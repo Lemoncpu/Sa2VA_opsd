@@ -2,7 +2,7 @@
   <img width="225" src="figs/logo.png">
 </p>
 
-<h2 align="center">SAMTok: Representing Any Mask with Two Words</h2>
+<h2 align="center">SAMTok: Representing Any Mask with Two Words [CVPR-2026]</h2>
 
 <p align="center">
   <a href="https://arxiv.org/abs/2601.16093" target="_blank"><img src="https://img.shields.io/badge/arXiv-2601.16093-red"></a>
