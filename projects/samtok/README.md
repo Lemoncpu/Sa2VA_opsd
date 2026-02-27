@@ -221,7 +221,7 @@ Please kindly cite our paper if you find this project helpful.
 @article{samtok,
   title={SAMTok: Representing Any Mask with Two Words},
   author={Zhou, Yikang and Zhang, Tao and Gong, Dengxian and Wu, Yuanzheng and Tian, Ye and Wang, Haochen and Yuan, Haobo and Wang, Jiacong and Qi, Lu and Wang, Anran and Wang, Zhuochen and Wang, Yujing and Chen, Cheng and Ji, Shunping and Li, Xiangtai},
-  journal={arXiv preprint arXiv:2601.16093},
+  journal={CVPR},
   year={2026}
 }
 ```
