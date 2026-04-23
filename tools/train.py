@@ -10,7 +10,7 @@ def parse_args():
     parser.add_argument(
         '--deepspeed',
         type=str,
-        default='deepspeed_zero2',
+        default=None,
         help='the path to the .json file for deepspeed')
     parser.add_argument(
         '--resume',

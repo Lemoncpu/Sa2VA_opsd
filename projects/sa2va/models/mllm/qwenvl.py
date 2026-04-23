@@ -4,6 +4,7 @@ from typing import Dict, Optional, Union, List
 
 
 import torch
+import torch.nn.functional as F
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoTokenizer, AutoProcessor, Qwen2_5_VLProcessor
 from peft import PeftModelForCausalLM, get_peft_model, prepare_model_for_kbit_training
 
@@ -45,7 +46,7 @@ class Qwen2_5_VL(BaseModel):
         )
 
         # self.model.enable_input_require_grads()
-        self.model.gradient_checkpointing_enable()
+        self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         # "<|image_pad|>" is used to pad the image tokens to a fixed length.
@@ -113,6 +114,156 @@ class Qwen2_5_VL(BaseModel):
     def get_embedding_size(self):
         return self.model.config.text_config.hidden_size
 
+    @staticmethod
+    def _normalize_prompt_masks(prompt_masks) -> torch.Tensor:
+        if isinstance(prompt_masks, torch.Tensor):
+            tensor = prompt_masks.to(dtype=torch.float32)
+        else:
+            tensor = torch.as_tensor(prompt_masks, dtype=torch.float32)
+        if tensor.ndim == 2:
+            tensor = tensor.unsqueeze(0)
+        if tensor.ndim != 3:
+            raise ValueError(f"prompt_masks must have shape (n_regions, h, w), got {tuple(tensor.shape)}")
+        return tensor
+
+    def _resolve_prompt_masks_per_image(
+        self,
+        prompt_masks,
+        vp_overall_mask,
+        image_grid_thw_per_sample,
+    ):
+        total_images = sum(int(item.shape[0]) for item in image_grid_thw_per_sample)
+        prompt_masks_per_image = [None] * total_images
+        if prompt_masks is None:
+            return prompt_masks_per_image
+
+        if vp_overall_mask is not None:
+            vp_overall_mask = vp_overall_mask.to(dtype=torch.bool).view(-1)
+            if int(vp_overall_mask.numel()) == total_images:
+                prompt_mask_idx = 0
+                image_offset = 0
+                for sample_grid_thw in image_grid_thw_per_sample:
+                    sample_image_count = int(sample_grid_thw.shape[0])
+                    sample_flags = vp_overall_mask[image_offset:image_offset + sample_image_count]
+                    flagged_indices = torch.nonzero(sample_flags, as_tuple=False).flatten().tolist()
+                    if flagged_indices:
+                        if len(flagged_indices) != 1:
+                            raise ValueError(
+                                f"Qwen visual prompt training currently supports one prompted image per sample, got {flagged_indices}."
+                            )
+                        if prompt_mask_idx >= len(prompt_masks):
+                            raise ValueError("vp_overall_mask expects more prompt_masks entries than provided.")
+                        prompt_masks_per_image[image_offset + flagged_indices[0]] = self._normalize_prompt_masks(
+                            prompt_masks[prompt_mask_idx]
+                        )
+                        prompt_mask_idx += 1
+                    image_offset += sample_image_count
+
+                if prompt_mask_idx != len(prompt_masks):
+                    raise ValueError(
+                        f"Unused prompt_masks entries remain after vp_overall_mask mapping: "
+                        f"used {prompt_mask_idx}, total {len(prompt_masks)}."
+                    )
+                return prompt_masks_per_image
+
+        if len(prompt_masks) == len(image_grid_thw_per_sample):
+            image_offset = 0
+            for sample_idx, sample_grid_thw in enumerate(image_grid_thw_per_sample):
+                sample_image_count = int(sample_grid_thw.shape[0])
+                if sample_image_count != 1:
+                    raise ValueError(
+                        "Without vp_overall_mask mapping, Qwen visual prompt training expects one image per sample."
+                    )
+                prompt_masks_per_image[image_offset] = self._normalize_prompt_masks(prompt_masks[sample_idx])
+                image_offset += sample_image_count
+            return prompt_masks_per_image
+
+        if len(prompt_masks) == total_images:
+            for image_idx, item in enumerate(prompt_masks):
+                prompt_masks_per_image[image_idx] = self._normalize_prompt_masks(item)
+            return prompt_masks_per_image
+
+        raise ValueError(
+            f"Cannot align prompt_masks with image_grid_thw: prompt_masks={len(prompt_masks)}, total_images={total_images}."
+        )
+
+    def _resize_prompt_masks_for_grid(self, prompt_masks: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+        spatial_merge_size = int(self.model.visual.spatial_merge_size)
+        target_h = int(grid_thw[1].item() // spatial_merge_size)
+        target_w = int(grid_thw[2].item() // spatial_merge_size)
+        if prompt_masks.shape[-2:] == (target_h, target_w):
+            return prompt_masks.bool()
+        resized = F.interpolate(
+            prompt_masks.unsqueeze(0),
+            size=(target_h, target_w),
+            mode='nearest',
+        ).squeeze(0)
+        return resized.bool()
+
+    def _build_inputs_embeds_with_visual_prompts(
+        self,
+        input_ids: torch.Tensor,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+        image_grid_thw_per_sample,
+        prompt_masks=None,
+        vp_overall_mask=None,
+    ) -> torch.Tensor:
+        if self.tokenizer is None:
+            raise ValueError("Tokenizer must be initialized before using visual prompt training.")
+
+        inputs_embeds = self.model.get_input_embeddings()(input_ids)
+        image_embeds = self.model.get_image_features(pixel_values, image_grid_thw)
+        flat_image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+        image_mask, _ = self.model.get_placeholder_mask(
+            input_ids,
+            inputs_embeds=inputs_embeds,
+            image_features=flat_image_embeds,
+        )
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask, flat_image_embeds)
+
+        prompt_masks_per_image = self._resolve_prompt_masks_per_image(
+            prompt_masks,
+            vp_overall_mask,
+            image_grid_thw_per_sample,
+        )
+        vp_token_id = self.tokenizer.convert_tokens_to_ids('<vp>')
+        if vp_token_id is None or vp_token_id < 0:
+            raise ValueError("Tokenizer does not provide a valid <vp> token id.")
+
+        vp_embeds = []
+        for image_embed, grid_thw, prompt_masks_for_image in zip(image_embeds, image_grid_thw, prompt_masks_per_image):
+            if prompt_masks_for_image is None:
+                continue
+            resized_masks = self._resize_prompt_masks_for_grid(prompt_masks_for_image, grid_thw)
+            flat_image_embed = image_embed.reshape(-1, image_embed.shape[-1])
+            flat_masks = resized_masks.to(device=flat_image_embed.device, dtype=torch.bool).reshape(
+                resized_masks.shape[0], -1
+            )
+            if flat_masks.shape[-1] != flat_image_embed.shape[0]:
+                raise ValueError(
+                    f"Prompt mask/image feature mismatch: {flat_masks.shape[-1]} vs {flat_image_embed.shape[0]}"
+                )
+            for region_mask in flat_masks:
+                vp_embeds.append(flat_image_embed[region_mask])
+
+        expected_vp_tokens = int((input_ids == vp_token_id).sum().item())
+        if vp_embeds:
+            vp_embeds = torch.cat(vp_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+        else:
+            vp_embeds = inputs_embeds.new_empty((0, inputs_embeds.shape[-1]))
+
+        if vp_embeds.shape[0] != expected_vp_tokens:
+            raise ValueError(
+                f"Visual prompt embedding count mismatch: expected {expected_vp_tokens}, got {vp_embeds.shape[0]}"
+            )
+
+        if expected_vp_tokens == 0:
+            return inputs_embeds
+
+        vp_mask = (input_ids == vp_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+        return inputs_embeds.masked_scatter(vp_mask, vp_embeds)
+
 
     def forward(self,
                 data: Dict[str, torch.Tensor],
@@ -121,20 +272,39 @@ class Qwen2_5_VL(BaseModel):
         assert mode == 'loss', f'Only support loss mode in {self.__class__.__name__}, but got {mode}'
         pixel_values: List[torch.Tensor] = data['pixel_values']
         pixel_values = torch.cat(pixel_values, dim=0)
-        image_grid_thw = data['image_grid_thw']
-        image_grid_thw = torch.cat(image_grid_thw, dim=0)
-        
-        
-        # DO NOT ENTER POSTION EMBEDDING HERE; Qwen2.5-VL will handle it inside (M-ROPE)
-        output = self.model(
+        image_grid_thw_per_sample = data['image_grid_thw']
+        image_grid_thw = torch.cat(image_grid_thw_per_sample, dim=0)
+        prompt_masks = data.get('prompt_masks')
+        vp_overall_mask = data.get('vp_overall_mask')
+
+        model_inputs = dict(
             input_ids=data['input_ids'],
             attention_mask=data['attention_mask'],
             labels=data['labels'],
-            pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
-            # output hidden states for potential further usage
             output_hidden_states=True,
         )
+
+        if prompt_masks is not None:
+            inputs_embeds = self._build_inputs_embeds_with_visual_prompts(
+                input_ids=data['input_ids'],
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                image_grid_thw_per_sample=image_grid_thw_per_sample,
+                prompt_masks=prompt_masks,
+                vp_overall_mask=vp_overall_mask,
+            )
+            output = self.model(
+                **model_inputs,
+                pixel_values=None,
+                inputs_embeds=inputs_embeds,
+            )
+        else:
+            # DO NOT ENTER POSITION EMBEDDING HERE; Qwen2.5-VL will handle it inside (M-ROPE)
+            output = self.model(
+                **model_inputs,
+                pixel_values=pixel_values,
+            )
         return output
 
 

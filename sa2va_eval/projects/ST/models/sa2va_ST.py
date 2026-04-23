@@ -27,26 +27,33 @@ except:
     pass
 
 def find_all_linear_names(model):
-    lora_module_names = set()
+    lora_module_names = set() # 初始化空set存储lora目标模块的名称
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear):
             names = name.split('.')
+            # len(names) == 1，说明是直接在模型上定义的线性层；len(names) > 1，说明是嵌套在其他模块中的线性层，此时取最后一个名称作为lora目标模块的名称
             lora_module_names.add(names[0] if len(names) == 1 else names[-1])
 
+    # 移除不需要添加lora的模块名称，例如lm_head和output_layer，这些模块在16-bit训练中可能会出现问题
+    # lm_head通常是语言模型的输出层，output_layer可能是一些特定任务的输出层
     if 'lm_head' in lora_module_names:  # needed for 16-bit
         lora_module_names.remove('lm_head')
     if 'output_layer' in lora_module_names:  # needed for 16-bit
         lora_module_names.remove('output_layer')
     return list(lora_module_names)
 
+# 维度变换，将一般作用在序列的LayerNorm变为作用在图像特征上的LayerNorm
 class Norm2d(nn.Module):
     def __init__(self, embed_dim):
         super().__init__()
+        # embed_dim是特征图的通道数
         self.ln = nn.LayerNorm(embed_dim, eps=1e-6)
+        # 原作用于序列[B, L, C]的LayerNorm，B是batch size，L是序列长度，C是特征维度。
     def forward(self, x):
+        # 输入x的形状为[B, C, H, W]，需要将其变换为[B, H, W, C]以适应LayerNorm的输入要求。
         x = x.permute(0, 2, 3, 1)
         x = self.ln(x)
-        x = x.permute(0, 3, 1, 2).contiguous()
+        x = x.permute(0, 3, 1, 2).contiguous() # 还原为[B, C, H, W]的形状，内存连续
         return x
 
 class DWconv(nn.Module):
@@ -68,7 +75,7 @@ class Sa2VASTModel(BaseModel):
     IMG_START_TOKEN = "<vision>"
     IMG_END_TOKEN = "</vision>"
 
-    IMG_RSEP_TOKEN = "<vrow_sep>"
+    IMG_RSEP_TOKEN = "<vrow_sep>" # 图像行分隔符
     CLS_TOKEN = "<|vis_cls|>"
     def __init__(self,
                  single_transformer,
@@ -103,7 +110,7 @@ class Sa2VASTModel(BaseModel):
         self.bs = bs
         self.use_distill = use_distill
         self.patch_size = patch_size
-        self.seg_pred_down_ratio = seg_pred_down_ratio
+        self.seg_pred_down_ratio = seg_pred_down_ratio # 分割预测的分辨率相对于输入图像的分辨率的下采样倍数
         self.seg_hidden_states = seg_hidden_states
         self.visual_prompt_nums = visual_prompt_nums
         visual_prompt_tokens = [f"<Prompt{i}>" for i in range(visual_prompt_nums)]
@@ -116,7 +123,7 @@ class Sa2VASTModel(BaseModel):
             assert visual_prompt_token in special_tokens
         self.special_tokens = special_tokens
         self.single_transformer = BUILDER.build(single_transformer)
-        self.llm_hidden_states = self.single_transformer.config.hidden_size
+        self.llm_hidden_states = self.single_transformer.config.hidden_size # LLM的隐藏状态维度
         self.mask2former_model = mask2former_model
         if self.mask2former_model is not None and use_distill:
             assert mask2former_processor is not None
@@ -153,20 +160,24 @@ class Sa2VASTModel(BaseModel):
 
         self.tokenizer = BUILDER.build(tokenizer)
         self._add_special_tokens()
-
+        
+        # 图像特征的输入维度，如果与LLM的隐藏状态维度不一致，则需要一个线性层进行预处理
         in_dim = min(self.single_transformer.config.hidden_size, 1024) # the hidden states of llm
 
         if in_dim == self.single_transformer.config.hidden_size:
+            # 图像特征维度等于LLM的隐藏状态维度，不需要进行预处理
             self.image_feature_pre_projector = None
         else:
+            # 创建一个线性层，将LLM的隐藏状态维度投影为图像特征维度
             self.image_feature_pre_projector = nn.Sequential(
                 nn.Linear(self.single_transformer.config.hidden_size, self.single_transformer.config.hidden_size),
-                nn.ReLU(inplace=True),
+                nn.ReLU(inplace=True), # inplace=True可以节省内存，但需要确保后续不再使用被修改的张量
                 nn.Linear(self.single_transformer.config.hidden_size, in_dim),
                 nn.Dropout(0.0)
             )
 
         out_dim = seg_hidden_states
+        # Token特征投影层，将LLM的隐藏状态维度投影为分割token的特征维度
         self.seg_token_projector = nn.Sequential(
             nn.Linear(self.llm_hidden_states, in_dim), nn.ReLU(inplace=True),
             nn.Linear(in_dim, out_dim), nn.Dropout(0.0)
@@ -275,6 +286,7 @@ class Sa2VASTModel(BaseModel):
         self.seg_token_idx = self.tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
         self.vision_patch_idx = self.tokenizer("<vpatch>", add_special_tokens=False).input_ids[0]
 
+        # visual prompt token idx
         self.vp_token_idxs = []
         for vp_token in self.visual_prompt_tokens:
             self.vp_token_idxs.append(self.tokenizer(vp_token, add_special_tokens=False).input_ids[0])
@@ -303,20 +315,22 @@ class Sa2VASTModel(BaseModel):
         return gt_masks
 
     def get_mask_prediction(self, seg_embeddings_list, image_seg_features):
-        # seg_embedding (N, C)
+        # seg_embedding (Q, C) Q分割类别数
         # image_feature (H, W, C)
         ret = []
         for seg_embeddings, image_seg_feature in zip(seg_embeddings_list, image_seg_features):
-            pred_masks = torch.einsum("qc,hwc->qhw", seg_embeddings, image_seg_feature)
+            # (Q, H, W) pred_masks有Q个分割类别，每个类别对应一个(H, W)的预测掩码
+            pred_masks = torch.einsum("qc,hwc->qhw", seg_embeddings, image_seg_feature) 
             ret.append(pred_masks)
         return ret
 
     def forward(self, data, data_samples=None, mode='loss'):
         images = data.pop('images', None)
         gt_masks = data.pop('masks', None)
-        patch_nums_per_images = data.pop('patch_nums_per_images', None)
+        patch_nums_per_images = data.pop('patch_nums_per_images', None) # (H_patches,W_patches)
         input_ids = data['input_ids']
 
+        # 如果输入有vision_patches，则将其展平
         if 'vision_patches' in data.keys() and data['vision_patches'] is not None:
             data['vision_patches'] = data['vision_patches'].flatten(1).to(self.torch_dtype)
 
@@ -335,9 +349,11 @@ class Sa2VASTModel(BaseModel):
         hidden_states = hidden_states[-1]
 
         # obtain image features
-        image_token_mask = input_ids == self.vision_patch_idx
+        image_token_mask = input_ids == self.vision_patch_idx # 选出vision patch的token位置
         vision_features = hidden_states[image_token_mask]  # (N, 256 * sub_pixels * sub_pixels)
+        # patch_split_nums存储每张图像对应的patch数量
         patch_split_nums = [item[0] * item[1] for item in patch_nums_per_images]
+        # 将vision features进行分块，分块大小为每张图像对应的patch数量
         vision_features = torch.split(vision_features, patch_split_nums, dim=0)
         all_image_features = []
         all_llm_image_features = []
@@ -358,11 +374,13 @@ class Sa2VASTModel(BaseModel):
                 image_features = self.image_feature_projector(image_features)
                 all_image_features.append(image_features)
             else:
+                # 原image features是(N, C)，N代表一张image的patch数量，C是特征维度。将其变换为(h_patches, w_patches, C)，其中h_patches和w_patches分别是图像在高度和宽度方向上的patch数量。
                 image_features = image_features.reshape(h_patches, w_patches, self.llm_hidden_states).unsqueeze(0) # (1, h, w, c)
                 all_llm_image_features.append(image_features)
                 if self.image_feature_pre_projector is not None:
                     image_features = self.image_feature_pre_projector(image_features)
                 image_features = image_features.permute(0, 3, 1, 2).contiguous()
+                # 上采样后形状[1,c,h_up,w_up]
                 image_features = self.upsample_blocks(image_features)[0]  # (c, h, w)
                 image_features = image_features.permute(1, 2, 0).contiguous() # (h, w, c)
                 image_features = self.image_feature_projector(image_features)
@@ -378,12 +396,13 @@ class Sa2VASTModel(BaseModel):
         if not seg_valid:
             seg_token_counts += 1
 
+        # 按一个seg的token数量进行分块
         seg_embeddings_list_ = torch.split(seg_token_features, seg_token_counts.tolist(), dim=0)
         seg_embeddings_list = []
         image_seg_features = []
-        gt_masks_ = []
+        gt_masks_ = [] # ground truth mask
         for idx, item in enumerate(seg_embeddings_list_):
-            if len(item) != 0 and all_image_features[idx] is not None:
+            if len(item) != 0 and all_image_features[idx] is not None: # seg不为空且有对应idx的图像特征
                 seg_embeddings_list.append(item)
                 image_seg_features.append(all_image_features[idx])
                 gt_masks_.append(gt_masks[idx])
@@ -407,6 +426,7 @@ class Sa2VASTModel(BaseModel):
         else:
             distill_loss_dict = {}
 
+        # get seg predictions
         pred_masks = self.get_mask_prediction(seg_embeddings_list, image_seg_features)
         if not self.loss_sample_points:
             gt_masks = [F.interpolate(gt_mask.unsqueeze(0), size=pred_mask.shape[-2:], mode='nearest').squeeze(0) for
@@ -582,7 +602,7 @@ class Sa2VASTModel(BaseModel):
 
     def sample_points(self, mask_pred, gt_masks):
         gt_masks = gt_masks.unsqueeze(1)
-        gt_masks = gt_masks.to(mask_pred)
+        gt_masks = gt_masks.to(mask_pred) # 对齐dtype
         mask_pred = mask_pred.unsqueeze(1)
         # (N, 1, h, w)
 
@@ -610,6 +630,7 @@ class Sa2VASTModel(BaseModel):
             self.template = template
         stop_words = []
         stop_words += self.template.get('STOP_WORDS', [])
+        # 生成停止准则
         stop_criteria = get_stop_criteria(
             tokenizer=self.tokenizer, stop_words=stop_words)
         self.stop_criteria = stop_criteria
@@ -618,8 +639,8 @@ class Sa2VASTModel(BaseModel):
             max_new_tokens=512,
             do_sample=False,
             temperature=0,
-            num_beams=1,
-            eos_token_id=self.tokenizer.eos_token_id,
+            num_beams=1, # beam束搜索数量
+            eos_token_id=self.tokenizer.eos_token_id, # 结束符token_id
             pad_token_id=self.tokenizer.eos_token_id,
         )
         default_generation_kwargs.update(metainfo.get('generation_kwargs', {}))
@@ -630,10 +651,13 @@ class Sa2VASTModel(BaseModel):
         self.seg_token_projector.to(self.torch_dtype)
         self.image_feature_projector.to(self.torch_dtype)
         self.upsample_blocks.to(self.torch_dtype)
+        # image_feature_pre_projector当图像特征维度与LLM隐藏状态维度不一致时才存在
         if self.image_feature_pre_projector is not None:
             self.image_feature_pre_projector.to(self.torch_dtype)
         return
 
+    # 图像patch转换为文本序列，格式为：<vision><vpatch><vpatch>...<vpatch></vision>，其中<vpatch>的数量等于图像的patch数量
+    # h_patches和w_patches分别是图像在高度和宽度方向上的patch数量
     def prepare_image_textual_seq_norowsep(self, h, w):
         image_token_patch_indices = []
         seq = ""
@@ -643,7 +667,7 @@ class Sa2VASTModel(BaseModel):
         tok_len += 1
         image_token_patch_indices.append(NON_VISION_TOKEN)
 
-        seq += self.IMG_CONTEXT_TOKEN * (w * h)
+        seq += self.IMG_CONTEXT_TOKEN * (w * h) # 添加w*h个图像patch的上下文token
         tok_len += (w * h)
         image_token_patch_indices += [idx for idx in range(w * h)]
 
@@ -669,7 +693,7 @@ class Sa2VASTModel(BaseModel):
         assert self.tokenizer
         if prompt_ids is not None:
             for _id in prompt_ids:
-                assert 0 <= _id < self.visual_prompt_nums
+                assert 0 <= _id < self.visual_prompt_nums # visual prompts should be less than visual_prompt_nums
 
         input_dict = {}
         ori_image_size = image.size
@@ -681,6 +705,7 @@ class Sa2VASTModel(BaseModel):
             image_token_patch_indices = []
             vp_token_indices = []
         else:
+            # image分成patches，并转换为tensor，shape (N_H_PATCHES, N_W_PATCHES, C, PATCH_H, PATCH_W)
             image_patches = convert_image_to_patches(image, self.patch_size)
             if prompt_masks is not None:
                 masks_prompt_patches = [convert_mask_to_patches(mask, self.patch_size) for mask in prompt_masks]
@@ -835,6 +860,7 @@ class Sa2VASTModel(BaseModel):
             ret_masks.append(masks)
         return {'prediction': predict, 'prediction_masks': ret_masks, 'input_text': ''}
 
+    # 在输入的token序列中搜索图像token的起始和结束位置，返回一个列表[start_idx, end_idx]，如果没有找到图像token，则返回None
     def search_vision_tokens(self, input_ids):
         image_start_idx = self.tokenizer(self.IMG_START_TOKEN, add_special_tokens=False).input_ids[0]
         image_end_idx = self.tokenizer(self.IMG_END_TOKEN, add_special_tokens=False).input_ids[0]

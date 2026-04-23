@@ -15,6 +15,10 @@ DATASETS_ATTRIBUTES = {
 class RESDataset:
     METAINFO: dict = dict(name='Referring Expression Segmentation')
 
+    @classmethod
+    def metainfo_name(cls):
+        return cls.METAINFO['name'].replace(' ', '_')
+
     def __init__(self,
                  image_folder,
                  dataset_name,

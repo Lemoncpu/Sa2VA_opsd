@@ -329,7 +329,8 @@ class Sa2VA06VPDataset(Sa2VABaseDataset):
         image_data = self._process_single_image(image, self.single_image_mode)
         out_data_dict.update(image_data)
         
-        vp_overall_mask = torch.Tensor([False] * (len(out_data_dict['pixel_values']) - 1) + [True])
+        visual_unit_count = len(out_data_dict['image_grid_thw']) if 'image_grid_thw' in out_data_dict else len(out_data_dict['pixel_values'])
+        vp_overall_mask = torch.Tensor([False] * (visual_unit_count - 1) + [True])
         out_data_dict['vp_overall_mask'] = vp_overall_mask
         
         # Create image token string and process conversations

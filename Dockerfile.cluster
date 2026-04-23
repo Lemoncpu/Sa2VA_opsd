@@ -1,0 +1,22 @@
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
+ENV UV_LINK_MODE=copy
+ENV HF_HOME=/workspace/.cache/huggingface
+
+RUN apt-get update && apt-get install -y --no-install-recommends     python3.11     python3.11-dev     python3.11-venv     python3-pip     build-essential     ninja-build     git     curl     ca-certificates     ffmpeg     libgl1     libglib2.0-0     && rm -rf /var/lib/apt/lists/*
+
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 &&     python -m pip install --upgrade pip &&     pip install uv
+
+WORKDIR /workspace/Sa2VA
+
+COPY . .
+
+RUN uv sync --extra=legacy --frozen
+
+ENV PATH=/workspace/Sa2VA/.venv/bin:${PATH}
+
+CMD ["/bin/bash"]

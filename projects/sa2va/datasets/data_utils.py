@@ -211,6 +211,11 @@ def sa2va_collect_fn(
     object_masks = []
     vp_overall_mask = []
     prompt_masks = []
+    def _visual_unit_count(example):
+        if example.get('image_grid_thw', None) is not None:
+            return int(len(example['image_grid_thw']))
+        return int(len(example['pixel_values']))
+
     for example in instances:
         input_ids.append(torch.LongTensor(example['input_ids']))
         labels.append(torch.LongTensor(example['labels']))
@@ -223,7 +228,7 @@ def sa2va_collect_fn(
                 if 'vp_overall_mask' in example.keys() and example['vp_overall_mask'] is not None:
                     vp_overall_mask.append(example['vp_overall_mask'])
                 else:
-                    vp_overall_mask.append(torch.Tensor([False] * len(example['pixel_values'])))
+                    vp_overall_mask.append(torch.Tensor([False] * _visual_unit_count(example)))
         
         if has_grounding_image and 'g_pixel_values' in example.keys():
             if isinstance(example['g_pixel_values'], list):
@@ -387,3 +392,21 @@ class ConcatDatasetSa2VA(TorchConcatDataset):
         main_str += ',\n'.join(
             [f'{repr(dataset)}' for dataset in self.datasets])
         return main_str
+
+def sa2va_opsd_collect_fn(
+        instances,
+        return_hf_format: bool = False,
+        use_varlen_attn: bool = False):
+    assert not return_hf_format, "return_hf_format is not supported yet."
+    assert not use_varlen_attn, "use_varlen_attn is not supported yet."
+
+    return {
+        'data': {
+            'images': [instance['image'] for instance in instances],
+            'prompt_masks': [instance['prompt_masks'] for instance in instances],
+            'student_questions': [instance['student_question'] for instance in instances],
+            'gt_masks': [instance['gt_mask'] for instance in instances],
+            'npz_paths': [instance['npz_path'] for instance in instances],
+        },
+        'data_samples': None,
+    }

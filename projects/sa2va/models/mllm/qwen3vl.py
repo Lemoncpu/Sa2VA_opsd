@@ -60,7 +60,7 @@ class Qwen3VL(BaseModel):
 
 
         # self.model.enable_input_require_grads()
-        self.model.gradient_checkpointing_enable()
+        self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         # "<|image_pad|>" is used to pad the image tokens to a fixed length.

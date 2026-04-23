@@ -15,7 +15,7 @@ def get_resize_output_image_size(
     max_resolution: int = MAX_RESOLUTION,
     patch_size=32
 ) -> tuple:
-    if fix_resolution==True:
+    if fix_resolution==True: # 固定分辨率为224*224
         return 224,224
     l1, l2 = image_size # 540, 32
     short, long = (l2, l1) if l2 <= l1 else (l1, l2)

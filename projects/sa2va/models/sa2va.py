@@ -42,7 +42,7 @@ class Sa2VAModel(BaseModel):
         if special_tokens is None:
             special_tokens = ['[SEG]']
 
-        self.mllm = BUILDER.build(mllm)
+        self.mllm = BUILDER.build(mllm) # 使用BUILDER构建mllm实例
         self.arch_type = arch_type
 
         tokenizer = BUILDER.build(tokenizer)
@@ -167,8 +167,11 @@ class Sa2VAModel(BaseModel):
 
     def state_dict(self, *args, **kwargs):
         prefix = kwargs.pop('prefix', '')
+        # 创建mllm的state_dict，并在所有键名前添加前缀'mllm.'
         state_dict_mllm = self.mllm.state_dict(*args, prefix=prefix + 'mllm.', **kwargs)
+        # 创建grounding_encoder的state_dict，并在所有键名前添加前缀'grounding_encoder.'
         state_dict_sam2 = self.grounding_encoder.state_dict(*args, prefix=prefix + 'grounding_encoder.', **kwargs)
+        # 创建text_hidden_fcs神经网络层的state_dict，并在所有键名前添加前缀'text_hidden_fcs.'
         state_dict_text = self.text_hidden_fcs.state_dict(*args, prefix=prefix + 'text_hidden_fcs.', **kwargs)
         to_return = OrderedDict()
         to_return.update(state_dict_mllm)
@@ -215,7 +218,7 @@ class Sa2VAModel(BaseModel):
         gt_masks = data.pop('masks', None)
         frames_per_batch = data.pop('frames_per_batch', None)
         input_ids = data['input_ids']
-        output = self.mllm(data, data_samples, mode)
+        output = self.mllm(data, data_samples, mode) 
 
         if gt_masks is None:
             # require zero seg datas
