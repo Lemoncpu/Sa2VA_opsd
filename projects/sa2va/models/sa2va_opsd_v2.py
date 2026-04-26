@@ -905,7 +905,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         with self._temporary_eval_model(model):
             with torch.inference_mode():
                 formatted_prompt_masks = self._to_teacher_prompt_masks(prompt_masks)
-                prompt_image = self._build_mask_focused_image(image, prompt_masks) if apply_mask_focus else image
+                prompt_image = self._build_mask_focused_image(image, prompt_masks) if apply_mask_focus and prompt_masks is not None else image
                 mm_inputs = self._build_forward_inputs(model, prompt_image, formatted_prompt_masks, prompt_text)
                 inputs_embeds = self._compose_inputs_embeds(model, mm_inputs)
                 generation_config = self._clone_generation_config(model, generation_overrides)
@@ -1042,8 +1042,12 @@ class Sa2VAOPSDModelV2(BaseModel):
             device=self.device,
             dtype=model.torch_dtype,
         )
-        prompt_masks, vp_token_str = self._create_region_prompt(model, prompt_masks)
-        vp_overall_mask = torch.tensor([False] * (len(images) - 1) + [True], device=self.device)
+        if prompt_masks is not None:
+            prompt_masks, vp_token_str = self._create_region_prompt(model, prompt_masks)
+            vp_overall_mask = torch.tensor([False] * (len(images) - 1) + [True], device=self.device)
+        else:
+            vp_token_str = ""
+            vp_overall_mask = None
         clean_question = self._normalize_student_question(question_text)
         full_human_prompt = "<image>\n" + vp_token_str + clean_question
         num_image_tokens = pixel_values.shape[0] * model.patch_token
@@ -1089,21 +1093,24 @@ class Sa2VAOPSDModelV2(BaseModel):
         vit_embeds = self._extract_vit_embeds(model, pixel_values)
         image_flags = (torch.sum(pixel_values, dim=(1, 2, 3)) != 0).to(self.device).long()
         vit_embeds = vit_embeds[image_flags == 1]
-        vp_embeds = []
-        vp_overall_mask = vp_overall_mask.to(self.device).bool()[image_flags == 1]
-        overall_tile_vit_embeds = vit_embeds[vp_overall_mask]
-        vp_img_idx = 0
-        for image_idx in range(len(vit_embeds)):
-            vp_embeds.append(vit_embeds[image_idx].reshape(-1, hidden_dim))
-            if vp_overall_mask[image_idx]:
-                tile_vit_embeds = overall_tile_vit_embeds[vp_img_idx].reshape(-1, hidden_dim)
-                object_masks = prompt_masks[vp_img_idx].to(self.device).bool()
-                num_objects = len(object_masks)
-                tile_vit_embeds = tile_vit_embeds.unsqueeze(0).repeat(num_objects, 1, 1)
-                object_masks = object_masks.reshape(num_objects, -1)
-                vp_embeds.append(tile_vit_embeds[object_masks])
-                vp_img_idx += 1
-        vp_embeds = torch.cat(vp_embeds, dim=0)
+        if prompt_masks is None or vp_overall_mask is None:
+            vp_embeds = vit_embeds.reshape(-1, hidden_dim)
+        else:
+            vp_embeds = []
+            vp_overall_mask = vp_overall_mask.to(self.device).bool()[image_flags == 1]
+            overall_tile_vit_embeds = vit_embeds[vp_overall_mask]
+            vp_img_idx = 0
+            for image_idx in range(len(vit_embeds)):
+                vp_embeds.append(vit_embeds[image_idx].reshape(-1, hidden_dim))
+                if vp_overall_mask[image_idx]:
+                    tile_vit_embeds = overall_tile_vit_embeds[vp_img_idx].reshape(-1, hidden_dim)
+                    object_masks = prompt_masks[vp_img_idx].to(self.device).bool()
+                    num_objects = len(object_masks)
+                    tile_vit_embeds = tile_vit_embeds.unsqueeze(0).repeat(num_objects, 1, 1)
+                    object_masks = object_masks.reshape(num_objects, -1)
+                    vp_embeds.append(tile_vit_embeds[object_masks])
+                    vp_img_idx += 1
+            vp_embeds = torch.cat(vp_embeds, dim=0)
         selected = input_ids.reshape(batch_size * seq_len) == model.img_context_token_id
         expected_tokens = int(selected.sum().item())
         if vp_embeds.shape[0] < expected_tokens:
@@ -1123,8 +1130,8 @@ class Sa2VAOPSDModelV2(BaseModel):
         completion_ids,
         apply_mask_focus=True,
     ):
-        teacher_prompt_masks = self._to_teacher_prompt_masks(prompt_masks)
-        caption_image = self._build_mask_focused_image(image, prompt_masks) if apply_mask_focus else image
+        teacher_prompt_masks = None if prompt_masks is None else self._to_teacher_prompt_masks(prompt_masks)
+        caption_image = self._build_mask_focused_image(image, prompt_masks) if apply_mask_focus and prompt_masks is not None else image
         mm_inputs = self._build_forward_inputs(model, caption_image, teacher_prompt_masks, prompt_text)
         prompt_len = mm_inputs["input_ids"].shape[1]
         completion_len = int(completion_ids.shape[1])
@@ -1143,8 +1150,6 @@ class Sa2VAOPSDModelV2(BaseModel):
         try:
             forward_signature = inspect.signature(model.language_model.forward)
             if completion_len > 0 and "logits_to_keep" in forward_signature.parameters:
-                # Keep only the minimal tail window needed to score the completion:
-                # one logit for the prompt->first-token transition, plus one per completion token.
                 requested_logits_to_keep = completion_len + 1
                 forward_kwargs["logits_to_keep"] = requested_logits_to_keep
         except (TypeError, ValueError):
@@ -1178,6 +1183,173 @@ class Sa2VAOPSDModelV2(BaseModel):
             valid_mask[row_idx, :row_len] = True
         return padded, valid_mask
 
+    @staticmethod
+    def _pad_sequence_batch(sequences, *, pad_value, dtype=None, device=None):
+        if not sequences:
+            raise ValueError("sequences must not be empty.")
+        target_device = device if device is not None else sequences[0].device
+        target_dtype = dtype if dtype is not None else sequences[0].dtype
+        tail_shape = tuple(sequences[0].shape[1:])
+        max_len = max(int(sequence.shape[0]) for sequence in sequences)
+        padded = torch.full(
+            (len(sequences), max_len, *tail_shape),
+            pad_value,
+            dtype=target_dtype,
+            device=target_device,
+        )
+        valid_mask = torch.zeros((len(sequences), max_len), dtype=torch.bool, device=target_device)
+        for row_idx, sequence in enumerate(sequences):
+            if tuple(sequence.shape[1:]) != tail_shape:
+                raise ValueError(
+                    f"Expected all sequences to share tail shape {tail_shape}, got {tuple(sequence.shape[1:])}."
+                )
+            row = sequence.to(device=target_device, dtype=target_dtype)
+            row_len = int(row.shape[0])
+            padded[row_idx, :row_len] = row
+            valid_mask[row_idx, :row_len] = True
+        return padded, valid_mask
+
+    def _build_full_sequence_batch(self, model, samples):
+        if not samples:
+            raise ValueError("samples must not be empty.")
+
+        prompt_sequences = []
+        prompt_lengths = []
+        completion_rows = []
+        completion_lengths = []
+        full_input_ids_rows = []
+        full_embed_rows = []
+        embedding_layer = model.language_model.get_input_embeddings()
+
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        for sample in samples:
+            image = sample["image"]
+            prompt_masks = sample.get("prompt_masks")
+            prompt_text = sample["prompt_text"]
+            apply_mask_focus = bool(sample.get("apply_mask_focus", True))
+            completion_ids = sample["completion_ids"]
+            if completion_ids.ndim == 1:
+                completion_ids = completion_ids.unsqueeze(0)
+            if completion_ids.ndim != 2 or completion_ids.shape[0] != 1:
+                raise ValueError(
+                    f"Expected completion_ids with shape (1, seq_len), got {tuple(completion_ids.shape)}."
+                )
+            completion_ids = completion_ids.to(self.device)
+            prompt_image = self._build_mask_focused_image(image, prompt_masks) if apply_mask_focus and prompt_masks is not None else image
+            prompt_masks_for_forward = None if prompt_masks is None else self._to_teacher_prompt_masks(prompt_masks)
+            mm_inputs = self._build_forward_inputs(model, prompt_image, prompt_masks_for_forward, prompt_text)
+            prompt_embeds = self._compose_inputs_embeds(model, mm_inputs)
+            if prompt_embeds.ndim != 3 or prompt_embeds.shape[0] != 1:
+                raise ValueError(
+                    f"Expected prompt_embeds with shape (1, seq_len, hidden), got {tuple(prompt_embeds.shape)}."
+                )
+            completion_embeds = embedding_layer(completion_ids)
+            full_input_ids = torch.cat([mm_inputs["input_ids"], completion_ids], dim=1)
+            full_embeds = torch.cat([prompt_embeds, completion_embeds], dim=1)
+
+            prompt_sequences.append(mm_inputs)
+            prompt_lengths.append(int(prompt_embeds.shape[1]))
+            completion_rows.append(completion_ids[0])
+            completion_lengths.append(int(completion_ids.shape[1]))
+            full_input_ids_rows.append(full_input_ids[0])
+            full_embed_rows.append(full_embeds[0])
+
+        completion_ids_batch, completion_mask = self._pad_sequence_batch(
+            completion_rows,
+            pad_value=pad_token_id,
+            dtype=torch.long,
+            device=self.device,
+        )
+        full_input_ids_batch, _ = self._pad_sequence_batch(
+            full_input_ids_rows,
+            pad_value=pad_token_id,
+            dtype=torch.long,
+            device=self.device,
+        )
+        full_inputs_embeds, attention_mask = self._pad_sequence_batch(
+            full_embed_rows,
+            pad_value=0.0,
+            dtype=full_embed_rows[0].dtype,
+            device=self.device,
+        )
+        position_ids = attention_mask.long().cumsum(-1) - 1
+        position_ids.masked_fill_(~attention_mask, 0)
+        prompt_lengths = torch.tensor(prompt_lengths, dtype=torch.long, device=self.device)
+        completion_lengths = torch.tensor(completion_lengths, dtype=torch.long, device=self.device)
+        return {
+            "samples": prompt_sequences,
+            "input_ids": full_input_ids_batch,
+            "inputs_embeds": full_inputs_embeds,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "completion_ids": completion_ids_batch,
+            "completion_mask": completion_mask,
+            "prompt_lengths": prompt_lengths,
+            "completion_lengths": completion_lengths,
+        }
+
+    def _forward_sequence_multi_sample_with_model(self, model, samples, output_hidden_states=False):
+        batch_inputs = self._build_full_sequence_batch(model, samples)
+        outputs = model.language_model(
+            inputs_embeds=batch_inputs["inputs_embeds"],
+            attention_mask=batch_inputs["attention_mask"],
+            position_ids=batch_inputs["position_ids"],
+            use_cache=False,
+            return_dict=True,
+            output_hidden_states=output_hidden_states,
+        )
+        logits = outputs.logits
+        completion_len = int(batch_inputs["completion_ids"].shape[1])
+        vocab_size = logits.shape[-1]
+        if completion_len == 0:
+            completion_logits = logits[:, 0:0, :]
+            gather_positions = torch.zeros((logits.shape[0], 0), dtype=torch.long, device=logits.device)
+        else:
+            gather_positions = batch_inputs["prompt_lengths"].unsqueeze(1) - 1 + torch.arange(
+                completion_len, device=logits.device
+            ).unsqueeze(0)
+            gather_positions = gather_positions.clamp(min=0, max=logits.shape[1] - 1)
+            completion_logits = logits.gather(
+                dim=1,
+                index=gather_positions.unsqueeze(-1).expand(-1, -1, vocab_size),
+            )
+        result = {
+            "batch_inputs": batch_inputs,
+            "logits": completion_logits,
+            "completion_ids": batch_inputs["completion_ids"],
+            "completion_mask": batch_inputs["completion_mask"],
+            "gather_positions": gather_positions,
+        }
+        if output_hidden_states:
+            last_hidden_states = outputs.hidden_states[-1]
+            hidden_dim = last_hidden_states.shape[-1]
+            completion_hidden_states = last_hidden_states.gather(
+                dim=1,
+                index=gather_positions.unsqueeze(-1).expand(-1, -1, hidden_dim),
+            )
+            result["completion_hidden_states"] = completion_hidden_states
+            result["outputs"] = outputs
+        return result
+
+    @staticmethod
+    def _masked_token_mean(values, valid_mask):
+        weights = valid_mask.to(dtype=values.dtype)
+        return (values * weights).sum(dim=-1) / weights.sum(dim=-1).clamp_min(1.0)
+
+    @staticmethod
+    def _sequence_cross_entropy_batch_from_logits(logits, completion_ids, completion_mask):
+        token_losses = F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]),
+            completion_ids.reshape(-1).to(logits.device),
+            reduction="none",
+        ).reshape_as(completion_ids)
+        return Sa2VAOPSDModelV2._masked_token_mean(token_losses, completion_mask)
+
     def _forward_sequence_batch_with_model(
         self,
         model,
@@ -1191,8 +1363,8 @@ class Sa2VAOPSDModelV2(BaseModel):
             raise ValueError(
                 f"completion_ids_batch must have shape (batch, seq_len), got {tuple(completion_ids_batch.shape)}."
             )
-        teacher_prompt_masks = self._to_teacher_prompt_masks(prompt_masks)
-        caption_image = self._build_mask_focused_image(image, prompt_masks) if apply_mask_focus else image
+        teacher_prompt_masks = None if prompt_masks is None else self._to_teacher_prompt_masks(prompt_masks)
+        caption_image = self._build_mask_focused_image(image, prompt_masks) if apply_mask_focus and prompt_masks is not None else image
         mm_inputs = self._build_forward_inputs(model, caption_image, teacher_prompt_masks, prompt_text)
         prompt_len = mm_inputs["input_ids"].shape[1]
         completion_len = int(completion_ids_batch.shape[1])
@@ -1231,7 +1403,6 @@ class Sa2VAOPSDModelV2(BaseModel):
         if requested_logits_to_keep is not None and outputs.logits.shape[1] == requested_logits_to_keep:
             return outputs.logits[:, :-1, :]
         return outputs.logits[:, prompt_len - 1: -1, :]
-
     def predict_teacher_caption_on_student_trajectory(
         self,
         *,
@@ -1635,6 +1806,9 @@ class Sa2VAOPSDModelV2(BaseModel):
             high_threshold=self.iou_high_threshold,
         )
 
+    def _empty_loss_vector(self):
+        return torch.empty(0, device=self.device, dtype=next(self.student_model.parameters()).dtype)
+
     def compute_regenerate_alignment_loss(
         self,
         image,
@@ -1653,6 +1827,30 @@ class Sa2VAOPSDModelV2(BaseModel):
             apply_mask_focus=True,
         )
         return self._sequence_cross_entropy_from_logits(student_logits, completion_ids)
+
+    def compute_regenerate_alignment_losses_batch(self, batch_items):
+        samples = []
+        for item in batch_items:
+            completion_ids = item["completion_ids"]
+            if completion_ids.shape[1] == 0:
+                continue
+            samples.append(
+                {
+                    "image": item["image"],
+                    "prompt_masks": item["prompt_masks"],
+                    "prompt_text": item["student_question"],
+                    "completion_ids": completion_ids,
+                    "apply_mask_focus": True,
+                }
+            )
+        if not samples:
+            return self._empty_loss_vector()
+        batch_result = self._forward_sequence_multi_sample_with_model(self.student_model, samples)
+        return self._sequence_cross_entropy_batch_from_logits(
+            batch_result["logits"],
+            batch_result["completion_ids"],
+            batch_result["completion_mask"],
+        )
 
     def compute_onpolicy_distill_loss(
         self,
@@ -1694,6 +1892,52 @@ class Sa2VAOPSDModelV2(BaseModel):
         token_weights = token_weights / token_weights.mean(dim=-1, keepdim=True).clamp_min(1e-6)
         sample_weight = self.mid_iou_alpha * max(1.0 - float(iou), 0.0)
         return (jsd_tokens * token_weights).mean() * sample_weight
+
+    def compute_onpolicy_distill_losses_batch(self, batch_items):
+        student_samples = []
+        teacher_samples = []
+        sample_weights = []
+        for item in batch_items:
+            completion_ids = item["completion_ids"]
+            if completion_ids.shape[1] == 0:
+                continue
+            student_samples.append(
+                {
+                    "image": item["image"],
+                    "prompt_masks": item["prompt_masks"],
+                    "prompt_text": item["student_question"],
+                    "completion_ids": completion_ids,
+                    "apply_mask_focus": True,
+                }
+            )
+            teacher_samples.append(
+                {
+                    "image": item["image"],
+                    "prompt_masks": item.get("teacher_prompt_masks", item["prompt_masks"]),
+                    "prompt_text": item["teacher_prompt"],
+                    "completion_ids": completion_ids,
+                    "apply_mask_focus": False,
+                }
+            )
+            sample_weights.append(self.mid_iou_alpha * max(1.0 - float(item.get("iou", 0.0)), 0.0))
+        if not student_samples:
+            return self._empty_loss_vector()
+        student_result = self._forward_sequence_multi_sample_with_model(self.student_model, student_samples)
+        teacher_model = self.require_teacher_model("On-policy distillation")
+        with torch.no_grad():
+            teacher_result = self._forward_sequence_multi_sample_with_model(teacher_model, teacher_samples)
+        jsd_tokens, teacher_entropy = self.generalized_jsd_token_loss(
+            student_logits=student_result["logits"],
+            teacher_logits=teacher_result["logits"],
+            beta=self.jsd_beta,
+            temperature=self.teacher_temperature,
+        )
+        completion_mask = student_result["completion_mask"]
+        token_weights = torch.exp(-self.entropy_weight_beta * teacher_entropy)
+        token_weights = token_weights / self._masked_token_mean(token_weights, completion_mask).unsqueeze(1).clamp_min(1e-6)
+        sample_losses = self._masked_token_mean(jsd_tokens * token_weights, completion_mask)
+        sample_weight_tensor = torch.tensor(sample_weights, dtype=sample_losses.dtype, device=self.device)
+        return sample_losses * sample_weight_tensor
 
     def _sample_grpo_descriptions(self, *, image, prompt_masks, student_question):
         target_rollout_count = int(self.grpo_group_size)
@@ -1820,6 +2064,98 @@ class Sa2VAOPSDModelV2(BaseModel):
             "reward_count": len(rollout_entries),
         }
 
+    def compute_grpo_losses_batch(self, batch_items):
+        rollout_entries = []
+        for sample_idx, item in enumerate(batch_items):
+            descriptions = self._sample_grpo_descriptions(
+                image=item["image"],
+                prompt_masks=item["prompt_masks"],
+                student_question=item["student_question"],
+            )
+            spatial_hint = self._coarse_spatial_hint(item["gt_mask"])
+            for description in descriptions:
+                if description.completion_ids.shape[1] == 0:
+                    continue
+                reconstruction = self.reconstruct_mask(
+                    image=item["image"],
+                    caption=description.clean_caption,
+                    description_status=description.status,
+                    spatial_hint=spatial_hint,
+                    gt_mask=item["gt_mask"],
+                )
+                rollout_entries.append(
+                    {
+                        "sample_idx": sample_idx,
+                        "image": item["image"],
+                        "prompt_masks": item["prompt_masks"],
+                        "student_question": item["student_question"],
+                        "completion_ids": description.completion_ids,
+                        "reward_value": float(self._compute_iou(item["gt_mask"], reconstruction.pred_mask)),
+                    }
+                )
+
+        if not rollout_entries:
+            return self._empty_loss_vector(), {"reward_sum": 0.0, "reward_count": 0}
+
+        rollout_samples = [
+            {
+                "image": entry["image"],
+                "prompt_masks": entry["prompt_masks"],
+                "prompt_text": entry["student_question"],
+                "completion_ids": entry["completion_ids"],
+                "apply_mask_focus": True,
+            }
+            for entry in rollout_entries
+        ]
+        with self._temporary_eval_model(self.student_model):
+            with torch.inference_mode():
+                old_result = self._forward_sequence_multi_sample_with_model(self.student_model, rollout_samples)
+                old_token_log_probs = self._token_log_probs_from_logits(
+                    old_result["logits"],
+                    old_result["completion_ids"],
+                )
+        old_token_log_probs = self._materialize_autograd_input(old_token_log_probs.detach())
+
+        current_result = self._forward_sequence_multi_sample_with_model(self.student_model, rollout_samples)
+        current_token_log_probs = self._token_log_probs_from_logits(
+            current_result["logits"],
+            current_result["completion_ids"],
+        )
+        completion_mask = current_result["completion_mask"].to(dtype=current_token_log_probs.dtype)
+        reward_tensor = torch.tensor(
+            [entry["reward_value"] for entry in rollout_entries],
+            device=self.device,
+            dtype=current_token_log_probs.dtype,
+        )
+        advantages = torch.zeros_like(reward_tensor)
+        grouped_indices = {}
+        for rollout_idx, entry in enumerate(rollout_entries):
+            grouped_indices.setdefault(entry["sample_idx"], []).append(rollout_idx)
+        for indices in grouped_indices.values():
+            index_tensor = torch.tensor(indices, dtype=torch.long, device=self.device)
+            sample_rewards = reward_tensor.index_select(0, index_tensor)
+            reward_std = sample_rewards.std(unbiased=False).clamp_min(self.grpo_advantage_eps)
+            sample_advantages = (sample_rewards - sample_rewards.mean()) / reward_std
+            advantages.index_copy_(0, index_tensor, sample_advantages)
+
+        ratio = torch.exp(current_token_log_probs - old_token_log_probs)
+        clipped_ratio = ratio.clamp(1.0 - self.grpo_clip_eps, 1.0 + self.grpo_clip_eps)
+        advantage_batch = advantages.unsqueeze(1)
+        surrogate = torch.min(ratio * advantage_batch, clipped_ratio * advantage_batch)
+        rollout_losses = -(surrogate * completion_mask).sum(dim=-1) / completion_mask.sum(dim=-1).clamp_min(1.0)
+
+        sample_losses = []
+        for sample_idx in range(len(batch_items)):
+            indices = grouped_indices.get(sample_idx)
+            if not indices:
+                continue
+            sample_losses.append(rollout_losses[indices].mean())
+        if not sample_losses:
+            return self._empty_loss_vector(), {"reward_sum": 0.0, "reward_count": 0}
+        return torch.stack(sample_losses), {
+            "reward_sum": float(reward_tensor.sum().item()),
+            "reward_count": len(rollout_entries),
+        }
     def forward(self, data, data_samples=None, mode="loss"):
         del data_samples, mode
         images = data["images"]
@@ -1859,6 +2195,10 @@ class Sa2VAOPSDModelV2(BaseModel):
         last_caption = ""
         last_teacher_prompt = ""
         last_route = ""
+
+        regen_entries = []
+        onpolicy_entries = []
+        grpo_entries = []
 
         for image, prompt_masks, student_question, gt_mask, sample_key in zip(
             images, prompt_masks_batch, student_questions, gt_masks, sample_keys
@@ -1935,7 +2275,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                 iou=iou,
                 empty_gt_mask=False,
             )
-            sample_loss = None
+
             teacher_prompt = ""
             if route == TEACHER_REGENERATE_ROUTE:
                 teacher_regenerate_count += 1
@@ -1965,15 +2305,14 @@ class Sa2VAOPSDModelV2(BaseModel):
                     teacher_fields=teacher_fields,
                 )
                 teacher_prompt = teacher_fields.get("teacher_regenerate_prompt", "")
-                sample_loss = self.compute_regenerate_alignment_loss(
-                    image=image,
-                    prompt_masks=prompt_masks,
-                    student_question=student_question,
-                    completion_ids=teacher_regenerate.completion_ids,
+                regen_entries.append(
+                    {
+                        "image": image,
+                        "prompt_masks": prompt_masks,
+                        "student_question": student_question,
+                        "completion_ids": teacher_regenerate.completion_ids,
+                    }
                 )
-                if sample_loss is not None:
-                    regen_loss_count += 1
-                    total_regen_ce = sample_loss if total_regen_ce is None else total_regen_ce + sample_loss
                 last_caption = teacher_regenerate.clean_caption or description.clean_caption
             elif route == ON_POLICY_DISTILL_ROUTE:
                 on_policy_distill_count += 1
@@ -2008,42 +2347,64 @@ class Sa2VAOPSDModelV2(BaseModel):
                     ],
                     axis=0,
                 )
-                sample_loss = self.compute_onpolicy_distill_loss(
-                    image=image,
-                    prompt_masks=prompt_masks,
-                    student_question=student_question,
-                    teacher_prompt=teacher_prompt,
-                    completion_ids=description.completion_ids,
-                    teacher_prompt_masks=teacher_prompt_masks,
-                    iou=iou,
+                onpolicy_entries.append(
+                    {
+                        "image": image,
+                        "prompt_masks": prompt_masks,
+                        "student_question": student_question,
+                        "teacher_prompt": teacher_prompt,
+                        "completion_ids": description.completion_ids,
+                        "teacher_prompt_masks": teacher_prompt_masks,
+                        "iou": iou,
+                    }
                 )
-                if sample_loss is not None:
-                    onpolicy_loss_count += 1
-                    total_onpolicy_jsd = sample_loss if total_onpolicy_jsd is None else total_onpolicy_jsd + sample_loss
                 last_caption = description.clean_caption
             else:
                 grpo_positive_count += 1
-                sample_loss, grpo_meta = self.compute_grpo_loss(
-                    image=image,
-                    prompt_masks=prompt_masks,
-                    student_question=student_question,
-                    gt_mask=gt_mask_np,
+                grpo_entries.append(
+                    {
+                        "image": image,
+                        "prompt_masks": prompt_masks,
+                        "student_question": student_question,
+                        "gt_mask": gt_mask_np,
+                    }
                 )
                 teacher_prompt = "[GRPO_ROUTE]"
-                grpo_reward_sum += grpo_meta["reward_sum"]
-                grpo_reward_count += grpo_meta["reward_count"]
-                if sample_loss is not None:
-                    grpo_loss_count += 1
-                    total_grpo = sample_loss if total_grpo is None else total_grpo + sample_loss
                 last_caption = description.clean_caption
 
             last_sample_key = sample_key
             last_route = route
             last_teacher_prompt = teacher_prompt
             total_iou += iou
-            if sample_loss is not None:
-                optimized_count += 1
-                total_loss = sample_loss if total_loss is None else total_loss + sample_loss
+
+        if regen_entries:
+            regen_losses = self.compute_regenerate_alignment_losses_batch(regen_entries)
+            if regen_losses.numel() > 0:
+                regen_loss_count += int(regen_losses.shape[0])
+                regen_loss_sum = regen_losses.sum()
+                total_regen_ce = regen_loss_sum if total_regen_ce is None else total_regen_ce + regen_loss_sum
+                total_loss = regen_loss_sum if total_loss is None else total_loss + regen_loss_sum
+                optimized_count += int(regen_losses.shape[0])
+
+        if onpolicy_entries:
+            onpolicy_losses = self.compute_onpolicy_distill_losses_batch(onpolicy_entries)
+            if onpolicy_losses.numel() > 0:
+                onpolicy_loss_count += int(onpolicy_losses.shape[0])
+                onpolicy_loss_sum = onpolicy_losses.sum()
+                total_onpolicy_jsd = onpolicy_loss_sum if total_onpolicy_jsd is None else total_onpolicy_jsd + onpolicy_loss_sum
+                total_loss = onpolicy_loss_sum if total_loss is None else total_loss + onpolicy_loss_sum
+                optimized_count += int(onpolicy_losses.shape[0])
+
+        if grpo_entries:
+            grpo_losses, grpo_meta = self.compute_grpo_losses_batch(grpo_entries)
+            grpo_reward_sum += grpo_meta["reward_sum"]
+            grpo_reward_count += grpo_meta["reward_count"]
+            if grpo_losses.numel() > 0:
+                grpo_loss_count += int(grpo_losses.shape[0])
+                grpo_loss_sum = grpo_losses.sum()
+                total_grpo = grpo_loss_sum if total_grpo is None else total_grpo + grpo_loss_sum
+                total_loss = grpo_loss_sum if total_loss is None else total_loss + grpo_loss_sum
+                optimized_count += int(grpo_losses.shape[0])
 
         self._cumulative_valid_count += routed_count
         self._cumulative_loss_count += optimized_count

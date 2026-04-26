@@ -27,6 +27,8 @@ WORK_DIR="${WORK_DIR:-${DEFAULT_WORK_DIR}}"
 MODEL_PATH="${MODEL_PATH:-${DEFAULT_MODEL_PATH}}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-${DEFAULT_TOKENIZER_PATH}}"
 DEEPSPEED="${DEEPSPEED:-deepspeed_zero2}"
+BATCH_SIZE_OVERRIDE="${BATCH_SIZE_OVERRIDE:-}"
+ACCUMULATIVE_COUNTS_OVERRIDE="${ACCUMULATIVE_COUNTS_OVERRIDE:-}"
 PYTORCH_CUDA_ALLOC_CONF_VALUE="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 RESUME_PATH=""
 LOAD_FROM_PATH=""
@@ -73,6 +75,16 @@ validate_gpu_count() {
 
   if [[ ! "${gpu_count}" =~ ^[1-9][0-9]*$ ]]; then
     echo "GPU count must be a positive integer, got: ${gpu_count}" >&2
+    exit 1
+  fi
+}
+
+validate_positive_int() {
+  local option_name="$1"
+  local value="$2"
+
+  if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "${option_name} must be a positive integer, got: ${value}" >&2
     exit 1
   fi
 }
@@ -145,6 +157,8 @@ usage() {
   echo "  --cuda-devices IDS      Comma-separated CUDA ids, e.g. 0,1,3. If omitted, uses 0..N-1."
   echo "  --port N                torchrun master port. Default: random port in [29500, 30499]"
   echo "  --deepspeed NAME        DeepSpeed config alias used by tools/dist.sh. Default: deepspeed_zero2"
+  echo "  --batch-size N          Override per-device training batch size in config."
+  echo "  --accumulative-counts N Override gradient accumulation steps in config."
   echo "  --resume PATH           Resume from a checkpoint path."
   echo "  --load-from PATH        Load model weights from a checkpoint without restoring training state."
   echo "  -h, --help              Show this help."
@@ -207,6 +221,14 @@ while [[ $# -gt 0 ]]; do
       DEEPSPEED="$2"
       shift 2
       ;;
+    --batch-size)
+      BATCH_SIZE_OVERRIDE="$2"
+      shift 2
+      ;;
+    --accumulative-counts|--grad-accum)
+      ACCUMULATIVE_COUNTS_OVERRIDE="$2"
+      shift 2
+      ;;
     --resume)
       RESUME_PATH="$2"
       shift 2
@@ -233,6 +255,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 EXTRA_ARGS=("$@")
+
+if [[ -n "${BATCH_SIZE_OVERRIDE}" ]]; then
+  validate_positive_int "--batch-size" "${BATCH_SIZE_OVERRIDE}"
+fi
+if [[ -n "${ACCUMULATIVE_COUNTS_OVERRIDE}" ]]; then
+  validate_positive_int "--accumulative-counts" "${ACCUMULATIVE_COUNTS_OVERRIDE}"
+fi
 
 if [[ -n "${CUDA_DEVICE_IDS}" ]]; then
   CUDA_DEVICE_IDS="${CUDA_DEVICE_IDS// /}"
@@ -317,6 +346,10 @@ fi
 
 mkdir -p "${WORK_DIR}"
 
+EFFECTIVE_BATCH_SIZE="${BATCH_SIZE_OVERRIDE:-1}"
+EFFECTIVE_ACCUMULATIVE_COUNTS="${ACCUMULATIVE_COUNTS_OVERRIDE:-1}"
+PER_DEVICE_BATCH_SIZE_OVERRIDE=$((EFFECTIVE_BATCH_SIZE * EFFECTIVE_ACCUMULATIVE_COUNTS))
+
 TRAIN_ARGS=(--work-dir "${WORK_DIR}")
 TRAIN_ARGS+=(
   --cfg-options
@@ -334,6 +367,21 @@ TRAIN_ARGS+=(
   "train_dataloader.dataset.split=${SPLIT}"
   "train_dataloader.dataset.image_root=${IMAGE_ROOT}"
 )
+if [[ -n "${BATCH_SIZE_OVERRIDE}" ]]; then
+  TRAIN_ARGS+=(
+    "batch_size=${BATCH_SIZE_OVERRIDE}"
+    "train_dataloader.batch_size=${BATCH_SIZE_OVERRIDE}"
+  )
+fi
+if [[ -n "${ACCUMULATIVE_COUNTS_OVERRIDE}" ]]; then
+  TRAIN_ARGS+=(
+    "accumulative_counts=${ACCUMULATIVE_COUNTS_OVERRIDE}"
+    "optim_wrapper.accumulative_counts=${ACCUMULATIVE_COUNTS_OVERRIDE}"
+  )
+fi
+if [[ -n "${BATCH_SIZE_OVERRIDE}" || -n "${ACCUMULATIVE_COUNTS_OVERRIDE}" ]]; then
+  TRAIN_ARGS+=("train_dataloader.sampler.per_device_batch_size=${PER_DEVICE_BATCH_SIZE_OVERRIDE}")
+fi
 if [[ -n "${LOAD_FROM_PATH}" ]]; then
   TRAIN_ARGS+=("load_from=${LOAD_FROM_PATH}" "resume=False")
 fi
@@ -361,6 +409,8 @@ echo "  GPUS=${GPUS}"
 echo "  CUDA_VISIBLE_DEVICES=${CUDA_DEVICE_IDS}"
 echo "  PORT=${PORT}"
 echo "  DEEPSPEED=${DEEPSPEED}"
+echo "  BATCH_SIZE_OVERRIDE=${BATCH_SIZE_OVERRIDE}"
+echo "  ACCUMULATIVE_COUNTS_OVERRIDE=${ACCUMULATIVE_COUNTS_OVERRIDE}"
 echo "  LOAD_FROM_PATH=${LOAD_FROM_PATH}"
 echo "  RESUME_PATH=${RESUME_PATH}"
 echo "  PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF_VALUE}"
