@@ -3,6 +3,7 @@ import inspect
 import re
 from contextlib import contextmanager
 from dataclasses import dataclass
+from types import MethodType
 
 import numpy as np
 import torch
@@ -10,6 +11,7 @@ import torch.nn.functional as F
 from mmengine.model import BaseModel
 from PIL import Image
 from transformers import AutoModel, AutoProcessor, AutoTokenizer, GenerationConfig
+from transformers.modeling_outputs import BaseModelOutput
 from transformers.modeling_utils import PreTrainedModel
 
 from projects.sa2va.datasets.common import SEG_QUESTIONS
@@ -319,6 +321,58 @@ class Sa2VAOPSDModelV2(BaseModel):
                 enable_fn(gradient_checkpointing_kwargs={"use_reentrant": False})
             except (TypeError, ValueError):
                 continue
+        Sa2VAOPSDModelV2._patch_legacy_gradient_checkpointing_modules(model)
+
+    @staticmethod
+    def _patch_legacy_gradient_checkpointing_modules(model):
+        for module in model.modules():
+            if type(module).__name__ == "InternVisionEncoder":
+                Sa2VAOPSDModelV2._patch_intern_vision_encoder_forward(module)
+
+    @staticmethod
+    def _resolve_non_reentrant_checkpoint_fn(module):
+        checkpoint_fn = getattr(module, "_gradient_checkpointing_func", None)
+        if callable(checkpoint_fn):
+            return checkpoint_fn
+
+        def _checkpoint(function, *args):
+            return torch.utils.checkpoint.checkpoint(function, *args, use_reentrant=False)
+
+        return _checkpoint
+
+    @staticmethod
+    def _patch_intern_vision_encoder_forward(module):
+        if getattr(module, "_opsd_non_reentrant_checkpoint_patched", False):
+            return
+
+        def _forward(self, inputs_embeds, output_hidden_states=None, return_dict=None):
+            output_hidden_states = (
+                output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+            )
+            return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+            encoder_states = () if output_hidden_states else None
+            hidden_states = inputs_embeds
+            checkpoint_fn = Sa2VAOPSDModelV2._resolve_non_reentrant_checkpoint_fn(self)
+
+            for encoder_layer in self.layers:
+                if output_hidden_states:
+                    encoder_states = encoder_states + (hidden_states,)
+                if self.gradient_checkpointing and self.training:
+                    layer_outputs = checkpoint_fn(encoder_layer, hidden_states)
+                else:
+                    layer_outputs = encoder_layer(hidden_states)
+                hidden_states = layer_outputs
+
+            if output_hidden_states:
+                encoder_states = encoder_states + (hidden_states,)
+
+            if not return_dict:
+                return tuple(v for v in [hidden_states, encoder_states] if v is not None)
+            return BaseModelOutput(last_hidden_state=hidden_states, hidden_states=encoder_states)
+
+        module.forward = MethodType(_forward, module)
+        module._opsd_non_reentrant_checkpoint_patched = True
 
     @staticmethod
     def _gradient_checkpointing_candidates(model):
