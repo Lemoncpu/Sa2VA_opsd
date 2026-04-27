@@ -289,20 +289,20 @@ def build_compare_fallback(
 
     if sample.get("description_status") != "ok":
         problem = "The first-stage caption was empty or malformed, so reconstruction had no stable target."
-        correction = "Produce a valid noun phrase that directly names the masked target."
+        correction = "Write a valid sentence that directly describes the masked target with clearly visible details."
         reason = "Without a usable first caption, the reconstructor has no stable target to follow."
     elif route == TEACHER_REGENERATE_ROUTE:
         if reconstruction.status != "ok" or int(np.asarray(ref_mask).sum()) == 0:
             problem = "The current caption does not reconstruct a usable target mask from the gtmask description task."
-            correction = "Rewrite the caption from scratch so it directly names the gtmask target and includes the minimum local cue needed to recover region1."
+            correction = "Rewrite the caption from scratch so it directly describes the gtmask target with visible attributes and the minimum local context needed to recover region1."
             reason = "The reconstruction result is missing or unusable, so the current student trajectory should be replaced rather than lightly edited."
         else:
             problem = "The current caption still does not describe the gtmask precisely enough for reliable reconstruction."
-            correction = "Rewrite the caption so region1 is named directly, then add one strong local attribute, relation, or side cue that separates gtmask from nearby distractors."
+            correction = "Rewrite the caption so region1 is described directly, then add one strong visible attribute, relation, or side cue that separates gtmask from nearby distractors."
             reason = "The IoU and non-overlap areas show that the current student trajectory is too far from region1 and needs a stronger reset."
     elif route == ON_POLICY_DISTILL_ROUTE:
         problem = "The current caption is partially useful but still misses target-specific evidence for stable reconstruction."
-        correction = "Keep the correct target noun when possible, then add one stronger local attribute, relation, or side cue that separates gtmask from nearby distractors."
+        correction = "Keep the correct target category when possible, then add one stronger visible attribute, relation, or side cue that separates gtmask from nearby distractors."
         reason = "The IoU is moderate, so the student caption has useful structure but still needs a guided on-policy correction."
     else:
         problem = "The caption already reconstructs a region close to the gtmask and only a small local mismatch may remain."

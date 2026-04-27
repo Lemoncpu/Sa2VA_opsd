@@ -1793,7 +1793,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             distractor_spatial_hint = distractor_spatial_hint or "not available"
             prompt = (
                 "<image>\n"
-                "Write one short RefCOCO-style referring expression for region1 (gtmask).\n"
+                "Write one natural and complete sentence that describes region1 (gtmask) in detail.\n"
                 "The student's caption failed. Do not preserve it if it still points to region2.\n"
                 "Use region2 only as a negative example to avoid.\n"
                 f"Student prompt: {clean_question}\n"
@@ -1806,13 +1806,13 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"Rewrite direction: {teacher_correction_direction}\n"
                 f"Why the old caption failed: {teacher_reason}\n"
                 "Output requirements:\n"
-                "- Return exactly one short noun phrase for region1, usually 2 to 6 words.\n"
-                "- Prefer category plus one strong disambiguating cue.\n"
-                "- If similar objects exist, prefer side, location, or relation cues over long scene narration.\n"
+                "- Return exactly one natural and complete sentence describing region1.\n"
+                "- Focus on visible appearance, attributes, parts, and relevant local context that helps understand the target.\n"
+                "- Prefer concrete visible details over generic statements.\n"
                 "- Do not explain.\n"
                 "- Do not output labels.\n"
                 "- Do not mention region1 or region2.\n"
-                "- Do not output a full sentence.\n"
+                "- Do not describe anything that is not visible.\n"
                 "- Do not copy the failed student caption if it still matches region2."
             )
         return prompt

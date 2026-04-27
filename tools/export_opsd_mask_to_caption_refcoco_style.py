@@ -13,18 +13,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from projects.sa2va.datasets.sa2va_opsd_npz_v2 import Sa2VAOpsdNPZDatasetV2
+from projects.sa2va.datasets.common import DEFAULT_MASK_TO_CAPTION_QUESTION
 from projects.sa2va.evaluation.caption_to_mask_common import normalize_refcoco_caption
 from projects.sa2va.models.sa2va_opsd_v3 import Sa2VAOPSDModelV3
 
 
-DEFAULT_STUDENT_QUESTION = (
-    "<image>"
-    "Can you provide me with a concise description of the region in the picture marked by region1? "
-    "Answer with a short referring expression in RefCOCO style, usually 2 to 6 words, naming the target itself "
-    "with only the most necessary attribute or location cue. Prefer forms like category plus color, size, "
-    "left/right, top/bottom, or a nearby relation. Do not describe the whole scene. Do not write a full sentence "
-    "and do not start with 'it is'. Do not output [SEG], masks, tags, or placeholder tokens."
-)
+DEFAULT_STUDENT_QUESTION = DEFAULT_MASK_TO_CAPTION_QUESTION
 
 
 def parse_args():

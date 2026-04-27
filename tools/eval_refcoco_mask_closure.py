@@ -167,8 +167,8 @@ Judge what problem the current IoU indicates from the facts above. Do not rely o
 
 {base_context}
 Output exactly 5 lines and nothing else:
-GTMASK: one short sentence describing region1.
-REFMASK: one short sentence describing region2 or saying it is empty/wrong.
+GTMASK: one concise sentence describing region1.
+REFMASK: one concise sentence describing region2 or saying it is empty/wrong.
 CAPTION_PROBLEM: the specific caption error.
 CORRECTION_DIRECTION: how the caption should change.
 REASON: why that change should move region2 toward region1.
@@ -195,19 +195,19 @@ def build_teacher_diagnosis_fallback(sample, reconstruction, iou, gt_mask, ref_m
     generic_caption = model._is_overly_generic_caption(caption)
     if sample.get("description_status") != "ok":
         problem = "The first-stage caption was empty or malformed, so reconstruction had no stable target."
-        correction = "Produce a valid noun phrase that directly names the masked target."
+        correction = "Write a valid sentence that directly describes the masked target with clearly visible details."
     elif reconstruction.status != "ok" or int(np.asarray(ref_mask).sum()) == 0:
         problem = "The caption did not reconstruct a usable target mask."
-        correction = "Add the target category plus one local appearance or spatial cue."
+        correction = "Add the target category plus one visible local appearance or spatial cue."
     elif iou < 0.2:
         problem = "The caption points to the wrong object or wrong image extent."
-        correction = "Name the masked target itself and add a stronger local disambiguation cue."
+        correction = "Describe the masked target directly and add a stronger visible local disambiguation cue."
     elif iou < 0.5:
         problem = "The caption is partially correct but still misses key disambiguation for the target extent."
-        correction = "Keep the target noun and tighten the local attribute or relation."
+        correction = "Keep the correct target category and tighten the local attribute or relation."
     else:
         problem = "The caption is close, but it still underspecifies some local detail of the target extent."
-        correction = "Keep the current target noun and refine it with one precise local detail."
+        correction = "Keep the current sentence stable and refine it with one precise local detail."
 
     if generic_caption or token_count <= 2:
         correction += " Avoid single-word or overly generic captions."

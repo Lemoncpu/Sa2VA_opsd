@@ -1,3 +1,13 @@
+DEFAULT_MASK_TO_CAPTION_QUESTION = (
+    "<image>"
+    "Describe the region marked by region1 in detail. "
+    "Focus on the region's appearance, attributes, parts, and any relevant local context that helps understand it. "
+    "Use a natural and complete sentence. "
+    "Avoid hallucinations and describe only what is visible. "
+    "Do not output segmentation tokens, tags, or placeholder text."
+)
+
+
 
 # Glamm
 SEG_QUESTIONS = [

@@ -2,6 +2,8 @@ _os = __import__("os")
 _getenv = _os.getenv
 _join = _os.path.join
 
+from projects.sa2va.datasets.common import DEFAULT_MASK_TO_CAPTION_QUESTION
+
 
 ROOT_DIR = _os.path.abspath(_getenv("SA2VA_ROOT_DIR", _os.getcwd()))
 
@@ -29,14 +31,7 @@ image_root_candidates = [
     if candidate
 ]
 
-student_question = (
-    "<image>"
-    "Can you provide me with a concise description of the region in the picture marked by region1? "
-    "Answer with a short referring expression in RefCOCO style, usually 2 to 6 words, naming the target itself "
-    "with only the most necessary attribute or location cue. Prefer forms like category plus color, size, "
-    "left/right, top/bottom, or a nearby relation. Do not describe the whole scene. Do not write a full sentence "
-    "and do not start with 'it is'. Do not output [SEG], masks, tags, or placeholder tokens."
-)
+student_question = DEFAULT_MASK_TO_CAPTION_QUESTION
 
 device = _getenv("SA2VA_REFCOCO_DEVICE", "cuda:0")
 limit = int(_getenv("SA2VA_REFCOCO_LIMIT", "100"))
