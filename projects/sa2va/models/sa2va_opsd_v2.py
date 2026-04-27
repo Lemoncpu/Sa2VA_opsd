@@ -152,6 +152,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         self._cumulative_description_seg_style_count = 0
         self._cumulative_reconstruct_ok_count = 0
         self._cumulative_reconstruct_failed_count = 0
+        self._cumulative_reconstruct_skip_count = 0
         self._cumulative_empty_gt_mask_count = 0
         self._cumulative_seg_correct_count = 0
         self._cumulative_iou_sum = 0.0
@@ -1664,6 +1665,14 @@ class Sa2VAOPSDModelV2(BaseModel):
                     and int(np.asarray(result.pred_mask).sum()) > int(np.asarray(best_result.pred_mask).sum())
                 ):
                     best_result = result
+        if best_result is None:
+            return ReconstructionResult(
+                pred_mask=None,
+                question=None,
+                raw_prediction="",
+                prediction_masks_count=0,
+                status="missing_reconstruction_result",
+            )
         return best_result
 
     def _compute_iou(self, gt_mask, pred_mask):
@@ -2042,7 +2051,10 @@ class Sa2VAOPSDModelV2(BaseModel):
                 spatial_hint=self._coarse_spatial_hint(gt_mask),
                 gt_mask=gt_mask,
             )
-            reward_value = float(self._compute_iou(gt_mask, reconstruction.pred_mask))
+            pred_mask = None if reconstruction is None else reconstruction.pred_mask
+            if pred_mask is None:
+                continue
+            reward_value = float(self._compute_iou(gt_mask, pred_mask))
             with self._temporary_eval_model(self.student_model):
                 with torch.inference_mode():
                     old_policy_logits = self._forward_sequence_with_model(
@@ -2137,6 +2149,9 @@ class Sa2VAOPSDModelV2(BaseModel):
                     spatial_hint=spatial_hint,
                     gt_mask=item["gt_mask"],
                 )
+                pred_mask = None if reconstruction is None else reconstruction.pred_mask
+                if pred_mask is None:
+                    continue
                 rollout_entries.append(
                     {
                         "sample_idx": sample_idx,
@@ -2144,7 +2159,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                         "prompt_masks": item["prompt_masks"],
                         "student_question": item["student_question"],
                         "completion_ids": description.completion_ids,
-                        "reward_value": float(self._compute_iou(item["gt_mask"], reconstruction.pred_mask)),
+                        "reward_value": float(self._compute_iou(item["gt_mask"], pred_mask)),
                     }
                 )
 
@@ -2232,6 +2247,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         description_seg_style_count = 0
         reconstruct_ok_count = 0
         reconstruct_failed_count = 0
+        reconstruct_skip_count = 0
         empty_gt_mask_count = 0
         seg_correct_count = 0
         teacher_regenerate_count = 0
@@ -2302,15 +2318,44 @@ class Sa2VAOPSDModelV2(BaseModel):
                 spatial_hint=self._coarse_spatial_hint(gt_mask_np),
                 gt_mask=gt_mask_np,
             )
-            iou = self._compute_iou(gt_mask_np, reconstruction.pred_mask)
-            ref_mask_np = gt_mask_np * 0 if reconstruction.pred_mask is None else self._to_numpy_mask(reconstruction.pred_mask)
+            reconstruct_status = "missing_reconstruction_result" if reconstruction is None else reconstruction.status
+            reconstruct_question = None if reconstruction is None else reconstruction.question
+            raw_reconstruct_prediction = "" if reconstruction is None else reconstruction.raw_prediction
+            prediction_masks_count = 0 if reconstruction is None else reconstruction.prediction_masks_count
+            pred_mask = None if reconstruction is None else reconstruction.pred_mask
+            if pred_mask is None:
+                reconstruct_skip_count += 1
+                last_sample_key = sample_key
+                last_route = "reconstruct_skip"
+                last_teacher_prompt = ""
+                last_caption = description.clean_caption
+                self._debug_sample(
+                    sample_key=sample_key,
+                    route="reconstruct_skip",
+                    student_question=student_question,
+                    raw_prediction=description.raw_prediction,
+                    caption=description.clean_caption,
+                    description_status=description.status,
+                    reconstruct_question=reconstruct_question,
+                    raw_reconstruct_prediction=raw_reconstruct_prediction,
+                    reconstruct_status=reconstruct_status,
+                    prediction_masks_count=prediction_masks_count,
+                    pred_mask=None,
+                    gt_mask=gt_mask_np,
+                    iou=0.0,
+                    empty_gt_mask=False,
+                )
+                continue
+
+            iou = self._compute_iou(gt_mask_np, pred_mask)
+            ref_mask_np = self._to_numpy_mask(pred_mask)
             route = self._route_from_iou(iou)
             routed_count += 1
             if iou >= 0.5:
                 seg_correct_count += 1
-            if reconstruction.status == "ok":
+            if reconstruct_status == "ok":
                 reconstruct_ok_count += 1
-            elif reconstruction.status not in {"ok", "skipped_invalid_description"}:
+            elif reconstruct_status not in {"ok", "skipped_invalid_description"}:
                 reconstruct_failed_count += 1
 
             self._debug_sample(
@@ -2320,11 +2365,11 @@ class Sa2VAOPSDModelV2(BaseModel):
                 raw_prediction=description.raw_prediction,
                 caption=description.clean_caption,
                 description_status=description.status,
-                reconstruct_question=reconstruction.question,
-                raw_reconstruct_prediction=reconstruction.raw_prediction,
-                reconstruct_status=reconstruction.status,
-                prediction_masks_count=reconstruction.prediction_masks_count,
-                pred_mask=reconstruction.pred_mask,
+                reconstruct_question=reconstruct_question,
+                raw_reconstruct_prediction=raw_reconstruct_prediction,
+                reconstruct_status=reconstruct_status,
+                prediction_masks_count=prediction_masks_count,
+                pred_mask=pred_mask,
                 gt_mask=gt_mask_np,
                 iou=iou,
                 empty_gt_mask=False,
@@ -2471,6 +2516,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         self._cumulative_description_seg_style_count += description_seg_style_count
         self._cumulative_reconstruct_ok_count += reconstruct_ok_count
         self._cumulative_reconstruct_failed_count += reconstruct_failed_count
+        self._cumulative_reconstruct_skip_count += reconstruct_skip_count
         self._cumulative_empty_gt_mask_count += empty_gt_mask_count
         self._cumulative_seg_correct_count += seg_correct_count
         self._cumulative_teacher_regenerate_count += teacher_regenerate_count
@@ -2536,6 +2582,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "description_seg_style_count": self._metric_tensor(self._cumulative_description_seg_style_count, zero.dtype),
                 "reconstruct_ok_count": self._metric_tensor(self._cumulative_reconstruct_ok_count, zero.dtype),
                 "reconstruct_failed_count": self._metric_tensor(self._cumulative_reconstruct_failed_count, zero.dtype),
+                "reconstruct_skip_count": self._metric_tensor(self._cumulative_reconstruct_skip_count, zero.dtype),
                 "empty_gt_mask_count": self._metric_tensor(self._cumulative_empty_gt_mask_count, zero.dtype),
                 "teacher_regenerate_rate": self._metric_tensor(cumulative_teacher_regenerate_rate, zero.dtype),
                 "on_policy_distill_rate": self._metric_tensor(cumulative_on_policy_distill_rate, zero.dtype),
@@ -2610,6 +2657,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             "description_seg_style_count": self._metric_tensor(self._cumulative_description_seg_style_count, avg_total_loss.dtype),
             "reconstruct_ok_count": self._metric_tensor(self._cumulative_reconstruct_ok_count, avg_total_loss.dtype),
             "reconstruct_failed_count": self._metric_tensor(self._cumulative_reconstruct_failed_count, avg_total_loss.dtype),
+            "reconstruct_skip_count": self._metric_tensor(self._cumulative_reconstruct_skip_count, avg_total_loss.dtype),
             "empty_gt_mask_count": self._metric_tensor(self._cumulative_empty_gt_mask_count, avg_total_loss.dtype),
             "teacher_regenerate_rate": self._metric_tensor(cumulative_teacher_regenerate_rate, avg_total_loss.dtype),
             "on_policy_distill_rate": self._metric_tensor(cumulative_on_policy_distill_rate, avg_total_loss.dtype),
