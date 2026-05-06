@@ -1738,8 +1738,6 @@ class Sa2VAOPSDModelV2(BaseModel):
         )
         seg_correct = bool(teacher_fields.get("caption_to_mask_seg_correct", False))
         route = teacher_fields.get("teacher_route", ON_POLICY_DISTILL_ROUTE)
-        gt_text = teacher_fields.get("teacher_gtmask", relation_context["gt_summary"])
-        ref_text = teacher_fields.get("teacher_refmask", relation_context["ref_summary"])
         target_spatial_hint = self._coarse_spatial_hint(gt_mask)
         distractor_spatial_hint = self._coarse_spatial_hint(ref_mask)
         teacher_caption_problem = teacher_fields.get("teacher_caption_problem", "")
@@ -1747,16 +1745,19 @@ class Sa2VAOPSDModelV2(BaseModel):
         teacher_reason = teacher_fields.get("teacher_reason", "")
         if route == TEACHER_REGENERATE_ROUTE:
             route_guidance = (
-                "The current sample is unusable. Treat region2 as a distractor, not a target to preserve. "
-                "If the student caption points to region2, replace it instead of refining it."
+                f"The current IoU is below {self.iou_low_threshold:.2f}, so the caption-to-mask reconstruction is too far from the gtmask. "
+                "Use the teacher to regenerate a new target caption instead of preserving the student's current wording."
             )
         elif route == ON_POLICY_DISTILL_ROUTE:
             route_guidance = (
-                "The current sample is in the normal on-policy correction band. Keep the student's target semantics when correct and shift probability mass toward the missing target cue."
+                f"The current IoU is between {self.iou_low_threshold:.2f} and {self.iou_high_threshold:.2f}, so this sample enters the on-policy correction branch. "
+                "Compare gtmask and refmask pixel by pixel: pixels present only in gtmask are missing target evidence, while pixels present only in refmask are distractor evidence. "
+                "Use these pixel-level differences to score the student's trajectory and guide probability mass toward tokens that explain the missing gtmask pixels while suppressing tokens that explain refmask-only pixels."
             )
         else:
             route_guidance = (
-                "The current sample is already high quality. Large edits are likely harmful, so keep any remaining changes minimal."
+                f"The current IoU is at least {self.iou_high_threshold:.2f}, so the reconstruction already matches the gtmask well. "
+                "Large corrections are likely harmful; keep any remaining guidance minimal."
             )
         prompt = (
             "<image>\n"
@@ -1771,11 +1772,10 @@ class Sa2VAOPSDModelV2(BaseModel):
             f"Reconstruction question: {reconstruction.question or ''}\n"
             f"caption_to_mask_seg_correct: {'true' if seg_correct else 'false'}\n"
             "IoU is the intersection-over-union between gtmask and refmask: intersection / union.\n"
-            "If IoU is close to 0, gtmask and refmask are weakly related or completely different.\n"
-            "If IoU is close to 1, gtmask and refmask are very similar.\n"
+            f"If IoU is below {self.iou_low_threshold:.2f}, the reconstruction is too inaccurate and the teacher should regenerate a better caption.\n"
+            f"If IoU is between {self.iou_low_threshold:.2f} and {self.iou_high_threshold:.2f}, use on-policy supervision: compare gtmask and refmask pixel by pixel, identify missing gtmask-only pixels and erroneous refmask-only pixels, then use those differences to score and supervise the student's token trajectory.\n"
+            f"If IoU is at least {self.iou_high_threshold:.2f}, gtmask and refmask are highly aligned and only light correction is needed.\n"
             f"Current IoU between gtmask(region1) and refmask(region2): {iou:.4f}\n"
-            f"gtmask text: {gt_text}\n"
-            f"refmask text: {ref_text}\n"
             f"gtmask summary: {relation_context['gt_summary']}\n"
             f"refmask summary: {relation_context['ref_summary']}\n"
             f"Unique non-overlap area in gtmask: {relation_context['gt_only_summary']}\n"
@@ -1799,8 +1799,6 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"Student prompt: {clean_question}\n"
                 f"Failed student caption: {student_caption}\n"
                 f"Current IoU between region1 and region2: {iou:.4f}\n"
-                f"region1 target text: {gt_text}\n"
-                f"region2 distractor text: {ref_text}\n"
                 f"Target localization hint: {target_spatial_hint}\n"
                 f"Distractor localization hint: {distractor_spatial_hint}\n"
                 f"Rewrite direction: {teacher_correction_direction}\n"
@@ -1869,6 +1867,166 @@ class Sa2VAOPSDModelV2(BaseModel):
             high_threshold=self.iou_high_threshold,
         )
 
+    def estimate_opsd_route_for_sample_with_model(
+        self,
+        *,
+        description_model,
+        reconstruct_model,
+        image,
+        prompt_masks,
+        student_question,
+        gt_mask,
+        sample_key=None,
+        debug: bool = False,
+    ):
+        gt_mask_np = self._to_numpy_mask(gt_mask)
+        if int(gt_mask_np.sum()) == 0:
+            return {
+                "sample_key": sample_key,
+                "route": "skip",
+                "iou": 0.0,
+                "description_status": "empty_gt_mask",
+                "reconstruct_status": "skipped_empty_gt_mask",
+                "description": None,
+                "reconstruction": None,
+                "pred_mask": None,
+            }
+
+        description = self.generate_description_with_model(
+            description_model,
+            image=image,
+            mask_prompts=prompt_masks,
+            student_question=student_question,
+            apply_mask_focus=True,
+        )
+        if description.status != "ok":
+            reconstruction = ReconstructionResult(
+                pred_mask=None,
+                question=None,
+                raw_prediction="",
+                prediction_masks_count=0,
+                status="skipped_invalid_description",
+            )
+        else:
+            best_result = None
+            best_iou = -1.0
+            spatial_hint = self._coarse_spatial_hint(gt_mask_np)
+            for reconstruct_question_base in self._resolve_reconstruct_questions(description.clean_caption):
+                reconstruct_question_variants = [reconstruct_question_base]
+                if spatial_hint:
+                    reconstruct_question_variants.append(
+                        self._append_spatial_hint_to_question(reconstruct_question_base, spatial_hint)
+                    )
+                for reconstruct_question in reconstruct_question_variants:
+                    predict_dict = self._predict_forward_eval(
+                        reconstruct_model,
+                        image=image,
+                        text=reconstruct_question,
+                        past_text="",
+                        mask_prompts=None,
+                        tokenizer=self.tokenizer,
+                    )
+                    raw_prediction = predict_dict.get("prediction", "")
+                    prediction_masks = predict_dict.get("prediction_masks")
+                    prediction_masks_count = 0 if prediction_masks is None else len(prediction_masks)
+                    if not prediction_masks:
+                        result = ReconstructionResult(
+                            pred_mask=None,
+                            question=reconstruct_question,
+                            raw_prediction=raw_prediction,
+                            prediction_masks_count=prediction_masks_count,
+                            status="empty_prediction_masks",
+                        )
+                        candidate_iou = -1.0
+                    else:
+                        first_mask = prediction_masks[0]
+                        if isinstance(first_mask, torch.Tensor):
+                            first_mask = first_mask.detach().cpu().numpy()
+                        first_mask = np.asarray(first_mask)
+                        if first_mask.ndim == 3 and first_mask.shape[0] == 1:
+                            first_mask = first_mask[0]
+                        pred_mask = self._to_numpy_mask(first_mask)
+                        result = ReconstructionResult(
+                            pred_mask=pred_mask,
+                            question=reconstruct_question,
+                            raw_prediction=raw_prediction,
+                            prediction_masks_count=prediction_masks_count,
+                            status="ok" if pred_mask.sum() > 0 else "zero_area_mask",
+                        )
+                        candidate_iou = self._compute_iou(gt_mask_np, pred_mask)
+                    if candidate_iou > best_iou:
+                        best_result = result
+                        best_iou = candidate_iou
+            reconstruction = best_result
+
+        reconstruct_status = (
+            "missing_reconstruction_result" if reconstruction is None else reconstruction.status
+        )
+        pred_mask = None if reconstruction is None else reconstruction.pred_mask
+        route = "skip"
+        iou = 0.0
+        if pred_mask is not None:
+            iou = self._compute_iou(gt_mask_np, pred_mask)
+            route = self._route_from_iou(iou)
+        if debug:
+            self._debug_sample(
+                sample_key=sample_key,
+                route=route,
+                student_question=student_question,
+                raw_prediction=description.raw_prediction,
+                caption=description.clean_caption,
+                description_status=description.status,
+                reconstruct_question=None if reconstruction is None else reconstruction.question,
+                raw_reconstruct_prediction="" if reconstruction is None else reconstruction.raw_prediction,
+                reconstruct_status=reconstruct_status,
+                prediction_masks_count=0 if reconstruction is None else reconstruction.prediction_masks_count,
+                pred_mask=pred_mask,
+                gt_mask=gt_mask_np,
+                iou=iou,
+                empty_gt_mask=False,
+            )
+        return {
+            "sample_key": sample_key,
+            "route": route,
+            "iou": float(iou),
+            "description_status": description.status,
+            "reconstruct_status": reconstruct_status,
+            "description": description,
+            "reconstruction": reconstruction,
+            "pred_mask": pred_mask,
+        }
+
+    def estimate_opsd_route_for_sample(
+        self,
+        *,
+        image,
+        prompt_masks,
+        student_question,
+        gt_mask,
+        sample_key=None,
+        debug: bool = False,
+    ):
+        return self.estimate_opsd_route_for_sample_with_model(
+            description_model=self.student_model,
+            reconstruct_model=self.student_model,
+            image=image,
+            prompt_masks=prompt_masks,
+            student_question=student_question,
+            gt_mask=gt_mask,
+            sample_key=sample_key,
+            debug=debug,
+        )
+
+    @staticmethod
+    def _resolve_batch_route(routes):
+        route_list = [route for route in routes if route not in {None, "", "skip"}]
+        if not route_list:
+            return None
+        unique_routes = sorted(set(route_list))
+        if len(unique_routes) != 1:
+            raise RuntimeError(f"Mixed OPSD routes in one batch: {unique_routes}")
+        return unique_routes[0]
+
     def _empty_loss_vector(self):
         return torch.empty(0, device=self.device, dtype=next(self.student_model.parameters()).dtype)
 
@@ -1892,28 +2050,22 @@ class Sa2VAOPSDModelV2(BaseModel):
         return self._sequence_cross_entropy_from_logits(student_logits, completion_ids)
 
     def compute_regenerate_alignment_losses_batch(self, batch_items):
-        samples = []
+        sample_losses = []
         for item in batch_items:
             completion_ids = item["completion_ids"]
             if completion_ids.shape[1] == 0:
                 continue
-            samples.append(
-                {
-                    "image": item["image"],
-                    "prompt_masks": item["prompt_masks"],
-                    "prompt_text": item["student_question"],
-                    "completion_ids": completion_ids,
-                    "apply_mask_focus": True,
-                }
+            sample_loss = self.compute_regenerate_alignment_loss(
+                image=item["image"],
+                prompt_masks=item["prompt_masks"],
+                student_question=item["student_question"],
+                completion_ids=completion_ids,
             )
-        if not samples:
+            if sample_loss is not None:
+                sample_losses.append(sample_loss)
+        if not sample_losses:
             return self._empty_loss_vector()
-        batch_result = self._forward_sequence_multi_sample_with_model(self.student_model, samples)
-        return self._sequence_cross_entropy_batch_from_logits(
-            batch_result["logits"],
-            batch_result["completion_ids"],
-            batch_result["completion_mask"],
-        )
+        return torch.stack(sample_losses)
 
     def compute_onpolicy_distill_loss(
         self,
@@ -1957,50 +2109,25 @@ class Sa2VAOPSDModelV2(BaseModel):
         return (jsd_tokens * token_weights).mean() * sample_weight
 
     def compute_onpolicy_distill_losses_batch(self, batch_items):
-        student_samples = []
-        teacher_samples = []
-        sample_weights = []
+        sample_losses = []
         for item in batch_items:
             completion_ids = item["completion_ids"]
             if completion_ids.shape[1] == 0:
                 continue
-            student_samples.append(
-                {
-                    "image": item["image"],
-                    "prompt_masks": item["prompt_masks"],
-                    "prompt_text": item["student_question"],
-                    "completion_ids": completion_ids,
-                    "apply_mask_focus": True,
-                }
+            sample_loss = self.compute_onpolicy_distill_loss(
+                image=item["image"],
+                prompt_masks=item["prompt_masks"],
+                student_question=item["student_question"],
+                teacher_prompt=item["teacher_prompt"],
+                completion_ids=completion_ids,
+                teacher_prompt_masks=item.get("teacher_prompt_masks", item["prompt_masks"]),
+                iou=float(item.get("iou", 0.0)),
             )
-            teacher_samples.append(
-                {
-                    "image": item["image"],
-                    "prompt_masks": item.get("teacher_prompt_masks", item["prompt_masks"]),
-                    "prompt_text": item["teacher_prompt"],
-                    "completion_ids": completion_ids,
-                    "apply_mask_focus": False,
-                }
-            )
-            sample_weights.append(self.mid_iou_alpha * max(1.0 - float(item.get("iou", 0.0)), 0.0))
-        if not student_samples:
+            if sample_loss is not None:
+                sample_losses.append(sample_loss)
+        if not sample_losses:
             return self._empty_loss_vector()
-        student_result = self._forward_sequence_multi_sample_with_model(self.student_model, student_samples)
-        teacher_model = self.require_teacher_model("On-policy distillation")
-        with torch.no_grad():
-            teacher_result = self._forward_sequence_multi_sample_with_model(teacher_model, teacher_samples)
-        jsd_tokens, teacher_entropy = self.generalized_jsd_token_loss(
-            student_logits=student_result["logits"],
-            teacher_logits=teacher_result["logits"],
-            beta=self.jsd_beta,
-            temperature=self.teacher_temperature,
-        )
-        completion_mask = student_result["completion_mask"]
-        token_weights = torch.exp(-self.entropy_weight_beta * teacher_entropy)
-        token_weights = token_weights / self._masked_token_mean(token_weights, completion_mask).unsqueeze(1).clamp_min(1e-6)
-        sample_losses = self._masked_token_mean(jsd_tokens * token_weights, completion_mask)
-        sample_weight_tensor = torch.tensor(sample_weights, dtype=sample_losses.dtype, device=self.device)
-        return sample_losses * sample_weight_tensor
+        return torch.stack(sample_losses)
 
     def _sample_grpo_descriptions(self, *, image, prompt_masks, student_question):
         target_rollout_count = int(self.grpo_group_size)
@@ -2131,99 +2258,25 @@ class Sa2VAOPSDModelV2(BaseModel):
         }
 
     def compute_grpo_losses_batch(self, batch_items):
-        rollout_entries = []
-        for sample_idx, item in enumerate(batch_items):
-            descriptions = self._sample_grpo_descriptions(
+        sample_losses = []
+        reward_sum = 0.0
+        reward_count = 0
+        for item in batch_items:
+            sample_loss, grpo_meta = self.compute_grpo_loss(
                 image=item["image"],
                 prompt_masks=item["prompt_masks"],
                 student_question=item["student_question"],
+                gt_mask=item["gt_mask"],
             )
-            spatial_hint = self._coarse_spatial_hint(item["gt_mask"])
-            for description in descriptions:
-                if description.completion_ids.shape[1] == 0:
-                    continue
-                reconstruction = self.reconstruct_mask(
-                    image=item["image"],
-                    caption=description.clean_caption,
-                    description_status=description.status,
-                    spatial_hint=spatial_hint,
-                    gt_mask=item["gt_mask"],
-                )
-                pred_mask = None if reconstruction is None else reconstruction.pred_mask
-                if pred_mask is None:
-                    continue
-                rollout_entries.append(
-                    {
-                        "sample_idx": sample_idx,
-                        "image": item["image"],
-                        "prompt_masks": item["prompt_masks"],
-                        "student_question": item["student_question"],
-                        "completion_ids": description.completion_ids,
-                        "reward_value": float(self._compute_iou(item["gt_mask"], pred_mask)),
-                    }
-                )
-
-        if not rollout_entries:
-            return self._empty_loss_vector(), {"reward_sum": 0.0, "reward_count": 0}
-
-        rollout_samples = [
-            {
-                "image": entry["image"],
-                "prompt_masks": entry["prompt_masks"],
-                "prompt_text": entry["student_question"],
-                "completion_ids": entry["completion_ids"],
-                "apply_mask_focus": True,
-            }
-            for entry in rollout_entries
-        ]
-        with self._temporary_eval_model(self.student_model):
-            with torch.inference_mode():
-                old_result = self._forward_sequence_multi_sample_with_model(self.student_model, rollout_samples)
-                old_token_log_probs = self._token_log_probs_from_logits(
-                    old_result["logits"],
-                    old_result["completion_ids"],
-                )
-        old_token_log_probs = self._materialize_autograd_input(old_token_log_probs.detach())
-
-        current_result = self._forward_sequence_multi_sample_with_model(self.student_model, rollout_samples)
-        current_token_log_probs = self._token_log_probs_from_logits(
-            current_result["logits"],
-            current_result["completion_ids"],
-        )
-        completion_mask = current_result["completion_mask"].to(dtype=current_token_log_probs.dtype)
-        reward_tensor = torch.tensor(
-            [entry["reward_value"] for entry in rollout_entries],
-            device=self.device,
-            dtype=current_token_log_probs.dtype,
-        )
-        advantages = torch.zeros_like(reward_tensor)
-        grouped_indices = {}
-        for rollout_idx, entry in enumerate(rollout_entries):
-            grouped_indices.setdefault(entry["sample_idx"], []).append(rollout_idx)
-        for indices in grouped_indices.values():
-            index_tensor = torch.tensor(indices, dtype=torch.long, device=self.device)
-            sample_rewards = reward_tensor.index_select(0, index_tensor)
-            reward_std = sample_rewards.std(unbiased=False).clamp_min(self.grpo_advantage_eps)
-            sample_advantages = (sample_rewards - sample_rewards.mean()) / reward_std
-            advantages.index_copy_(0, index_tensor, sample_advantages)
-
-        ratio = torch.exp(current_token_log_probs - old_token_log_probs)
-        clipped_ratio = ratio.clamp(1.0 - self.grpo_clip_eps, 1.0 + self.grpo_clip_eps)
-        advantage_batch = advantages.unsqueeze(1)
-        surrogate = torch.min(ratio * advantage_batch, clipped_ratio * advantage_batch)
-        rollout_losses = -(surrogate * completion_mask).sum(dim=-1) / completion_mask.sum(dim=-1).clamp_min(1.0)
-
-        sample_losses = []
-        for sample_idx in range(len(batch_items)):
-            indices = grouped_indices.get(sample_idx)
-            if not indices:
-                continue
-            sample_losses.append(rollout_losses[indices].mean())
+            reward_sum += grpo_meta["reward_sum"]
+            reward_count += grpo_meta["reward_count"]
+            if sample_loss is not None:
+                sample_losses.append(sample_loss)
         if not sample_losses:
             return self._empty_loss_vector(), {"reward_sum": 0.0, "reward_count": 0}
         return torch.stack(sample_losses), {
-            "reward_sum": float(reward_tensor.sum().item()),
-            "reward_count": len(rollout_entries),
+            "reward_sum": reward_sum,
+            "reward_count": reward_count,
         }
     def forward(self, data, data_samples=None, mode="loss"):
         del data_samples, mode
@@ -2232,6 +2285,8 @@ class Sa2VAOPSDModelV2(BaseModel):
         student_questions = data["student_questions"]
         gt_masks = data["gt_masks"]
         sample_keys = data.get("sample_keys") or data.get("npz_paths") or [None] * len(images)
+        routes = data.get("routes") or [None] * len(images)
+        batch_route = self._resolve_batch_route(routes)
 
         zero = next(self.student_model.parameters()).sum() * 0.0
         total_loss = None
@@ -2270,8 +2325,8 @@ class Sa2VAOPSDModelV2(BaseModel):
         onpolicy_entries = []
         grpo_entries = []
 
-        for image, prompt_masks, student_question, gt_mask, sample_key in zip(
-            images, prompt_masks_batch, student_questions, gt_masks, sample_keys
+        for image, prompt_masks, student_question, gt_mask, sample_key, route_from_manifest in zip(
+            images, prompt_masks_batch, student_questions, gt_masks, sample_keys, routes
         ):
             gt_mask_np = self._to_numpy_mask(gt_mask)
             empty_gt_mask = int(gt_mask_np.sum()) == 0
@@ -2349,7 +2404,8 @@ class Sa2VAOPSDModelV2(BaseModel):
 
             iou = self._compute_iou(gt_mask_np, pred_mask)
             ref_mask_np = self._to_numpy_mask(pred_mask)
-            route = self._route_from_iou(iou)
+            online_route = self._route_from_iou(iou)
+            route = batch_route or route_from_manifest or online_route
             routed_count += 1
             if iou >= 0.5:
                 seg_correct_count += 1
@@ -2360,7 +2416,7 @@ class Sa2VAOPSDModelV2(BaseModel):
 
             self._debug_sample(
                 sample_key=sample_key,
-                route=route,
+                route=f"{route} (online={online_route})" if route != online_route else route,
                 student_question=student_question,
                 raw_prediction=description.raw_prediction,
                 caption=description.clean_caption,
@@ -2562,6 +2618,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         if optimized_count == 0:
             metrics = {
                 "loss_opsd_total": zero,
+                "batch_route": batch_route or "",
                 "opsd_total_cum": self._metric_tensor(cumulative_loss_opsd_total, zero.dtype),
                 "opsd_regen_ce": zero,
                 "opsd_regen_ce_cum": self._metric_tensor(cumulative_regen_ce, zero.dtype),
@@ -2637,6 +2694,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             )
         metrics = {
             "loss_opsd_total": avg_total_loss,
+            "batch_route": batch_route or last_route,
             "opsd_total_cum": self._metric_tensor(cumulative_loss_opsd_total, avg_total_loss.dtype),
             "opsd_regen_ce": avg_regen_ce.detach(),
             "opsd_regen_ce_cum": self._metric_tensor(cumulative_regen_ce, avg_total_loss.dtype),
