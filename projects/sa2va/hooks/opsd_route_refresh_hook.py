@@ -42,6 +42,16 @@ class OpsdRouteRefreshHook(Hook):
         if self._dist_is_initialized():
             torch.distributed.barrier()
 
+    def _sync_success_or_raise(self, runner, ok: bool):
+        if not self._dist_is_initialized():
+            if not ok:
+                raise RuntimeError("OPSD route refresh failed on rank0.")
+            return
+        status = torch.tensor([1 if ok else 0], device=self._unwrap_model(runner).device)
+        torch.distributed.broadcast(status, src=0)
+        if int(status.item()) != 1:
+            raise RuntimeError("OPSD route refresh failed on rank0; aborting all ranks.")
+
     def _build_export_paths(self, runner, global_step: int):
         cache_dir = Path(runner.work_dir) / self.route_cache_dir
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -73,6 +83,9 @@ class OpsdRouteRefreshHook(Hook):
         dataloader = getattr(train_loop, "dataloader", None)
         if dataloader is None:
             return
+        self._refresh_dataset_and_log(runner, dataloader)
+
+    def _refresh_dataset_and_log(self, runner, dataloader) -> None:
         dataset = getattr(dataloader, "dataset", None)
         refresh_fn = getattr(dataset, "refresh_route_manifest_if_needed", None)
         if callable(refresh_fn):
@@ -96,6 +109,15 @@ class OpsdRouteRefreshHook(Hook):
         refresh_iter = int(getattr(runner, "iter", -1)) + 1
         if refresh_iter <= 0 or refresh_iter % self.interval != 0:
             return
+        export_ok = True
         if self._is_rank0():
-            self._export_routes(runner, refresh_iter)
-        self._barrier()
+            try:
+                self._export_routes(runner, refresh_iter)
+            except Exception:
+                export_ok = False
+                runner.logger.exception("Failed to export OPSD route manifest at iter=%s", refresh_iter)
+        self._sync_success_or_raise(runner, export_ok)
+        train_loop = getattr(runner, "train_loop", None)
+        dataloader = getattr(train_loop, "dataloader", None)
+        if dataloader is not None:
+            self._refresh_dataset_and_log(runner, dataloader)

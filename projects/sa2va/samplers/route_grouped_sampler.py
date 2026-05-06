@@ -39,6 +39,8 @@ class RouteGroupedSampler(Sampler[int]):
         self.epoch = 0
         self.rank = self._resolve_rank(rank)
         self.world_size = self._resolve_world_size(world_size)
+        self._cached_rank_indices: List[int] = []
+        self._cached_manifest_version = None
 
     @staticmethod
     def _dist_is_initialized() -> bool:
@@ -119,13 +121,33 @@ class RouteGroupedSampler(Sampler[int]):
             rank_indices.extend(global_batch[local_start:local_end])
         return rank_indices
 
+    def _get_manifest_version(self):
+        get_manifest_version = getattr(self.dataset, "get_route_manifest_version", None)
+        if callable(get_manifest_version):
+            return int(get_manifest_version())
+        return None
+
+    def _refresh_cached_indices_if_needed(self) -> None:
+        manifest_version = self._get_manifest_version()
+        if (
+            self._cached_manifest_version != manifest_version
+            or not self._cached_rank_indices
+        ):
+            self._cached_rank_indices = self._build_rank_indices()
+            self._cached_manifest_version = manifest_version
+
     def __iter__(self):
-        return iter(self._build_rank_indices())
+        self._refresh_cached_indices_if_needed()
+        position = 0
+        while position < len(self._cached_rank_indices):
+            manifest_version = self._get_manifest_version()
+            if manifest_version != self._cached_manifest_version:
+                self._refresh_cached_indices_if_needed()
+                position = 0
+                continue
+            yield self._cached_rank_indices[position]
+            position += 1
 
     def __len__(self) -> int:
-        total_local_samples = 0
-        for indices in self._build_route_buckets().values():
-            total_local_samples += (
-                len(indices) // self.global_batch_size
-            ) * self.per_device_batch_size
-        return total_local_samples
+        self._refresh_cached_indices_if_needed()
+        return len(self._cached_rank_indices)

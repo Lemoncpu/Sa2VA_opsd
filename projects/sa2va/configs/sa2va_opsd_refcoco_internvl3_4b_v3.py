@@ -23,7 +23,7 @@ device = "auto"
 
 batch_size = 1
 accumulative_counts = 1
-dataloader_num_workers = 2
+dataloader_num_workers = 0
 max_epochs = 1
 optim_type = AdamW
 lr = 2e-5
