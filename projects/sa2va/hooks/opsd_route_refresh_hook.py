@@ -83,9 +83,9 @@ class OpsdRouteRefreshHook(Hook):
         dataloader = getattr(train_loop, "dataloader", None)
         if dataloader is None:
             return
-        self._refresh_dataset_and_log(runner, dataloader)
+        self._refresh_dataset_and_log(runner, train_loop, dataloader)
 
-    def _refresh_dataset_and_log(self, runner, dataloader) -> None:
+    def _refresh_dataset_and_log(self, runner, train_loop, dataloader) -> None:
         dataset = getattr(dataloader, "dataset", None)
         refresh_fn = getattr(dataset, "refresh_route_manifest_if_needed", None)
         if callable(refresh_fn):
@@ -120,4 +120,4 @@ class OpsdRouteRefreshHook(Hook):
         train_loop = getattr(runner, "train_loop", None)
         dataloader = getattr(train_loop, "dataloader", None)
         if dataloader is not None:
-            self._refresh_dataset_and_log(runner, dataloader)
+            self._refresh_dataset_and_log(runner, train_loop, dataloader)

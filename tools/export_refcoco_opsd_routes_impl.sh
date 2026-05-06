@@ -14,6 +14,11 @@ ENTRY_NAME="${SA2VA_REFCOCO_OPSD_ENTRY_NAME:-$(basename "$0")}"
 
 CONFIG="${CONFIG:-${DEFAULT_CONFIG}}"
 ACTIVATE_SCRIPT="${ACTIVATE_SCRIPT:-.venv/bin/activate}"
+GPUS="${GPUS:-}"
+PORT="${PORT:-$((29500 + RANDOM % 1000))}"
+MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+CUDA_DEVICE_IDS="${CUDA_VISIBLE_DEVICES:-}"
+
 DATA_ROOT="${DATA_ROOT:-/data/xiaoyicheng/refcoco}"
 IMAGE_ROOT="${IMAGE_ROOT:-/data/xiaoyicheng/refcoco/train2014}"
 DATASET="${DATASET:-refcoco}"
@@ -26,10 +31,95 @@ ROUTE_MODEL="${ROUTE_MODEL:-teacher}"
 GLOBAL_STEP="${GLOBAL_STEP:-0}"
 LIMIT="${LIMIT:-}"
 DEVICE="${DEVICE:-}"
+DEEPSPEED="${DEEPSPEED:-deepspeed_zero2}"
+DEFAULT_GPUS=8
+
+count_csv_items() {
+  local csv="${1// /}"
+  local count=0
+  local rest
+  local item
+
+  if [[ -z "${csv}" ]]; then
+    echo 0
+    return
+  fi
+
+  rest="${csv},"
+  while [[ -n "${rest}" ]]; do
+    item="${rest%%,*}"
+    rest="${rest#*,}"
+    count=$((count + 1))
+  done
+
+  echo "${count}"
+}
+
+build_cuda_device_ids() {
+  local gpu_count="$1"
+  local ids=()
+  local idx
+
+  for ((idx = 0; idx < gpu_count; idx++)); do
+    ids+=("${idx}")
+  done
+
+  (
+    IFS=','
+    echo "${ids[*]}"
+  )
+}
+
+validate_gpu_count() {
+  local gpu_count="$1"
+
+  if [[ ! "${gpu_count}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "GPU count must be a positive integer, got: ${gpu_count}" >&2
+    exit 1
+  fi
+}
+
+validate_positive_int() {
+  local option_name="$1"
+  local value="$2"
+
+  if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "${option_name} must be a positive integer, got: ${value}" >&2
+    exit 1
+  fi
+}
+
+validate_cuda_device_ids() {
+  local csv="${1// /}"
+  local rest
+  local item
+  declare -A seen=()
+
+  if [[ -z "${csv}" ]]; then
+    echo "CUDA device ids cannot be empty." >&2
+    exit 1
+  fi
+
+  rest="${csv},"
+  while [[ -n "${rest}" ]]; do
+    item="${rest%%,*}"
+    rest="${rest#*,}"
+
+    if [[ ! "${item}" =~ ^[0-9]+$ ]]; then
+      echo "Invalid CUDA device id: ${item}. Use comma-separated integers like 0,1,3." >&2
+      exit 1
+    fi
+    if [[ -n "${seen[${item}]:-}" ]]; then
+      echo "Duplicate CUDA device id: ${item}" >&2
+      exit 1
+    fi
+    seen["${item}"]=1
+  done
+}
 
 usage() {
   echo "Usage:"
-  echo "  bash tools/${ENTRY_NAME} [options]"
+  echo "  bash tools/${ENTRY_NAME} [options] [-- extra export args]"
   echo
   echo "Options:"
   echo "  --model-path PATH       Base model path. Default: ${DEFAULT_MODEL_PATH}"
@@ -41,10 +131,15 @@ usage() {
   echo "  --dataset NAME          refcoco | refcoco_plus | refcoco+ | refcocog. Default: refcoco"
   echo "  --split NAME            Dataset split. Default: train"
   echo "  --work-dir PATH         Output work dir. Default: ${DEFAULT_WORK_DIR}"
+  echo "  --gpus N                Number of GPUs. If omitted, infer from --cuda-devices."
+  echo "  --cuda-count N          Alias of --gpus."
+  echo "  --cuda-devices IDS      Comma-separated CUDA ids, e.g. 0,1,3. If omitted, uses 0..N-1."
+  echo "  --port N                torchrun master port. Default: random port in [29500, 30499]"
+  echo "  --deepspeed NAME        Compatibility arg forwarded through tools/dist.sh. Default: deepspeed_zero2"
   echo "  --route-model NAME      teacher | student. Default: teacher"
   echo "  --global-step N         Recorded global step. Default: 0"
-  echo "  --limit N               Optional sample cap for dry run."
-  echo "  --device STR            Optional device override, e.g. cuda:0"
+  echo "  --limit N               Optional sample cap."
+  echo "  --device STR            Optional single-process device override, e.g. cuda:0"
   echo "  -h, --help              Show this help."
 }
 
@@ -86,6 +181,22 @@ while [[ $# -gt 0 ]]; do
       WORK_DIR="$2"
       shift 2
       ;;
+    --gpus|--cuda-count)
+      GPUS="$2"
+      shift 2
+      ;;
+    --cuda-devices|--gpu-ids)
+      CUDA_DEVICE_IDS="$2"
+      shift 2
+      ;;
+    --port)
+      PORT="$2"
+      shift 2
+      ;;
+    --deepspeed)
+      DEEPSPEED="$2"
+      shift 2
+      ;;
     --route-model)
       ROUTE_MODEL="$2"
       shift 2
@@ -106,6 +217,10 @@ while [[ $# -gt 0 ]]; do
       usage
       exit 0
       ;;
+    --)
+      shift
+      break
+      ;;
     *)
       echo "Unknown option: $1" >&2
       echo >&2
@@ -114,6 +229,39 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+EXTRA_ARGS=("$@")
+
+if [[ -n "${LIMIT}" ]]; then
+  validate_positive_int "--limit" "${LIMIT}"
+fi
+
+if [[ -n "${CUDA_DEVICE_IDS}" ]]; then
+  CUDA_DEVICE_IDS="${CUDA_DEVICE_IDS// /}"
+  validate_cuda_device_ids "${CUDA_DEVICE_IDS}"
+fi
+
+if [[ -z "${GPUS}" && -z "${CUDA_DEVICE_IDS}" ]]; then
+  GPUS=1
+  CUDA_DEVICE_IDS="$(build_cuda_device_ids "${GPUS}")"
+elif [[ -n "${CUDA_DEVICE_IDS}" ]]; then
+  CUDA_DEVICE_COUNT="$(count_csv_items "${CUDA_DEVICE_IDS}")"
+  if [[ -z "${GPUS}" ]]; then
+    GPUS="${CUDA_DEVICE_COUNT}"
+  fi
+fi
+
+validate_gpu_count "${GPUS}"
+
+if [[ -z "${CUDA_DEVICE_IDS}" ]]; then
+  CUDA_DEVICE_IDS="$(build_cuda_device_ids "${GPUS}")"
+fi
+
+CUDA_DEVICE_COUNT="$(count_csv_items "${CUDA_DEVICE_IDS}")"
+if [[ "${GPUS}" -ne "${CUDA_DEVICE_COUNT}" ]]; then
+  echo "--gpus/--cuda-count (${GPUS}) does not match --cuda-devices count (${CUDA_DEVICE_COUNT})." >&2
+  exit 1
+fi
 
 if [[ ! -f "${ACTIVATE_SCRIPT}" ]]; then
   echo "Activate script does not exist: ${ACTIVATE_SCRIPT}" >&2
@@ -165,9 +313,7 @@ fi
 mkdir -p "${WORK_DIR}/route_cache"
 OUT_PATH="${WORK_DIR}/route_cache/routes_step_$(printf '%07d' "${GLOBAL_STEP}").jsonl"
 
-CMD=(
-  python tools/export_opsd_routes.py
-  "${CONFIG}"
+EXPORT_ARGS=(
   --out "${OUT_PATH}"
   --route-model "${ROUTE_MODEL}"
   --global-step "${GLOBAL_STEP}"
@@ -185,13 +331,16 @@ CMD=(
 )
 
 if [[ -n "${CHECKPOINT_PATH}" ]]; then
-  CMD+=(--checkpoint "${CHECKPOINT_PATH}")
+  EXPORT_ARGS+=(--checkpoint "${CHECKPOINT_PATH}")
 fi
 if [[ -n "${LIMIT}" ]]; then
-  CMD+=(--limit "${LIMIT}")
+  EXPORT_ARGS+=(--limit "${LIMIT}")
 fi
 if [[ -n "${DEVICE}" ]]; then
-  CMD+=(--device "${DEVICE}")
+  EXPORT_ARGS+=(--device "${DEVICE}")
+fi
+if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+  EXPORT_ARGS+=("${EXTRA_ARGS[@]}")
 fi
 
 export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}"
@@ -214,6 +363,21 @@ echo "  ROUTE_MODEL=${ROUTE_MODEL}"
 echo "  GLOBAL_STEP=${GLOBAL_STEP}"
 echo "  LIMIT=${LIMIT}"
 echo "  DEVICE=${DEVICE}"
+echo "  GPUS=${GPUS}"
+echo "  CUDA_VISIBLE_DEVICES=${CUDA_DEVICE_IDS}"
+echo "  PORT=${PORT}"
+echo "  DEEPSPEED=${DEEPSPEED}"
 echo "  OUT_PATH=${OUT_PATH}"
 
-"${CMD[@]}"
+if [[ "${GPUS}" -eq 1 ]]; then
+  PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}" \
+  CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_IDS}" \
+  python tools/export_opsd_routes.py "${CONFIG}" "${EXPORT_ARGS[@]}"
+else
+  PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}" \
+  CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_IDS}" \
+  PORT="${PORT}" \
+  MASTER_ADDR="${MASTER_ADDR}" \
+  DEEPSPEED="${DEEPSPEED}" \
+  bash tools/dist.sh export_opsd_routes "${CONFIG}" "${GPUS}" "${EXPORT_ARGS[@]}"
+fi
