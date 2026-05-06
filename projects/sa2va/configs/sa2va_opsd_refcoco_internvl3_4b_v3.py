@@ -2,14 +2,15 @@ from mmengine.hooks import CheckpointHook, DistSamplerSeedHook, IterTimerHook, L
 from mmengine.optim import CosineAnnealingLR, LinearLR, OptimWrapper
 from torch.optim import AdamW
 
-from xtuner.dataset.samplers import LengthGroupedSampler
 from xtuner.engine.runner import TrainLoop
 
 from projects.sa2va.hooks.ema_teacher_hook import EMATeacherHook
+from projects.sa2va.hooks.opsd_route_refresh_hook import OpsdRouteRefreshHook
 from projects.sa2va.datasets.common import DEFAULT_MASK_TO_CAPTION_QUESTION
 from projects.sa2va.datasets.data_utils_opsd_v2 import sa2va_opsd_collect_fn_v2
 from projects.sa2va.datasets.refcoco_opsd import Sa2VAOpsdRefCocoDataset
 from projects.sa2va.models.sa2va_opsd_v3 import Sa2VAOPSDModelV3
+from projects.sa2va.samplers.route_grouped_sampler import RouteGroupedSampler
 
 
 path = "./pretrained/Sa2VA-4B"
@@ -32,6 +33,10 @@ max_norm = 1
 warmup_ratio = 0.03
 save_steps = 100
 save_total_limit = 2
+route_refresh_interval = 5000
+route_cache_dir = "./work_dirs/sa2va_opsd_refcoco_internvl3_4b_v3/route_cache"
+route_manifest_path = f"{route_cache_dir}/routes_step_0000000.jsonl"
+route_manifest_latest_path = f"{route_cache_dir}/routes_latest.jsonl"
 
 model = dict(
     type=Sa2VAOPSDModelV3,
@@ -56,6 +61,7 @@ model = dict(
     grpo_sample_max_new_tokens=48,
     low_iou_regen_max_new_tokens=48,
     min_caption_tokens=4,
+    enable_ddp_route_safety_loss=True,
     reconstruct_question_template="<image>Please segment the region described as: {caption}",
 )
 
@@ -74,6 +80,10 @@ train_dataset = dict(
     shuffle=False,
     skip_empty_masks=True,
     student_question=DEFAULT_MASK_TO_CAPTION_QUESTION,
+    route_manifest_path=route_manifest_path,
+    route_manifest_latest_path=route_manifest_latest_path,
+    route_manifest_required=True,
+    skip_route_manifest_skip_samples=True,
 )
 
 train_dataloader = dict(
@@ -81,9 +91,11 @@ train_dataloader = dict(
     num_workers=dataloader_num_workers,
     dataset=train_dataset,
     sampler=dict(
-        type=LengthGroupedSampler,
-        length_property="modality_length",
+        type=RouteGroupedSampler,
         per_device_batch_size=batch_size * accumulative_counts,
+        shuffle=True,
+        drop_last=True,
+        require_routes=True,
     ),
     collate_fn=dict(type=sa2va_opsd_collect_fn_v2),
 )
@@ -97,7 +109,7 @@ optim_wrapper = dict(
 
 model_wrapper_cfg = dict(
     type="MMDistributedDataParallel",
-    find_unused_parameters=True,
+    find_unused_parameters=False,
     broadcast_buffers=False,
 )
 
@@ -124,6 +136,12 @@ train_cfg = dict(type=TrainLoop, max_epochs=max_epochs)
 
 custom_hooks = [
     dict(type=EMATeacherHook),
+    dict(
+        type=OpsdRouteRefreshHook,
+        interval=route_refresh_interval,
+        route_cache_dir="route_cache",
+        route_model="teacher",
+    ),
 ]
 
 default_hooks = dict(

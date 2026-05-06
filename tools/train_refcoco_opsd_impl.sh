@@ -349,6 +349,9 @@ mkdir -p "${WORK_DIR}"
 EFFECTIVE_BATCH_SIZE="${BATCH_SIZE_OVERRIDE:-1}"
 EFFECTIVE_ACCUMULATIVE_COUNTS="${ACCUMULATIVE_COUNTS_OVERRIDE:-1}"
 PER_DEVICE_BATCH_SIZE_OVERRIDE=$((EFFECTIVE_BATCH_SIZE * EFFECTIVE_ACCUMULATIVE_COUNTS))
+ROUTE_CACHE_DIR="${WORK_DIR}/route_cache"
+ROUTE_MANIFEST_PATH="${ROUTE_CACHE_DIR}/routes_step_0000000.jsonl"
+ROUTE_MANIFEST_LATEST_PATH="${ROUTE_CACHE_DIR}/routes_latest.jsonl"
 
 TRAIN_ARGS=(--work-dir "${WORK_DIR}")
 TRAIN_ARGS+=(
@@ -366,6 +369,10 @@ TRAIN_ARGS+=(
   "train_dataloader.dataset.dataset_name=${DATASET}"
   "train_dataloader.dataset.split=${SPLIT}"
   "train_dataloader.dataset.image_root=${IMAGE_ROOT}"
+  "train_dataset.route_manifest_path=${ROUTE_MANIFEST_PATH}"
+  "train_dataset.route_manifest_latest_path=${ROUTE_MANIFEST_LATEST_PATH}"
+  "train_dataloader.dataset.route_manifest_path=${ROUTE_MANIFEST_PATH}"
+  "train_dataloader.dataset.route_manifest_latest_path=${ROUTE_MANIFEST_LATEST_PATH}"
 )
 if [[ -n "${BATCH_SIZE_OVERRIDE}" ]]; then
   TRAIN_ARGS+=(

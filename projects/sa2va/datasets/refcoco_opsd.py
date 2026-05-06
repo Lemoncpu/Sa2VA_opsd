@@ -1,3 +1,4 @@
+import json
 import os
 import random
 from typing import Dict, List, Optional, Tuple
@@ -9,6 +10,14 @@ from pycocotools import mask as mask_utils
 from torch.utils.data import Dataset
 
 from .sa2va_opsd_npz_v2 import DEFAULT_STUDENT_QUESTION
+
+
+VALID_OPSD_ROUTES = {
+    "teacher_regenerate",
+    "on_policy_distill",
+    "grpo_positive",
+}
+SKIP_OPSD_ROUTE = "skip"
 
 
 DATASET_META = {
@@ -127,6 +136,10 @@ class Sa2VAOpsdRefCocoDataset(Dataset):
         max_refetch: int = 20,
         skip_empty_masks: bool = True,
         skip_missing_images: bool = True,
+        route_manifest_path: str = None,
+        route_manifest_latest_path: str = None,
+        route_manifest_required: bool = False,
+        skip_route_manifest_skip_samples: bool = True,
         **kwargs,
     ):
         del kwargs
@@ -140,7 +153,14 @@ class Sa2VAOpsdRefCocoDataset(Dataset):
         self.max_refetch = max_refetch
         self.skip_empty_masks = skip_empty_masks
         self.skip_missing_images = skip_missing_images
-        self.records, self.image_root = build_refcoco_opsd_records(
+        self.route_manifest_path = route_manifest_path
+        self.route_manifest_latest_path = route_manifest_latest_path
+        self.route_manifest_required = route_manifest_required
+        self.skip_route_manifest_skip_samples = skip_route_manifest_skip_samples
+        self.active_route_manifest_path = None
+        self.route_manifest_mtime = None
+        self.route_info_by_key = {}
+        self._base_records, self.image_root = build_refcoco_opsd_records(
             data_root=data_root,
             dataset_name=dataset_name,
             split=split,
@@ -152,17 +172,110 @@ class Sa2VAOpsdRefCocoDataset(Dataset):
         if self.max_records is not None:
             if self.max_records <= 0:
                 raise ValueError(f"max_records must be positive, got {self.max_records}.")
-            self.records = self.records[: self.max_records]
-        if not self.records:
+            self._base_records = self._base_records[: self.max_records]
+        if not self._base_records:
             raise ValueError(
                 f"No RefCOCO OPSD records found for dataset={dataset_name}, split={split}, image_root={self.image_root}."
             )
         if shuffle:
-            random.shuffle(self.records)
+            random.shuffle(self._base_records)
+        self.records = list(self._base_records)
+        self.load_route_manifest(required=self.route_manifest_required)
+        self._apply_route_manifest_filter()
 
     @property
     def modality_length(self):
         return [100] * len(self)
+
+    def resolve_active_route_manifest_path(self) -> Optional[str]:
+        latest_path = self.route_manifest_latest_path
+        if latest_path and os.path.exists(latest_path):
+            return latest_path
+        return self.route_manifest_path
+
+    @staticmethod
+    def load_route_manifest_file(path: str) -> Dict[str, Dict]:
+        info_by_key = {}
+        with open(path, "r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                item = json.loads(line)
+                sample_key = item.get("sample_key")
+                if not sample_key:
+                    raise ValueError(f"Missing sample_key in route manifest {path}:{line_no}")
+                route = item.get("route")
+                if route not in VALID_OPSD_ROUTES and route != "skip":
+                    raise ValueError(
+                        f"Invalid route {route!r} for sample_key={sample_key!r} in {path}:{line_no}"
+                    )
+                info_by_key[sample_key] = item
+        return info_by_key
+
+    def load_route_manifest(self, required: bool = False):
+        path = self.resolve_active_route_manifest_path()
+        self.route_info_by_key = {}
+        self.active_route_manifest_path = path
+        self.route_manifest_mtime = None
+        if not path:
+            if required:
+                raise FileNotFoundError("route_manifest_path is required but was not set.")
+            return
+        if not os.path.exists(path):
+            if required:
+                raise FileNotFoundError(f"Route manifest does not exist: {path}")
+            return
+        self.route_info_by_key = self.load_route_manifest_file(path)
+        self.route_manifest_mtime = os.path.getmtime(path)
+
+    def _apply_route_manifest_filter(self):
+        if self.skip_route_manifest_skip_samples and self.route_info_by_key:
+            self.records = [
+                record
+                for record in self._base_records
+                if self.get_route_for_sample_key(record["sample_key"]) != SKIP_OPSD_ROUTE
+            ]
+            if not self.records:
+                raise ValueError(
+                    "All RefCOCO OPSD records were filtered by route manifest: "
+                    f"{self.active_route_manifest_path or self.route_manifest_path}"
+                )
+            return
+        self.records = list(self._base_records)
+
+    def refresh_route_manifest_if_needed(self, force: bool = False):
+        path = self.resolve_active_route_manifest_path()
+        if not path or not os.path.exists(path):
+            return
+        mtime = os.path.getmtime(path)
+        if (
+            force
+            or self.active_route_manifest_path != path
+            or self.route_manifest_mtime is None
+            or mtime != self.route_manifest_mtime
+        ):
+            self.load_route_manifest(required=self.route_manifest_required)
+            self._apply_route_manifest_filter()
+
+    def get_route_for_sample_key(self, sample_key: str):
+        info = self.route_info_by_key.get(sample_key, {})
+        return info.get("route")
+
+    def get_route_info_for_index(self, index: int) -> Dict:
+        record = self.records[index % len(self.records)]
+        return self.route_info_by_key.get(record["sample_key"], {})
+
+    def get_route_for_index(self, index: int):
+        return self.get_route_info_for_index(index).get("route")
+
+    def get_route_distribution(self) -> Dict[str, int]:
+        route_counts: Dict[str, int] = {}
+        for record in self.records:
+            route = self.get_route_for_sample_key(record["sample_key"])
+            route_key = route or "missing"
+            route_counts[route_key] = route_counts.get(route_key, 0) + 1
+        return route_counts
 
     def __len__(self):
         return len(self.records) * self.repeats
@@ -173,6 +286,7 @@ class Sa2VAOpsdRefCocoDataset(Dataset):
 
     def prepare_data(self, index: int):
         record = self.records[index % len(self.records)]
+        route_info = self.route_info_by_key.get(record["sample_key"], {})
         image = Image.open(record["image_path"]).convert("RGB")
         gt_mask = torch.from_numpy(np.asarray(record["gt_mask"]).astype(np.uint8))
         if self.skip_empty_masks and int(gt_mask.sum().item()) == 0:
@@ -183,6 +297,11 @@ class Sa2VAOpsdRefCocoDataset(Dataset):
             "student_question": self.student_question,
             "gt_mask": gt_mask,
             "sample_key": record["sample_key"],
+            "route": route_info.get("route"),
+            "route_iou": route_info.get("iou"),
+            "route_global_step": route_info.get("global_step"),
+            "route_timestamp": route_info.get("timestamp"),
+            "route_manifest_path": self.active_route_manifest_path or self.route_manifest_path,
             "npz_path": None,
             "frame1": None,
             "mask1": None,
