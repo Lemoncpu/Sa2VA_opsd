@@ -25,7 +25,6 @@ def parse_args():
     parser.add_argument("--checkpoint", default=None, help="Checkpoint to load before route export.")
     parser.add_argument("--out", required=True, help="Output JSONL path.")
     parser.add_argument("--limit", type=int, default=None, help="Optional sample cap.")
-    parser.add_argument("--device", default=None, help="Runtime device override.")
     parser.add_argument(
         "--route-model",
         default="teacher",
@@ -124,12 +123,12 @@ def barrier() -> None:
         torch.distributed.barrier()
 
 
-def build_model_from_cfg(cfg: dict, *, device: str = None):
+def build_model_from_cfg(cfg: dict):
     from projects.sa2va.models.sa2va_opsd_v3 import Sa2VAOPSDModelV3
 
     model_cfg = dict(cfg["model"])
     model_cfg.pop("type", None)
-    model_cfg["device"] = device or model_cfg.get("device", "auto")
+    model_cfg["device"] = model_cfg.get("device", "auto")
     model = Sa2VAOPSDModelV3(**model_cfg)
     model.eval()
     return model
@@ -276,6 +275,9 @@ def export_routes(
 ):
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    sync_device = getattr(model, "device", None)
+    if sync_device is None:
+        sync_device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}") if torch.cuda.is_available() else torch.device("cpu")
     timestamp = datetime.now(timezone.utc).isoformat() if is_rank0() else None
     if dist_is_initialized():
         payload = [timestamp]
@@ -285,15 +287,23 @@ def export_routes(
     rank = get_rank()
     world_size = get_world_size()
     shard_out_path = build_rank_shard_path(out_path, rank, world_size)
-    shard_counts, shard_record_count = export_routes_shard(
-        model=model,
-        samples=shard_samples_local,
-        shard_out_path=shard_out_path,
-        global_step=global_step,
-        route_model=route_model,
-        timestamp=timestamp,
-    )
-    barrier()
+    shard_counts = {}
+    shard_record_count = 0
+    shard_ok = True
+    try:
+        shard_counts, shard_record_count = export_routes_shard(
+            model=model,
+            samples=shard_samples_local,
+            shard_out_path=shard_out_path,
+            global_step=global_step,
+            route_model=route_model,
+            timestamp=timestamp,
+        )
+    except Exception:
+        shard_ok = False
+        if shard_out_path.exists():
+            shard_out_path.unlink()
+    sync_success_or_raise(shard_ok, device=sync_device)
 
     gathered_counts = [None] * world_size
     gathered_records = [None] * world_size
@@ -306,16 +316,25 @@ def export_routes(
 
     merged_counts = merge_route_counts(gathered_counts)
     shard_paths = [build_rank_shard_path(out_path, shard_rank, world_size) for shard_rank in range(world_size)]
+    merge_ok = True
     if is_rank0():
-        merge_shards(
-            out_path=out_path,
-            shard_paths=shard_paths,
-            update_latest=update_latest,
-        )
-    barrier()
+        try:
+            merge_shards(
+                out_path=out_path,
+                shard_paths=shard_paths,
+                update_latest=update_latest,
+            )
+        except Exception:
+            merge_ok = False
+    sync_success_or_raise(merge_ok, device=sync_device)
+
+    cleanup_ok = True
     if is_rank0():
-        cleanup_shards(shard_paths)
-    barrier()
+        try:
+            cleanup_shards(shard_paths)
+        except Exception:
+            cleanup_ok = False
+    sync_success_or_raise(cleanup_ok, device=sync_device)
     return {
         "route_counts": merged_counts,
         "record_count": int(sum(int(item) for item in gathered_records)),
@@ -358,12 +377,13 @@ def export_routes_from_runner(
 def main():
     args = parse_args()
     maybe_init_distributed(args)
+    print_summary = is_rank0()
     cfg = load_config(args.config, cfg_options=args.cfg_options)
     export_ok = True
     export_summary = None
     model = None
     try:
-        model = build_model_from_cfg(cfg, device=args.device)
+        model = build_model_from_cfg(cfg)
         load_checkpoint_if_needed(model, args.checkpoint)
         samples = collect_refcoco_samples_from_cfg(
             cfg,
@@ -396,7 +416,7 @@ def main():
             if dist_is_initialized():
                 torch.distributed.destroy_process_group()
 
-    if is_rank0():
+    if print_summary:
         print(
             json.dumps(
                 {

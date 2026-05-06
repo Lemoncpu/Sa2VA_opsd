@@ -1,5 +1,3 @@
-import os
-import shutil
 from pathlib import Path
 
 import torch
@@ -45,12 +43,12 @@ class OpsdRouteRefreshHook(Hook):
     def _sync_success_or_raise(self, runner, ok: bool):
         if not self._dist_is_initialized():
             if not ok:
-                raise RuntimeError("OPSD route refresh failed on rank0.")
+                raise RuntimeError("OPSD route refresh failed.")
             return
         status = torch.tensor([1 if ok else 0], device=self._unwrap_model(runner).device)
-        torch.distributed.broadcast(status, src=0)
+        torch.distributed.all_reduce(status, op=torch.distributed.ReduceOp.MIN)
         if int(status.item()) != 1:
-            raise RuntimeError("OPSD route refresh failed on rank0; aborting all ranks.")
+            raise RuntimeError("OPSD route refresh failed on at least one rank; aborting all ranks.")
 
     def _build_export_paths(self, runner, global_step: int):
         cache_dir = Path(runner.work_dir) / self.route_cache_dir
@@ -62,7 +60,7 @@ class OpsdRouteRefreshHook(Hook):
     def _export_routes(self, runner, global_step: int):
         from tools.export_opsd_routes import export_routes_from_runner
 
-        manifest_path, latest_path = self._build_export_paths(runner, global_step)
+        manifest_path, _ = self._build_export_paths(runner, global_step)
         export_routes_from_runner(
             runner=runner,
             out_path=str(manifest_path),
@@ -70,13 +68,8 @@ class OpsdRouteRefreshHook(Hook):
             route_model=self.route_model,
             limit=self.export_limit,
         )
-        if latest_path.exists() or latest_path.is_symlink():
-            latest_path.unlink()
-        try:
-            latest_path.symlink_to(manifest_path.name)
-        except OSError:
-            shutil.copyfile(manifest_path, latest_path)
-        runner.logger.info(f"Exported OPSD route manifest to {manifest_path}")
+        if self._is_rank0():
+            runner.logger.info(f"Exported OPSD route manifest to {manifest_path}")
 
     def before_train_epoch(self, runner) -> None:
         train_loop = getattr(runner, "train_loop", None)
@@ -110,12 +103,15 @@ class OpsdRouteRefreshHook(Hook):
         if refresh_iter <= 0 or refresh_iter % self.interval != 0:
             return
         export_ok = True
-        if self._is_rank0():
-            try:
-                self._export_routes(runner, refresh_iter)
-            except Exception:
-                export_ok = False
-                runner.logger.exception("Failed to export OPSD route manifest at iter=%s", refresh_iter)
+        try:
+            self._export_routes(runner, refresh_iter)
+        except Exception:
+            export_ok = False
+            runner.logger.exception(
+                "Failed to export OPSD route manifest at iter=%s on rank=%s",
+                refresh_iter,
+                torch.distributed.get_rank() if self._dist_is_initialized() else 0,
+            )
         self._sync_success_or_raise(runner, export_ok)
         train_loop = getattr(runner, "train_loop", None)
         dataloader = getattr(train_loop, "dataloader", None)

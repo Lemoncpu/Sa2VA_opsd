@@ -30,7 +30,6 @@ CHECKPOINT_PATH="${CHECKPOINT_PATH:-}"
 ROUTE_MODEL="${ROUTE_MODEL:-teacher}"
 GLOBAL_STEP="${GLOBAL_STEP:-0}"
 LIMIT="${LIMIT:-}"
-DEVICE="${DEVICE:-}"
 DEEPSPEED="${DEEPSPEED:-deepspeed_zero2}"
 DEFAULT_GPUS=8
 
@@ -139,7 +138,6 @@ usage() {
   echo "  --route-model NAME      teacher | student. Default: teacher"
   echo "  --global-step N         Recorded global step. Default: 0"
   echo "  --limit N               Optional sample cap."
-  echo "  --device STR            Optional single-process device override, e.g. cuda:0"
   echo "  -h, --help              Show this help."
 }
 
@@ -207,10 +205,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --limit)
       LIMIT="$2"
-      shift 2
-      ;;
-    --device)
-      DEVICE="$2"
       shift 2
       ;;
     -h|--help)
@@ -336,9 +330,6 @@ fi
 if [[ -n "${LIMIT}" ]]; then
   EXPORT_ARGS+=(--limit "${LIMIT}")
 fi
-if [[ -n "${DEVICE}" ]]; then
-  EXPORT_ARGS+=(--device "${DEVICE}")
-fi
 if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
   EXPORT_ARGS+=("${EXTRA_ARGS[@]}")
 fi
@@ -362,7 +353,6 @@ echo "  CHECKPOINT_PATH=${CHECKPOINT_PATH}"
 echo "  ROUTE_MODEL=${ROUTE_MODEL}"
 echo "  GLOBAL_STEP=${GLOBAL_STEP}"
 echo "  LIMIT=${LIMIT}"
-echo "  DEVICE=${DEVICE}"
 echo "  GPUS=${GPUS}"
 echo "  CUDA_VISIBLE_DEVICES=${CUDA_DEVICE_IDS}"
 echo "  PORT=${PORT}"
