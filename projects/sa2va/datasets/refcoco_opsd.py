@@ -159,6 +159,7 @@ class Sa2VAOpsdRefCocoDataset(Dataset):
         self.skip_route_manifest_skip_samples = skip_route_manifest_skip_samples
         self.active_route_manifest_path = None
         self.route_manifest_mtime = None
+        self.route_manifest_version = 0
         self.route_info_by_key = {}
         self._base_records, self.image_root = build_refcoco_opsd_records(
             data_root=data_root,
@@ -228,6 +229,7 @@ class Sa2VAOpsdRefCocoDataset(Dataset):
             return
         self.route_info_by_key = self.load_route_manifest_file(path)
         self.route_manifest_mtime = os.path.getmtime(path)
+        self.route_manifest_version += 1
 
     def _apply_route_manifest_filter(self):
         if self.skip_route_manifest_skip_samples and self.route_info_by_key:
@@ -258,9 +260,16 @@ class Sa2VAOpsdRefCocoDataset(Dataset):
             self.load_route_manifest(required=self.route_manifest_required)
             self._apply_route_manifest_filter()
 
+    def get_route_manifest_version(self) -> int:
+        return int(self.route_manifest_version)
+
     def get_route_for_sample_key(self, sample_key: str):
         info = self.route_info_by_key.get(sample_key, {})
         return info.get("route")
+
+    def get_sample_key_for_index(self, index: int) -> str:
+        record = self.records[index % len(self.records)]
+        return record["sample_key"]
 
     def get_route_info_for_index(self, index: int) -> Dict:
         record = self.records[index % len(self.records)]

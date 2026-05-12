@@ -1,5 +1,3 @@
-import os
-import shutil
 from pathlib import Path
 
 import torch
@@ -42,6 +40,52 @@ class OpsdRouteRefreshHook(Hook):
         if self._dist_is_initialized():
             torch.distributed.barrier()
 
+    def _get_dataset_and_sampler(self, runner):
+        train_loop = getattr(runner, "train_loop", None)
+        dataloader = getattr(train_loop, "dataloader", None)
+        if dataloader is None:
+            return train_loop, None, None
+        return train_loop, getattr(dataloader, "dataset", None), getattr(dataloader, "sampler", None)
+
+    @staticmethod
+    def _extract_batch_sample_keys(data_batch):
+        if not isinstance(data_batch, dict):
+            return []
+        data = data_batch.get("data")
+        if not isinstance(data, dict):
+            return []
+        sample_keys = data.get("sample_keys")
+        if not sample_keys:
+            return []
+        return [str(sample_key) for sample_key in sample_keys if sample_key]
+
+    def _mark_batch_consumed(self, runner, data_batch) -> None:
+        sample_keys = self._extract_batch_sample_keys(data_batch)
+        if not sample_keys:
+            return
+        _, _, sampler = self._get_dataset_and_sampler(runner)
+        if sampler is not None and hasattr(sampler, "mark_consumed_sample_keys"):
+            sampler.mark_consumed_sample_keys(sample_keys)
+
+    def _get_global_consumed_sample_keys(self, runner):
+        _, _, sampler = self._get_dataset_and_sampler(runner)
+        if sampler is None or not hasattr(sampler, "get_consumed_sample_keys"):
+            return []
+        local_sample_keys = list(sampler.get_consumed_sample_keys())
+        if not self._dist_is_initialized():
+            return local_sample_keys
+        gathered_sample_keys = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(gathered_sample_keys, local_sample_keys)
+        merged = set()
+        for sample_keys in gathered_sample_keys:
+            for sample_key in sample_keys or []:
+                if sample_key:
+                    merged.add(str(sample_key))
+        merged_list = sorted(merged)
+        if hasattr(sampler, "replace_consumed_sample_keys"):
+            sampler.replace_consumed_sample_keys(merged_list)
+        return merged_list
+
     def _build_export_paths(self, runner, global_step: int):
         cache_dir = Path(runner.work_dir) / self.route_cache_dir
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -52,27 +96,35 @@ class OpsdRouteRefreshHook(Hook):
     def _export_routes(self, runner, global_step: int):
         from tools.export_opsd_routes import export_routes_from_runner
 
-        manifest_path, latest_path = self._build_export_paths(runner, global_step)
+        consumed_sample_keys = self._get_global_consumed_sample_keys(runner)
+        manifest_path, _ = self._build_export_paths(runner, global_step)
         export_routes_from_runner(
             runner=runner,
             out_path=str(manifest_path),
             global_step=global_step,
             route_model=self.route_model,
             limit=self.export_limit,
+            consumed_sample_keys=consumed_sample_keys,
         )
-        if latest_path.exists() or latest_path.is_symlink():
-            latest_path.unlink()
-        try:
-            latest_path.symlink_to(manifest_path.name)
-        except OSError:
-            shutil.copyfile(manifest_path, latest_path)
-        runner.logger.info(f"Exported OPSD route manifest to {manifest_path}")
+        if self._is_rank0():
+            runner.logger.info(
+                "Exported OPSD route manifest to %s after excluding %s consumed samples",
+                manifest_path,
+                len(consumed_sample_keys),
+            )
 
     def before_train_epoch(self, runner) -> None:
-        train_loop = getattr(runner, "train_loop", None)
+        train_loop, _, sampler = self._get_dataset_and_sampler(runner)
+        if train_loop is None:
+            return
+        if sampler is not None and hasattr(sampler, "reset_consumed_sample_keys"):
+            sampler.reset_consumed_sample_keys()
         dataloader = getattr(train_loop, "dataloader", None)
         if dataloader is None:
             return
+        self._refresh_dataset_and_log(runner, train_loop, dataloader)
+
+    def _refresh_dataset_and_log(self, runner, train_loop, dataloader) -> None:
         dataset = getattr(dataloader, "dataset", None)
         refresh_fn = getattr(dataset, "refresh_route_manifest_if_needed", None)
         if callable(refresh_fn):
@@ -89,13 +141,16 @@ class OpsdRouteRefreshHook(Hook):
             )
 
     def after_train_iter(self, runner, batch_idx: int, data_batch=None, outputs=None) -> None:
-        del batch_idx, data_batch, outputs
+        del batch_idx, outputs
         # runner.iter is the per-process cumulative train-iteration counter in mmengine.
         # In DDP all ranks advance it in lockstep, so interval=5000 means 5000 iterations
         # on one rank rather than 5000 optimizer steps after gradient accumulation.
+        self._mark_batch_consumed(runner, data_batch)
         refresh_iter = int(getattr(runner, "iter", -1)) + 1
         if refresh_iter <= 0 or refresh_iter % self.interval != 0:
             return
-        if self._is_rank0():
-            self._export_routes(runner, refresh_iter)
-        self._barrier()
+        self._export_routes(runner, refresh_iter)
+        train_loop = getattr(runner, "train_loop", None)
+        dataloader = getattr(train_loop, "dataloader", None)
+        if dataloader is not None:
+            self._refresh_dataset_and_log(runner, train_loop, dataloader)

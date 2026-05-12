@@ -353,6 +353,12 @@ ROUTE_CACHE_DIR="${WORK_DIR}/route_cache"
 ROUTE_MANIFEST_PATH="${ROUTE_CACHE_DIR}/routes_step_0000000.jsonl"
 ROUTE_MANIFEST_LATEST_PATH="${ROUTE_CACHE_DIR}/routes_latest.jsonl"
 
+if [[ ! -f "${ROUTE_MANIFEST_PATH}" ]]; then
+  echo "Initial OPSD route manifest does not exist: ${ROUTE_MANIFEST_PATH}" >&2
+  echo "Run tools/export_refcoco_opsd_${MODEL_FLAVOR}_routes.sh first to export the full route jsonl before training." >&2
+  exit 1
+fi
+
 TRAIN_ARGS=(--work-dir "${WORK_DIR}")
 TRAIN_ARGS+=(
   --cfg-options
