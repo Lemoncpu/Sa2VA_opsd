@@ -2618,7 +2618,6 @@ class Sa2VAOPSDModelV2(BaseModel):
         if optimized_count == 0:
             metrics = {
                 "loss_opsd_total": zero,
-                "batch_route": batch_route or "",
                 "opsd_total_cum": self._metric_tensor(cumulative_loss_opsd_total, zero.dtype),
                 "opsd_regen_ce": zero,
                 "opsd_regen_ce_cum": self._metric_tensor(cumulative_regen_ce, zero.dtype),
@@ -2694,7 +2693,6 @@ class Sa2VAOPSDModelV2(BaseModel):
             )
         metrics = {
             "loss_opsd_total": avg_total_loss,
-            "batch_route": batch_route or last_route,
             "opsd_total_cum": self._metric_tensor(cumulative_loss_opsd_total, avg_total_loss.dtype),
             "opsd_regen_ce": avg_regen_ce.detach(),
             "opsd_regen_ce_cum": self._metric_tensor(cumulative_regen_ce, avg_total_loss.dtype),

@@ -72,10 +72,7 @@ class Sa2VAOPSDModelV3(Sa2VAOPSDModelV2):
         return safety_loss
 
     def forward(self, data, data_samples=None, mode="loss"):
-        batch_route = self._resolve_batch_route(data.get("routes", []))
         metrics = super().forward(data, data_samples=data_samples, mode=mode)
-        if isinstance(metrics, dict):
-            metrics.setdefault("batch_route", batch_route or "")
         if (
             self.enable_ddp_route_safety_loss
             and self.training
