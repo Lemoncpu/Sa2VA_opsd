@@ -40,6 +40,11 @@ def parse_args():
         help="Also update routes_latest.jsonl beside the output manifest.",
     )
     parser.add_argument(
+        "--only-missing-from-manifest",
+        action="store_true",
+        help="Only export sample_keys missing from the existing manifest, then merge results back.",
+    )
+    parser.add_argument(
         "--cfg-options",
         nargs="+",
         action=DictAction,
@@ -163,6 +168,15 @@ def load_jsonl_records(path: Path) -> List[Dict]:
                 continue
             records.append(json.loads(line))
     return records
+
+
+def load_manifest_sample_keys(path: Path) -> Set[str]:
+    sample_keys: Set[str] = set()
+    for record in load_jsonl_records(path):
+        sample_key = record.get("sample_key")
+        if sample_key:
+            sample_keys.add(str(sample_key))
+    return sample_keys
 
 
 def write_jsonl_records(path: Path, records: Sequence[Dict]) -> None:
@@ -384,6 +398,7 @@ def export_routes(
     update_latest: bool = False,
     consumed_sample_keys: Optional[Sequence[str]] = None,
     existing_manifest_path: Optional[str] = None,
+    only_missing_from_manifest: bool = False,
 ):
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -391,6 +406,21 @@ def export_routes(
     world_size = get_world_size()
     consumed_sample_key_set = {str(sample_key) for sample_key in consumed_sample_keys or [] if sample_key}
     samples_to_export = filter_samples_by_sample_keys(samples, excluded_sample_keys=consumed_sample_key_set)
+    existing_records: List[Dict] = []
+    if existing_manifest_path:
+        existing_manifest = Path(existing_manifest_path)
+        if existing_manifest.exists():
+            existing_records = load_jsonl_records(existing_manifest)
+    if only_missing_from_manifest and existing_records:
+        existing_sample_keys = {
+            str(record["sample_key"])
+            for record in existing_records
+            if record.get("sample_key")
+        }
+        samples_to_export = filter_samples_by_sample_keys(
+            samples_to_export,
+            excluded_sample_keys=existing_sample_keys,
+        )
     coord_dir = get_coord_dir(out_path)
     if is_rank0():
         if coord_dir.exists():
@@ -462,24 +492,22 @@ def export_routes(
                 shard_paths=shard_paths,
                 update_latest=update_latest,
             )
-            if existing_manifest_path:
-                existing_manifest = Path(existing_manifest_path)
-                if existing_manifest.exists():
-                    merged_records = merge_manifest_records(
-                        existing_records=load_jsonl_records(existing_manifest),
-                        updated_records=load_jsonl_records(out_path),
-                    )
-                    write_jsonl_records(out_path, merged_records)
-                    if update_latest:
-                        latest_path = out_path.parent / "routes_latest.jsonl"
-                        if latest_path.exists() or latest_path.is_symlink():
-                            latest_path.unlink()
-                        try:
-                            latest_path.symlink_to(out_path.name)
-                        except OSError:
-                            shutil.copyfile(out_path, latest_path)
-                    merged_counts = summarize_route_counts(merged_records)
-                    record_count = len(merged_records)
+            if existing_records:
+                merged_records = merge_manifest_records(
+                    existing_records=existing_records,
+                    updated_records=load_jsonl_records(out_path),
+                )
+                write_jsonl_records(out_path, merged_records)
+                if update_latest:
+                    latest_path = out_path.parent / "routes_latest.jsonl"
+                    if latest_path.exists() or latest_path.is_symlink():
+                        latest_path.unlink()
+                    try:
+                        latest_path.symlink_to(out_path.name)
+                    except OSError:
+                        shutil.copyfile(out_path, latest_path)
+                merged_counts = summarize_route_counts(merged_records)
+                record_count = len(merged_records)
             cleanup_shards(shard_paths)
             atomic_write_json(
                 result_path,
@@ -524,6 +552,7 @@ def export_routes_from_runner(
     route_model: str = "teacher",
     limit: int = None,
     consumed_sample_keys: Optional[Sequence[str]] = None,
+    only_missing_from_manifest: bool = False,
 ):
     model = runner.model.module if hasattr(runner.model, "module") else runner.model
     cfg = runner.cfg
@@ -541,6 +570,7 @@ def export_routes_from_runner(
         update_latest=True,
         consumed_sample_keys=consumed_sample_keys,
         existing_manifest_path=existing_manifest_path,
+        only_missing_from_manifest=only_missing_from_manifest,
     )
     if is_rank0():
         runner.logger.info(
@@ -577,6 +607,8 @@ def main():
             global_step=args.global_step,
             route_model=args.route_model,
             update_latest=args.update_latest,
+            existing_manifest_path=args.out if args.only_missing_from_manifest else None,
+            only_missing_from_manifest=args.only_missing_from_manifest,
         )
     finally:
         if dist_is_initialized():

@@ -30,6 +30,7 @@ CHECKPOINT_PATH="${CHECKPOINT_PATH:-}"
 ROUTE_MODEL="${ROUTE_MODEL:-teacher}"
 GLOBAL_STEP="${GLOBAL_STEP:-0}"
 LIMIT="${LIMIT:-}"
+ONLY_MISSING_FROM_MANIFEST="${ONLY_MISSING_FROM_MANIFEST:-0}"
 DEEPSPEED="${DEEPSPEED:-deepspeed_zero2}"
 DEFAULT_GPUS=8
 
@@ -138,6 +139,7 @@ usage() {
   echo "  --route-model NAME      teacher | student. Default: teacher"
   echo "  --global-step N         Recorded global step. Default: 0"
   echo "  --limit N               Optional sample cap."
+  echo "  --only-missing          Only export sample_keys missing from the existing manifest, then merge them back."
   echo "  -h, --help              Show this help."
 }
 
@@ -206,6 +208,10 @@ while [[ $# -gt 0 ]]; do
     --limit)
       LIMIT="$2"
       shift 2
+      ;;
+    --only-missing|--only-missing-from-manifest)
+      ONLY_MISSING_FROM_MANIFEST=1
+      shift
       ;;
     -h|--help)
       usage
@@ -330,6 +336,9 @@ fi
 if [[ -n "${LIMIT}" ]]; then
   EXPORT_ARGS+=(--limit "${LIMIT}")
 fi
+if [[ "${ONLY_MISSING_FROM_MANIFEST}" == "1" ]]; then
+  EXPORT_ARGS+=(--only-missing-from-manifest)
+fi
 if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
   EXPORT_ARGS+=("${EXTRA_ARGS[@]}")
 fi
@@ -353,6 +362,7 @@ echo "  CHECKPOINT_PATH=${CHECKPOINT_PATH}"
 echo "  ROUTE_MODEL=${ROUTE_MODEL}"
 echo "  GLOBAL_STEP=${GLOBAL_STEP}"
 echo "  LIMIT=${LIMIT}"
+echo "  ONLY_MISSING_FROM_MANIFEST=${ONLY_MISSING_FROM_MANIFEST}"
 echo "  GPUS=${GPUS}"
 echo "  CUDA_VISIBLE_DEVICES=${CUDA_DEVICE_IDS}"
 echo "  PORT=${PORT}"
