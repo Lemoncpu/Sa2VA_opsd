@@ -80,6 +80,9 @@ class Sa2VAOPSDModelV2(BaseModel):
         grpo_advantage_eps=1e-6,
         grpo_sample_temperature=1.0,
         grpo_sample_top_p=1.0,
+        description_max_new_tokens=96,
+        description_repetition_penalty=1.1,
+        description_no_repeat_ngram_size=4,
         grpo_sample_max_new_tokens=48,
         low_iou_regen_max_new_tokens=48,
         teacher_summary_template=None,
@@ -133,6 +136,9 @@ class Sa2VAOPSDModelV2(BaseModel):
         self.grpo_advantage_eps = float(grpo_advantage_eps)
         self.grpo_sample_temperature = float(grpo_sample_temperature)
         self.grpo_sample_top_p = float(grpo_sample_top_p)
+        self.description_max_new_tokens = max(int(description_max_new_tokens), 1)
+        self.description_repetition_penalty = float(description_repetition_penalty)
+        self.description_no_repeat_ngram_size = max(int(description_no_repeat_ngram_size), 0)
         self.grpo_sample_max_new_tokens = max(int(grpo_sample_max_new_tokens), 1)
         self.low_iou_regen_max_new_tokens = max(int(low_iou_regen_max_new_tokens), 1)
         if self.iou_low_threshold > self.iou_high_threshold:
@@ -1628,6 +1634,13 @@ class Sa2VAOPSDModelV2(BaseModel):
             mask_prompts=mask_prompts,
             student_question=student_question,
             apply_mask_focus=True,
+            generation_overrides={
+                "max_new_tokens": self.description_max_new_tokens,
+                "do_sample": False,
+                "num_beams": 1,
+                "repetition_penalty": self.description_repetition_penalty,
+                "no_repeat_ngram_size": self.description_no_repeat_ngram_size,
+            },
         )
 
     def generate_teacher_caption_with_privileged_prompt(
