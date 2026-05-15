@@ -185,6 +185,7 @@ def build_compare_prompt_variants(
     ref_mask,
     route,
 ):
+    del gt_desc, ref_desc
     student_question = sample.get("student_question", "").replace("<image>", "").strip()
     caption = sample.get("caption", "") or ""
     description_status = sample.get("description_status", "ok")
@@ -220,10 +221,6 @@ def build_compare_prompt_variants(
         "If IoU is close to 0, gtmask and refmask are weakly related or completely different.\n"
         "If IoU is close to 1, gtmask and refmask are very similar.\n"
         f"Current IoU: {iou:.4f}\n"
-        f"gtmask text: {gt_desc}\n"
-        f"refmask text: {ref_desc}\n"
-        f"gtmask summary: {relation_context['gt_summary']}\n"
-        f"refmask summary: {relation_context['ref_summary']}\n"
         f"Unique non-overlap area in gtmask: {relation_context['gt_only_summary']}\n"
         f"Unique non-overlap area in refmask: {relation_context['ref_only_summary']}\n"
     )
@@ -255,8 +252,6 @@ Compare gtmask(region1) and refmask(region2), explain why the caption led to reg
 Judge what problem the current IoU indicates from the facts below. Do not rely on any pre-labeled failure category.
 Use the IoU value, the caption_to_mask_seg_correct flag, and the difference between the non-overlap areas to decide how to revise the caption.
 {route_instruction}
-gtmask text: {gt_desc}
-refmask text: {ref_desc}
 student caption: {caption}
 caption_to_mask_seg_correct: {_bool_text(seg_correct)}
 Current IoU: {iou:.4f}

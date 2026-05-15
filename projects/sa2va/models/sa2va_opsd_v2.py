@@ -734,20 +734,8 @@ class Sa2VAOPSDModelV2(BaseModel):
         return False
 
     def _resolve_reconstruct_questions(self, caption):
-        resolved = []
-        caption_variants = [caption]
-        canonical_caption = self._canonicalize_referring_expression(caption)
-        if canonical_caption and canonical_caption not in caption_variants:
-            caption_variants.append(canonical_caption)
-        subject_caption = self._subject_only_referring_expression(caption)
-        if subject_caption and subject_caption not in caption_variants:
-            caption_variants.append(subject_caption)
-        for caption_variant in caption_variants:
-            for template in self.reconstruct_question_templates:
-                resolved_question = template.format(caption=caption_variant, class_name=caption_variant)
-                if resolved_question not in resolved:
-                    resolved.append(resolved_question)
-        return resolved
+        primary_template = self.reconstruct_question_templates[0]
+        return [primary_template.format(caption=caption, class_name=caption)]
 
     @staticmethod
     def _canonicalize_referring_expression(caption):
@@ -1599,6 +1587,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         )
 
     def reconstruct_mask(self, image, caption, description_status, spatial_hint="", gt_mask=None):
+        del spatial_hint
         if description_status != "ok":
             return ReconstructionResult(
                 pred_mask=None,
@@ -1610,61 +1599,56 @@ class Sa2VAOPSDModelV2(BaseModel):
         best_result = None
         best_iou = -1.0
         for reconstruct_question_base in self._resolve_reconstruct_questions(caption):
-            reconstruct_question_variants = [reconstruct_question_base]
-            if spatial_hint:
-                reconstruct_question_variants.append(
-                    self._append_spatial_hint_to_question(reconstruct_question_base, spatial_hint)
+            reconstruct_question = reconstruct_question_base
+            predict_dict = self._predict_forward_eval(
+                self.student_model,
+                image=image,
+                text=reconstruct_question,
+                past_text="",
+                mask_prompts=None,
+                tokenizer=self.tokenizer,
+            )
+            raw_prediction = predict_dict.get("prediction", "")
+            prediction_masks = predict_dict.get("prediction_masks")
+            prediction_masks_count = 0 if prediction_masks is None else len(prediction_masks)
+            if not prediction_masks:
+                result = ReconstructionResult(
+                    pred_mask=None,
+                    question=reconstruct_question,
+                    raw_prediction=raw_prediction,
+                    prediction_masks_count=prediction_masks_count,
+                    status="empty_prediction_masks",
                 )
-            for reconstruct_question in reconstruct_question_variants:
-                predict_dict = self._predict_forward_eval(
-                    self.student_model,
-                    image=image,
-                    text=reconstruct_question,
-                    past_text="",
-                    mask_prompts=None,
-                    tokenizer=self.tokenizer,
+                candidate_iou = -1.0
+            else:
+                first_mask = prediction_masks[0]
+                if isinstance(first_mask, torch.Tensor):
+                    first_mask = first_mask.detach().cpu().numpy()
+                first_mask = np.asarray(first_mask)
+                if first_mask.ndim == 3 and first_mask.shape[0] == 1:
+                    first_mask = first_mask[0]
+                pred_mask = self._to_numpy_mask(first_mask)
+                status = "ok" if pred_mask.sum() > 0 else "zero_area_mask"
+                result = ReconstructionResult(
+                    pred_mask=pred_mask,
+                    question=reconstruct_question,
+                    raw_prediction=raw_prediction,
+                    prediction_masks_count=prediction_masks_count,
+                    status=status,
                 )
-                raw_prediction = predict_dict.get("prediction", "")
-                prediction_masks = predict_dict.get("prediction_masks")
-                prediction_masks_count = 0 if prediction_masks is None else len(prediction_masks)
-                if not prediction_masks:
-                    result = ReconstructionResult(
-                        pred_mask=None,
-                        question=reconstruct_question,
-                        raw_prediction=raw_prediction,
-                        prediction_masks_count=prediction_masks_count,
-                        status="empty_prediction_masks",
-                    )
-                    candidate_iou = -1.0
-                else:
-                    first_mask = prediction_masks[0]
-                    if isinstance(first_mask, torch.Tensor):
-                        first_mask = first_mask.detach().cpu().numpy()
-                    first_mask = np.asarray(first_mask)
-                    if first_mask.ndim == 3 and first_mask.shape[0] == 1:
-                        first_mask = first_mask[0]
-                    pred_mask = self._to_numpy_mask(first_mask)
-                    status = "ok" if pred_mask.sum() > 0 else "zero_area_mask"
-                    result = ReconstructionResult(
-                        pred_mask=pred_mask,
-                        question=reconstruct_question,
-                        raw_prediction=raw_prediction,
-                        prediction_masks_count=prediction_masks_count,
-                        status=status,
-                    )
-                    candidate_iou = self._compute_iou(gt_mask, pred_mask) if gt_mask is not None else -1.0
-                if gt_mask is not None:
-                    if candidate_iou > best_iou:
-                        best_result = result
-                        best_iou = candidate_iou
-                elif best_result is None or (
-                    best_result.status != "ok" and result.status == "ok"
-                ) or (
-                    best_result.status == "ok"
-                    and result.status == "ok"
-                    and int(np.asarray(result.pred_mask).sum()) > int(np.asarray(best_result.pred_mask).sum())
-                ):
+                candidate_iou = self._compute_iou(gt_mask, pred_mask) if gt_mask is not None else -1.0
+            if gt_mask is not None:
+                if candidate_iou > best_iou:
                     best_result = result
+                    best_iou = candidate_iou
+            elif best_result is None or (
+                best_result.status != "ok" and result.status == "ok"
+            ) or (
+                best_result.status == "ok"
+                and result.status == "ok"
+                and int(np.asarray(result.pred_mask).sum()) > int(np.asarray(best_result.pred_mask).sum())
+            ):
+                best_result = result
         if best_result is None:
             return ReconstructionResult(
                 pred_mask=None,
@@ -1738,11 +1722,6 @@ class Sa2VAOPSDModelV2(BaseModel):
         )
         seg_correct = bool(teacher_fields.get("caption_to_mask_seg_correct", False))
         route = teacher_fields.get("teacher_route", ON_POLICY_DISTILL_ROUTE)
-        target_spatial_hint = self._coarse_spatial_hint(gt_mask)
-        distractor_spatial_hint = self._coarse_spatial_hint(ref_mask)
-        teacher_caption_problem = teacher_fields.get("teacher_caption_problem", "")
-        teacher_correction_direction = teacher_fields.get("teacher_correction_direction", "")
-        teacher_reason = teacher_fields.get("teacher_reason", "")
         if route == TEACHER_REGENERATE_ROUTE:
             route_guidance = (
                 f"The current IoU is below {self.iou_low_threshold:.2f}, so the caption-to-mask reconstruction is too far from the gtmask. "
@@ -1776,21 +1755,14 @@ class Sa2VAOPSDModelV2(BaseModel):
             f"If IoU is between {self.iou_low_threshold:.2f} and {self.iou_high_threshold:.2f}, use on-policy supervision: compare gtmask and refmask pixel by pixel, identify missing gtmask-only pixels and erroneous refmask-only pixels, then use those differences to score and supervise the student's token trajectory.\n"
             f"If IoU is at least {self.iou_high_threshold:.2f}, gtmask and refmask are highly aligned and only light correction is needed.\n"
             f"Current IoU between gtmask(region1) and refmask(region2): {iou:.4f}\n"
-            f"gtmask summary: {relation_context['gt_summary']}\n"
-            f"refmask summary: {relation_context['ref_summary']}\n"
             f"Unique non-overlap area in gtmask: {relation_context['gt_only_summary']}\n"
             f"Unique non-overlap area in refmask: {relation_context['ref_only_summary']}\n"
-            f"Teacher diagnosis - caption problem: {teacher_caption_problem}\n"
-            f"Teacher diagnosis - correction direction: {teacher_correction_direction}\n"
-            f"Teacher diagnosis - reason: {teacher_reason}\n"
             f"{route_guidance}\n"
             "Judge what problem the current IoU indicates from the facts above. Do not rely on any pre-labeled failure category. "
             "Use the IoU value, the caption_to_mask_seg_correct flag, and the difference between the non-overlap areas of gtmask and refmask. "
             "Use this routed evidence to better model the target caption token sequence."
         )
         if generation_mode == "regenerate_caption":
-            target_spatial_hint = target_spatial_hint or "not available"
-            distractor_spatial_hint = distractor_spatial_hint or "not available"
             prompt = (
                 "<image>\n"
                 "Write one natural and complete sentence that describes region1 (gtmask) in detail.\n"
@@ -1799,10 +1771,8 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"Student prompt: {clean_question}\n"
                 f"Failed student caption: {student_caption}\n"
                 f"Current IoU between region1 and region2: {iou:.4f}\n"
-                f"Target localization hint: {target_spatial_hint}\n"
-                f"Distractor localization hint: {distractor_spatial_hint}\n"
-                f"Rewrite direction: {teacher_correction_direction}\n"
-                f"Why the old caption failed: {teacher_reason}\n"
+                f"{route_guidance}\n"
+                "Compare region1 and region2 directly from the privileged masks and image evidence, then write a better caption for region1.\n"
                 "Output requirements:\n"
                 "- Return exactly one natural and complete sentence describing region1.\n"
                 "- Focus on visible appearance, attributes, parts, and relevant local context that helps understand the target.\n"
