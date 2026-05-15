@@ -511,8 +511,13 @@ class Sa2VAOPSDModel(BaseModel):
 
     @staticmethod
     def _clean_caption_text(caption):
+        caption = "" if caption is None else str(caption)
         caption = caption.replace("<|im_end|>", "")
+        caption = caption.replace("<|end|>", "")
         caption = caption.replace("<|endoftext|>", "")
+        caption = re.sub(r"<\|[^>\n]*\|>", " ", caption)
+        caption = re.sub(r"<\|.*$", "", caption)
+        caption = re.sub(r"<[^>\n]*$", "", caption)
         caption = re.sub(r"\s+", " ", caption).strip()
         for prefix in ("Sure, ", "Sure. ", "Certainly, "):
             if caption.startswith(prefix):

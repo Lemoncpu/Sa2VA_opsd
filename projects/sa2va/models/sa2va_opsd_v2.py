@@ -574,7 +574,9 @@ class Sa2VAOPSDModelV2(BaseModel):
 
     @staticmethod
     def _clean_caption_text(caption):
+        caption = "" if caption is None else str(caption)
         caption = caption.replace("<|im_end|>", "")
+        caption = caption.replace("<|end|>", "")
         caption = caption.replace("<|endoftext|>", "")
         caption = re.sub(r"\s+", " ", caption).strip()
         for prefix in ("Sure, ", "Sure. ", "Certainly, "):
@@ -585,7 +587,12 @@ class Sa2VAOPSDModelV2(BaseModel):
         # emitted by the interleaved caption+segmentation output format.
         caption = re.sub(r"</?p>", "", caption, flags=re.IGNORECASE)
         caption = re.sub(r"\[SEG\]\.?", "", caption, flags=re.IGNORECASE)
+        # Generated EOS/control markers can be truncated at max_new_tokens and
+        # leave tail fragments like "<|end" or a bare "<|".
+        caption = re.sub(r"<\|[^>\n]*\|>", " ", caption)
+        caption = re.sub(r"<\|.*$", "", caption)
         caption = re.sub(r"<[^>]+>", " ", caption)
+        caption = re.sub(r"<[^>\n]*$", "", caption)
         caption = re.sub(r"(assistant|bot)\s*[:：]\s*", "", caption, flags=re.IGNORECASE)
         caption = re.sub(r"\s+", " ", caption)
         caption = re.sub(r"\s+([,.;:!?])", r"\1", caption)
