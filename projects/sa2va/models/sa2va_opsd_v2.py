@@ -44,6 +44,7 @@ class DescriptionResult:
     raw_prediction: str
     clean_caption: str
     completion_ids: torch.Tensor
+    training_completion_ids: torch.Tensor
     status: str
 
 
@@ -89,6 +90,15 @@ class Sa2VAOPSDModelV2(BaseModel):
         use_flash_attn=True,
         use_mask_focused_caption_image=True,
         mask_focused_context_mode="grayscale",
+        enable_explicit_caption_eos_supervision=True,
+        caption_quality_reward_weight=0.1,
+        caption_reward_valid_bonus=0.1,
+        caption_reward_sufficient_bonus=0.05,
+        caption_reward_generic_penalty=0.05,
+        caption_reward_truncated_penalty=0.2,
+        caption_reward_empty_penalty=0.3,
+        enable_invalid_caption_recovery=True,
+        use_online_route_for_loss=True,
     ):
         super().__init__()
         if teacher_model_path == "__skip__":
@@ -142,6 +152,15 @@ class Sa2VAOPSDModelV2(BaseModel):
         self.min_caption_tokens = max(int(min_caption_tokens), 1)
         self.use_mask_focused_caption_image = bool(use_mask_focused_caption_image)
         self.mask_focused_context_mode = str(mask_focused_context_mode).lower().strip()
+        self.enable_explicit_caption_eos_supervision = bool(enable_explicit_caption_eos_supervision)
+        self.caption_quality_reward_weight = float(caption_quality_reward_weight)
+        self.caption_reward_valid_bonus = float(caption_reward_valid_bonus)
+        self.caption_reward_sufficient_bonus = float(caption_reward_sufficient_bonus)
+        self.caption_reward_generic_penalty = float(caption_reward_generic_penalty)
+        self.caption_reward_truncated_penalty = float(caption_reward_truncated_penalty)
+        self.caption_reward_empty_penalty = float(caption_reward_empty_penalty)
+        self.enable_invalid_caption_recovery = bool(enable_invalid_caption_recovery)
+        self.use_online_route_for_loss = bool(use_online_route_for_loss)
         self.debug_print_limit = 3
         self._debug_print_count = 0
         self._cumulative_valid_count = 0
@@ -171,6 +190,10 @@ class Sa2VAOPSDModelV2(BaseModel):
         self._cumulative_grpo_sum = 0.0
         self._cumulative_grpo_reward_sum = 0.0
         self._cumulative_grpo_reward_count = 0
+        self._cumulative_grpo_quality_reward_sum = 0.0
+        self._cumulative_grpo_iou_reward_sum = 0.0
+        self._cumulative_recovery_caption_count = 0
+        self._cumulative_invalid_caption_penalty_count = 0
 
         self.teacher_summary_template = teacher_summary_template or (
             "You are optimizing the following task: given a gtmask, generate a caption that describes it. "
@@ -681,6 +704,20 @@ class Sa2VAOPSDModelV2(BaseModel):
             len(clean_caption or ""),
         )
 
+    def _caption_quality_reward(self, clean_caption, status):
+        reward = 0.0
+        if status == "empty":
+            return -self.caption_reward_empty_penalty
+        if status in {"truncated_caption", "seg_style_answer", "decode_error"}:
+            return -self.caption_reward_truncated_penalty
+        if status == "ok":
+            reward += self.caption_reward_valid_bonus
+            if self._is_caption_content_sufficient(clean_caption) and not self._is_overly_generic_caption(clean_caption):
+                reward += self.caption_reward_sufficient_bonus
+            if self._is_overly_generic_caption(clean_caption):
+                reward -= self.caption_reward_generic_penalty
+        return reward
+
     @staticmethod
     def _is_np_like_caption(caption):
         lowered = re.sub(r"\s+", " ", (caption or "").strip().lower())
@@ -735,6 +772,16 @@ class Sa2VAOPSDModelV2(BaseModel):
     def _resolve_reconstruct_questions(self, caption):
         primary_template = self.reconstruct_question_templates[0]
         return [primary_template.format(caption=caption, class_name=caption)]
+
+    @staticmethod
+    def _invalid_reconstruction_placeholder(status):
+        return ReconstructionResult(
+            pred_mask=None,
+            question=None,
+            raw_prediction="",
+            prediction_masks_count=0,
+            status=status,
+        )
 
     @staticmethod
     def _canonicalize_referring_expression(caption):
@@ -808,12 +855,50 @@ class Sa2VAOPSDModelV2(BaseModel):
             loc = f"in the {vert} {horiz}"
         return f"The target is {size} and located {loc}."
 
-    def _encode_completion_from_caption(self, caption):
-        return self.tokenizer(
+    def _template_suffix(self, model=None):
+        template = getattr(model, "template", None)
+        if isinstance(template, dict):
+            suffix = template.get("SUFFIX")
+            if isinstance(suffix, str) and suffix:
+                return suffix
+        return None
+
+    def _end_token_ids_for_completion(self, model=None):
+        suffix = self._template_suffix(model)
+        if suffix:
+            suffix_ids = self.tokenizer(
+                suffix,
+                add_special_tokens=False,
+                return_tensors="pt",
+            ).input_ids.to(self.device)
+            if suffix_ids.numel() > 0:
+                return suffix_ids
+        eos_token_id = self.tokenizer.eos_token_id
+        if eos_token_id is None:
+            return torch.empty((1, 0), device=self.device, dtype=torch.long)
+        return torch.tensor([[eos_token_id]], device=self.device, dtype=torch.long)
+
+    def _encode_completion_from_caption(self, caption, *, model=None, add_end_token=False):
+        caption_ids = self.tokenizer(
             caption,
             add_special_tokens=False,
             return_tensors="pt",
         ).input_ids.to(self.device)
+        if not add_end_token:
+            return caption_ids
+        end_token_ids = self._end_token_ids_for_completion(model)
+        if end_token_ids.numel() == 0:
+            return caption_ids
+        if caption_ids.numel() == 0:
+            return end_token_ids
+        return torch.cat([caption_ids, end_token_ids], dim=1)
+
+    def _encode_training_completion_from_caption(self, caption, *, model=None):
+        return self._encode_completion_from_caption(
+            caption,
+            model=model,
+            add_end_token=self.enable_explicit_caption_eos_supervision,
+        )
 
     @staticmethod
     def _mask_bbox(mask):
@@ -967,11 +1052,13 @@ class Sa2VAOPSDModelV2(BaseModel):
         status = self._infer_description_status(clean_caption)
         if status == "ok" and not self._is_caption_content_sufficient(clean_caption):
             status = "truncated_caption"
-        completion_ids = self._encode_completion_from_caption(clean_caption)
+        completion_ids = self._encode_completion_from_caption(clean_caption, model=model)
+        training_completion_ids = self._encode_training_completion_from_caption(clean_caption, model=model)
         return DescriptionResult(
             raw_prediction=raw_prediction,
             clean_caption=clean_caption,
             completion_ids=completion_ids,
+            training_completion_ids=training_completion_ids,
             status=status,
         )
 
@@ -1455,12 +1542,16 @@ class Sa2VAOPSDModelV2(BaseModel):
         apply_mask_focus=True,
     ):
         student_caption = self._clean_caption_text(student_caption or "")
-        student_completion_ids = self._encode_completion_from_caption(student_caption)
+        student_completion_ids = self._encode_training_completion_from_caption(
+            student_caption,
+            model=self.teacher_model if self.has_teacher_model() else self.student_model,
+        )
         if student_completion_ids.shape[1] == 0:
             return DescriptionResult(
                 raw_prediction="",
                 clean_caption="",
                 completion_ids=student_completion_ids,
+                training_completion_ids=student_completion_ids,
                 status="empty",
             )
 
@@ -1484,6 +1575,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             raw_prediction=raw_prediction,
             clean_caption=clean_caption,
             completion_ids=predicted_ids,
+            training_completion_ids=predicted_ids,
             status=status,
         )
 
@@ -1524,7 +1616,8 @@ class Sa2VAOPSDModelV2(BaseModel):
         return DescriptionResult(
             raw_prediction=raw_prediction,
             clean_caption=clean_caption,
-            completion_ids=self._encode_completion_from_caption(clean_caption),
+            completion_ids=self._encode_completion_from_caption(clean_caption, model=model),
+            training_completion_ids=self._encode_training_completion_from_caption(clean_caption, model=model),
             status=status,
         )
 
@@ -2151,13 +2244,17 @@ class Sa2VAOPSDModelV2(BaseModel):
         gt_mask,
     ):
         rollout_entries = []
+        quality_reward_sum = 0.0
+        iou_reward_sum = 0.0
         descriptions = self._sample_grpo_descriptions(
             image=image,
             prompt_masks=prompt_masks,
             student_question=student_question,
         )
         for description in descriptions:
-            if description.completion_ids.shape[1] == 0:
+            quality_reward = self._caption_quality_reward(description.clean_caption, description.status)
+            training_completion_ids = description.training_completion_ids
+            if training_completion_ids.shape[1] == 0:
                 continue
             reconstruction = self.reconstruct_mask(
                 image=image,
@@ -2167,9 +2264,12 @@ class Sa2VAOPSDModelV2(BaseModel):
                 gt_mask=gt_mask,
             )
             pred_mask = None if reconstruction is None else reconstruction.pred_mask
+            iou_reward = 0.0
             if pred_mask is None:
-                continue
-            reward_value = float(self._compute_iou(gt_mask, pred_mask))
+                reward_value = self.caption_quality_reward_weight * quality_reward
+            else:
+                iou_reward = float(self._compute_iou(gt_mask, pred_mask))
+                reward_value = iou_reward + self.caption_quality_reward_weight * quality_reward
             with self._temporary_eval_model(self.student_model):
                 with torch.inference_mode():
                     old_policy_logits = self._forward_sequence_with_model(
@@ -2177,24 +2277,26 @@ class Sa2VAOPSDModelV2(BaseModel):
                         image,
                         prompt_masks,
                         student_question,
-                        description.completion_ids,
+                        training_completion_ids,
                         apply_mask_focus=True,
                     )
                     old_token_log_probs = self._token_log_probs_from_logits(
                         old_policy_logits,
-                        description.completion_ids,
+                        training_completion_ids,
                     )
             old_token_log_probs = self._materialize_autograd_input(old_token_log_probs.detach())
+            quality_reward_sum += quality_reward
+            iou_reward_sum += iou_reward
             rollout_entries.append(
                 {
-                    "completion_ids": description.completion_ids,
+                    "completion_ids": training_completion_ids,
                     "old_token_log_probs": old_token_log_probs,
                     "reward_value": reward_value,
                 }
             )
 
         if not rollout_entries:
-            return None, {"reward_sum": 0.0, "reward_count": 0}
+            return None, {"reward_sum": 0.0, "reward_count": 0, "quality_reward_sum": 0.0, "iou_reward_sum": 0.0}
 
         reward_tensor = torch.tensor(
             [entry["reward_value"] for entry in rollout_entries],
@@ -2243,12 +2345,16 @@ class Sa2VAOPSDModelV2(BaseModel):
         return sample_losses.mean(), {
             "reward_sum": float(reward_tensor.sum().item()),
             "reward_count": len(rollout_entries),
+            "quality_reward_sum": float(quality_reward_sum),
+            "iou_reward_sum": float(iou_reward_sum),
         }
 
     def compute_grpo_losses_batch(self, batch_items):
         sample_losses = []
         reward_sum = 0.0
         reward_count = 0
+        quality_reward_sum = 0.0
+        iou_reward_sum = 0.0
         for item in batch_items:
             sample_loss, grpo_meta = self.compute_grpo_loss(
                 image=item["image"],
@@ -2258,13 +2364,22 @@ class Sa2VAOPSDModelV2(BaseModel):
             )
             reward_sum += grpo_meta["reward_sum"]
             reward_count += grpo_meta["reward_count"]
+            quality_reward_sum += grpo_meta.get("quality_reward_sum", 0.0)
+            iou_reward_sum += grpo_meta.get("iou_reward_sum", 0.0)
             if sample_loss is not None:
                 sample_losses.append(sample_loss)
         if not sample_losses:
-            return self._empty_loss_vector(), {"reward_sum": 0.0, "reward_count": 0}
+            return self._empty_loss_vector(), {
+                "reward_sum": 0.0,
+                "reward_count": 0,
+                "quality_reward_sum": 0.0,
+                "iou_reward_sum": 0.0,
+            }
         return torch.stack(sample_losses), {
             "reward_sum": reward_sum,
             "reward_count": reward_count,
+            "quality_reward_sum": quality_reward_sum,
+            "iou_reward_sum": iou_reward_sum,
         }
     def forward(self, data, data_samples=None, mode="loss"):
         del data_samples, mode
@@ -2304,6 +2419,10 @@ class Sa2VAOPSDModelV2(BaseModel):
         total_grpo = None
         grpo_reward_sum = 0.0
         grpo_reward_count = 0
+        grpo_quality_reward_sum = 0.0
+        grpo_iou_reward_sum = 0.0
+        recovery_caption_count = 0
+        invalid_caption_penalty_count = 0
         last_sample_key = None
         last_caption = ""
         last_teacher_prompt = ""
@@ -2349,18 +2468,25 @@ class Sa2VAOPSDModelV2(BaseModel):
                 description_ok_count += 1
             elif description.status == "empty":
                 description_empty_count += 1
+                invalid_caption_penalty_count += 1
             elif description.status == "truncated_caption":
                 description_truncated_count += 1
+                invalid_caption_penalty_count += 1
             elif description.status == "seg_style_answer":
                 description_seg_style_count += 1
+                invalid_caption_penalty_count += 1
 
-            reconstruction = self.reconstruct_mask(
-                image=image,
-                caption=description.clean_caption,
-                description_status=description.status,
-                spatial_hint=self._coarse_spatial_hint(gt_mask_np),
-                gt_mask=gt_mask_np,
-            )
+            reconstruction = None
+            if description.status == "ok":
+                reconstruction = self.reconstruct_mask(
+                    image=image,
+                    caption=description.clean_caption,
+                    description_status=description.status,
+                    spatial_hint=self._coarse_spatial_hint(gt_mask_np),
+                    gt_mask=gt_mask_np,
+                )
+            elif self.enable_invalid_caption_recovery:
+                reconstruction = self._invalid_reconstruction_placeholder("skipped_invalid_description")
             reconstruct_status = "missing_reconstruction_result" if reconstruction is None else reconstruction.status
             reconstruct_question = None if reconstruction is None else reconstruction.question
             raw_reconstruct_prediction = "" if reconstruction is None else reconstruction.raw_prediction
@@ -2372,6 +2498,37 @@ class Sa2VAOPSDModelV2(BaseModel):
                 last_route = "reconstruct_skip"
                 last_teacher_prompt = ""
                 last_caption = description.clean_caption
+                if self.enable_invalid_caption_recovery and description.status != "ok":
+                    zero_ref_mask = np.zeros_like(gt_mask_np, dtype=np.uint8)
+                    teacher_fields = self._build_training_teacher_fields(
+                        route=TEACHER_REGENERATE_ROUTE,
+                        iou=0.0,
+                    )
+                    recovery_reconstruction = reconstruction or self._invalid_reconstruction_placeholder("skipped_invalid_description")
+                    teacher_regenerate = self.generate_teacher_caption_with_privileged_prompt(
+                        image=image,
+                        gt_mask=gt_mask_np,
+                        ref_mask=zero_ref_mask,
+                        student_question=student_question,
+                        student_caption=description.clean_caption,
+                        description_status=description.status,
+                        reconstruction=recovery_reconstruction,
+                        iou=0.0,
+                        teacher_fields=teacher_fields,
+                    )
+                    regen_entries.append(
+                        {
+                            "image": image,
+                            "prompt_masks": prompt_masks,
+                            "student_question": student_question,
+                            "completion_ids": teacher_regenerate.training_completion_ids,
+                        }
+                    )
+                    teacher_regenerate_count += 1
+                    recovery_caption_count += 1
+                    last_route = TEACHER_REGENERATE_ROUTE
+                    last_teacher_prompt = self._route_prompt_tag(TEACHER_REGENERATE_ROUTE)
+                    last_caption = teacher_regenerate.clean_caption or description.clean_caption
                 self._debug_sample(
                     sample_key=sample_key,
                     route="reconstruct_skip",
@@ -2443,7 +2600,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                         "image": image,
                         "prompt_masks": prompt_masks,
                         "student_question": student_question,
-                        "completion_ids": teacher_regenerate.completion_ids,
+                        "completion_ids": teacher_regenerate.training_completion_ids,
                     }
                 )
                 last_caption = teacher_regenerate.clean_caption or description.clean_caption
@@ -2477,7 +2634,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                         "prompt_masks": prompt_masks,
                         "student_question": student_question,
                         "teacher_prompt": teacher_prompt,
-                        "completion_ids": description.completion_ids,
+                        "completion_ids": description.training_completion_ids,
                         "teacher_prompt_masks": teacher_prompt_masks,
                         "iou": iou,
                     }
@@ -2523,6 +2680,8 @@ class Sa2VAOPSDModelV2(BaseModel):
             grpo_losses, grpo_meta = self.compute_grpo_losses_batch(grpo_entries)
             grpo_reward_sum += grpo_meta["reward_sum"]
             grpo_reward_count += grpo_meta["reward_count"]
+            grpo_quality_reward_sum += grpo_meta.get("quality_reward_sum", 0.0)
+            grpo_iou_reward_sum += grpo_meta.get("iou_reward_sum", 0.0)
             if grpo_losses.numel() > 0:
                 grpo_loss_count += int(grpo_losses.shape[0])
                 grpo_loss_sum = grpo_losses.sum()
@@ -2553,6 +2712,10 @@ class Sa2VAOPSDModelV2(BaseModel):
         self._cumulative_iou_sum += total_iou
         self._cumulative_grpo_reward_sum += grpo_reward_sum
         self._cumulative_grpo_reward_count += grpo_reward_count
+        self._cumulative_grpo_quality_reward_sum += grpo_quality_reward_sum
+        self._cumulative_grpo_iou_reward_sum += grpo_iou_reward_sum
+        self._cumulative_recovery_caption_count += recovery_caption_count
+        self._cumulative_invalid_caption_penalty_count += invalid_caption_penalty_count
         if total_loss is not None:
             self._cumulative_total_loss_sum += float(total_loss.detach().item())
         if total_regen_ce is not None:
@@ -2568,6 +2731,12 @@ class Sa2VAOPSDModelV2(BaseModel):
         cumulative_nonempty_caption_count = max(self._cumulative_nonempty_caption_count, 1)
         cumulative_verifier_iou = self._cumulative_iou_sum / cumulative_valid_count
         cumulative_seg_correct_rate = self._cumulative_seg_correct_count / cumulative_valid_count
+        cumulative_all_sample_reconstruct_attempt_rate = self._cumulative_valid_count / cumulative_nonempty_gt_count
+        cumulative_all_sample_seg_success_rate = self._cumulative_reconstruct_ok_count / cumulative_nonempty_gt_count
+        cumulative_all_sample_seg_correct_rate = self._cumulative_seg_correct_count / cumulative_nonempty_gt_count
+        cumulative_valid_caption_cond_seg_correct_rate = (
+            self._cumulative_seg_correct_count / max(self._cumulative_description_ok_count, 1)
+        )
         cumulative_loss_opsd_total = self._cumulative_total_loss_sum / cumulative_loss_count
         cumulative_nonempty_caption_rate = (
             self._cumulative_nonempty_caption_count / cumulative_nonempty_gt_count
@@ -2583,6 +2752,10 @@ class Sa2VAOPSDModelV2(BaseModel):
         cumulative_onpolicy_jsd = self._cumulative_onpolicy_jsd_sum / max(self._cumulative_onpolicy_loss_count, 1)
         cumulative_grpo = self._cumulative_grpo_sum / max(self._cumulative_grpo_loss_count, 1)
         cumulative_grpo_reward_mean = self._cumulative_grpo_reward_sum / max(self._cumulative_grpo_reward_count, 1)
+        cumulative_grpo_quality_reward_mean = self._cumulative_grpo_quality_reward_sum / max(self._cumulative_grpo_reward_count, 1)
+        cumulative_grpo_iou_reward_mean = self._cumulative_grpo_iou_reward_sum / max(self._cumulative_grpo_reward_count, 1)
+        cumulative_recovery_caption_rate = self._cumulative_recovery_caption_count / cumulative_nonempty_gt_count
+        cumulative_invalid_caption_penalty_rate = self._cumulative_invalid_caption_penalty_count / cumulative_nonempty_gt_count
 
         if optimized_count == 0:
             metrics = {
@@ -2596,9 +2769,19 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "opsd_grpo_cum": self._metric_tensor(cumulative_grpo, zero.dtype),
                 "grpo_reward_mean": zero,
                 "grpo_reward_mean_cum": self._metric_tensor(cumulative_grpo_reward_mean, zero.dtype),
+                "grpo_quality_reward_mean_cum": self._metric_tensor(cumulative_grpo_quality_reward_mean, zero.dtype),
+                "grpo_iou_reward_mean_cum": self._metric_tensor(cumulative_grpo_iou_reward_mean, zero.dtype),
                 "grpo_group_size": self._metric_tensor(float(self.grpo_group_size), zero.dtype),
                 "verifier_iou": self._metric_tensor(cumulative_verifier_iou, zero.dtype),
                 "seg_correct_rate": self._metric_tensor(cumulative_seg_correct_rate, zero.dtype),
+                "all_sample_reconstruct_attempt_rate": self._metric_tensor(
+                    cumulative_all_sample_reconstruct_attempt_rate, zero.dtype
+                ),
+                "all_sample_seg_success_rate": self._metric_tensor(cumulative_all_sample_seg_success_rate, zero.dtype),
+                "all_sample_seg_correct_rate": self._metric_tensor(cumulative_all_sample_seg_correct_rate, zero.dtype),
+                "valid_caption_cond_seg_correct_rate": self._metric_tensor(
+                    cumulative_valid_caption_cond_seg_correct_rate, zero.dtype
+                ),
                 "nonempty_caption_rate": self._metric_tensor(cumulative_nonempty_caption_rate, zero.dtype),
                 "valid_caption_rate": self._metric_tensor(cumulative_valid_caption_rate, zero.dtype),
                 "avg_caption_tokens": self._metric_tensor(cumulative_avg_caption_tokens, zero.dtype),
@@ -2613,6 +2796,8 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "teacher_regenerate_rate": self._metric_tensor(cumulative_teacher_regenerate_rate, zero.dtype),
                 "on_policy_distill_rate": self._metric_tensor(cumulative_on_policy_distill_rate, zero.dtype),
                 "grpo_positive_rate": self._metric_tensor(cumulative_grpo_positive_rate, zero.dtype),
+                "recovery_caption_rate": self._metric_tensor(cumulative_recovery_caption_rate, zero.dtype),
+                "invalid_caption_penalty_rate": self._metric_tensor(cumulative_invalid_caption_penalty_rate, zero.dtype),
             }
             return metrics
 
@@ -2624,6 +2809,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         batch_on_policy_distill_rate = on_policy_distill_count / max(routed_count, 1)
         batch_grpo_positive_rate = grpo_positive_count / max(routed_count, 1)
         batch_grpo_reward_mean = grpo_reward_sum / max(grpo_reward_count, 1)
+        batch_recovery_caption_rate = recovery_caption_count / max(nonempty_gt_count, 1)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             if torch.distributed.get_rank() == 0:
                 print(
@@ -2636,7 +2822,12 @@ class Sa2VAOPSDModelV2(BaseModel):
                     f"grpo_reward_mean={batch_grpo_reward_mean:.4f} "
                     f"cum_iou={cumulative_verifier_iou:.4f} "
                     f"cum_seg_correct_rate={cumulative_seg_correct_rate:.4f} "
+                    f"cum_all_sample_seg_success_rate={cumulative_all_sample_seg_success_rate:.4f} "
+                    f"cum_all_sample_seg_correct_rate={cumulative_all_sample_seg_correct_rate:.4f} "
+                    f"cum_valid_caption_cond_seg_correct_rate={cumulative_valid_caption_cond_seg_correct_rate:.4f} "
                     f"cum_valid_caption_rate={cumulative_valid_caption_rate:.4f} "
+                    f"batch_recovery_caption_rate={batch_recovery_caption_rate:.4f} "
+                    f"cum_recovery_caption_rate={cumulative_recovery_caption_rate:.4f} "
                     f"cum_teacher_regenerate_rate={cumulative_teacher_regenerate_rate:.4f} "
                     f"cum_on_policy_distill_rate={cumulative_on_policy_distill_rate:.4f} "
                     f"cum_grpo_positive_rate={cumulative_grpo_positive_rate:.4f} "
@@ -2654,7 +2845,12 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"grpo_reward_mean={batch_grpo_reward_mean:.4f} "
                 f"cum_iou={cumulative_verifier_iou:.4f} "
                 f"cum_seg_correct_rate={cumulative_seg_correct_rate:.4f} "
+                f"cum_all_sample_seg_success_rate={cumulative_all_sample_seg_success_rate:.4f} "
+                f"cum_all_sample_seg_correct_rate={cumulative_all_sample_seg_correct_rate:.4f} "
+                f"cum_valid_caption_cond_seg_correct_rate={cumulative_valid_caption_cond_seg_correct_rate:.4f} "
                 f"cum_valid_caption_rate={cumulative_valid_caption_rate:.4f} "
+                f"batch_recovery_caption_rate={batch_recovery_caption_rate:.4f} "
+                f"cum_recovery_caption_rate={cumulative_recovery_caption_rate:.4f} "
                 f"cum_teacher_regenerate_rate={cumulative_teacher_regenerate_rate:.4f} "
                 f"cum_on_policy_distill_rate={cumulative_on_policy_distill_rate:.4f} "
                 f"cum_grpo_positive_rate={cumulative_grpo_positive_rate:.4f} "
@@ -2672,9 +2868,23 @@ class Sa2VAOPSDModelV2(BaseModel):
             "opsd_grpo_cum": self._metric_tensor(cumulative_grpo, avg_total_loss.dtype),
             "grpo_reward_mean": self._metric_tensor(batch_grpo_reward_mean, avg_total_loss.dtype),
             "grpo_reward_mean_cum": self._metric_tensor(cumulative_grpo_reward_mean, avg_total_loss.dtype),
+            "grpo_quality_reward_mean_cum": self._metric_tensor(cumulative_grpo_quality_reward_mean, avg_total_loss.dtype),
+            "grpo_iou_reward_mean_cum": self._metric_tensor(cumulative_grpo_iou_reward_mean, avg_total_loss.dtype),
             "grpo_group_size": self._metric_tensor(float(self.grpo_group_size), avg_total_loss.dtype),
             "verifier_iou": self._metric_tensor(cumulative_verifier_iou, avg_total_loss.dtype),
             "seg_correct_rate": self._metric_tensor(cumulative_seg_correct_rate, avg_total_loss.dtype),
+            "all_sample_reconstruct_attempt_rate": self._metric_tensor(
+                cumulative_all_sample_reconstruct_attempt_rate, avg_total_loss.dtype
+            ),
+            "all_sample_seg_success_rate": self._metric_tensor(
+                cumulative_all_sample_seg_success_rate, avg_total_loss.dtype
+            ),
+            "all_sample_seg_correct_rate": self._metric_tensor(
+                cumulative_all_sample_seg_correct_rate, avg_total_loss.dtype
+            ),
+            "valid_caption_cond_seg_correct_rate": self._metric_tensor(
+                cumulative_valid_caption_cond_seg_correct_rate, avg_total_loss.dtype
+            ),
             "nonempty_caption_rate": self._metric_tensor(cumulative_nonempty_caption_rate, avg_total_loss.dtype),
             "valid_caption_rate": self._metric_tensor(cumulative_valid_caption_rate, avg_total_loss.dtype),
             "avg_caption_tokens": self._metric_tensor(cumulative_avg_caption_tokens, avg_total_loss.dtype),
@@ -2689,5 +2899,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             "teacher_regenerate_rate": self._metric_tensor(cumulative_teacher_regenerate_rate, avg_total_loss.dtype),
             "on_policy_distill_rate": self._metric_tensor(cumulative_on_policy_distill_rate, avg_total_loss.dtype),
             "grpo_positive_rate": self._metric_tensor(cumulative_grpo_positive_rate, avg_total_loss.dtype),
+            "recovery_caption_rate": self._metric_tensor(cumulative_recovery_caption_rate, avg_total_loss.dtype),
+            "invalid_caption_penalty_rate": self._metric_tensor(cumulative_invalid_caption_penalty_rate, avg_total_loss.dtype),
         }
         return metrics
