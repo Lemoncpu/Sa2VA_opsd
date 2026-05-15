@@ -20,7 +20,6 @@ from projects.sa2va.evaluation.teacher_diagnosis_common import (
     ON_POLICY_DISTILL_ROUTE,
     TEACHER_REGENERATE_ROUTE,
     build_mask_relation_context,
-    build_teacher_diagnosis_fields_staged,
     classify_teacher_route,
 )
 
@@ -1837,6 +1836,13 @@ class Sa2VAOPSDModelV2(BaseModel):
             high_threshold=self.iou_high_threshold,
         )
 
+    @staticmethod
+    def _build_training_teacher_fields(*, route, iou):
+        return {
+            "teacher_route": route,
+            "caption_to_mask_seg_correct": bool(float(iou) >= 0.5),
+        }
+
     def estimate_opsd_route_for_sample_with_model(
         self,
         *,
@@ -2404,19 +2410,9 @@ class Sa2VAOPSDModelV2(BaseModel):
             teacher_prompt = ""
             if route == TEACHER_REGENERATE_ROUTE:
                 teacher_regenerate_count += 1
-                teacher_fields = build_teacher_diagnosis_fields_staged(
-                    model=self,
-                    sample={
-                        "image": image,
-                        "student_question": student_question,
-                        "caption": description.clean_caption,
-                        "description_status": description.status,
-                    },
-                    reconstruction=reconstruction,
-                    gt_mask=gt_mask_np,
+                teacher_fields = self._build_training_teacher_fields(
+                    route=route,
                     iou=iou,
-                    low_threshold=self.iou_low_threshold,
-                    high_threshold=self.iou_high_threshold,
                 )
                 teacher_regenerate = self.generate_teacher_caption_with_privileged_prompt(
                     image=image,
@@ -2429,7 +2425,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                     iou=iou,
                     teacher_fields=teacher_fields,
                 )
-                teacher_prompt = teacher_fields.get("teacher_regenerate_prompt", "")
+                teacher_prompt = teacher_regenerate.raw_prediction
                 regen_entries.append(
                     {
                         "image": image,
@@ -2441,19 +2437,9 @@ class Sa2VAOPSDModelV2(BaseModel):
                 last_caption = teacher_regenerate.clean_caption or description.clean_caption
             elif route == ON_POLICY_DISTILL_ROUTE:
                 on_policy_distill_count += 1
-                teacher_fields = build_teacher_diagnosis_fields_staged(
-                    model=self,
-                    sample={
-                        "image": image,
-                        "student_question": student_question,
-                        "caption": description.clean_caption,
-                        "description_status": description.status,
-                    },
-                    reconstruction=reconstruction,
-                    gt_mask=gt_mask_np,
+                teacher_fields = self._build_training_teacher_fields(
+                    route=route,
                     iou=iou,
-                    low_threshold=self.iou_low_threshold,
-                    high_threshold=self.iou_high_threshold,
                 )
                 teacher_prompt = self.build_teacher_privileged_prompt_v3(
                     student_question=student_question,
