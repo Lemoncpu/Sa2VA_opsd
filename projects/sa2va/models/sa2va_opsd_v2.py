@@ -44,7 +44,6 @@ class DescriptionResult:
     raw_prediction: str
     clean_caption: str
     completion_ids: torch.Tensor
-    training_completion_ids: torch.Tensor
     status: str
 
 
@@ -93,11 +92,11 @@ class Sa2VAOPSDModelV2(BaseModel):
         use_flash_attn=True,
         use_mask_focused_caption_image=True,
         mask_focused_context_mode="grayscale",
-        enable_explicit_caption_eos_supervision=True,
         caption_quality_reward_weight=0.1,
         caption_reward_valid_bonus=0.1,
         caption_reward_sufficient_bonus=0.05,
         caption_reward_generic_penalty=0.05,
+        caption_reward_repetition_penalty=0.1,
         caption_reward_truncated_penalty=0.2,
         caption_reward_empty_penalty=0.3,
         enable_invalid_caption_recovery=True,
@@ -158,11 +157,11 @@ class Sa2VAOPSDModelV2(BaseModel):
         self.min_caption_tokens = max(int(min_caption_tokens), 1)
         self.use_mask_focused_caption_image = bool(use_mask_focused_caption_image)
         self.mask_focused_context_mode = str(mask_focused_context_mode).lower().strip()
-        self.enable_explicit_caption_eos_supervision = bool(enable_explicit_caption_eos_supervision)
         self.caption_quality_reward_weight = float(caption_quality_reward_weight)
         self.caption_reward_valid_bonus = float(caption_reward_valid_bonus)
         self.caption_reward_sufficient_bonus = float(caption_reward_sufficient_bonus)
         self.caption_reward_generic_penalty = float(caption_reward_generic_penalty)
+        self.caption_reward_repetition_penalty = float(caption_reward_repetition_penalty)
         self.caption_reward_truncated_penalty = float(caption_reward_truncated_penalty)
         self.caption_reward_empty_penalty = float(caption_reward_empty_penalty)
         self.enable_invalid_caption_recovery = bool(enable_invalid_caption_recovery)
@@ -722,7 +721,39 @@ class Sa2VAOPSDModelV2(BaseModel):
                 reward += self.caption_reward_sufficient_bonus
             if self._is_overly_generic_caption(clean_caption):
                 reward -= self.caption_reward_generic_penalty
+            if self._has_repetitive_caption_pattern(clean_caption):
+                reward -= self.caption_reward_repetition_penalty
         return reward
+
+    @staticmethod
+    def _has_repetitive_caption_pattern(caption):
+        normalized = re.sub(r"\s+", " ", (caption or "").strip().lower())
+        if not normalized:
+            return False
+        repeated_phrases = (
+            "sure it is",
+            "it is it is",
+            "sure sure",
+            "region1 region1",
+            "the region marked as",
+        )
+        if any(normalized.count(phrase) >= 2 for phrase in repeated_phrases):
+            return True
+        tokens = re.findall(r"[a-z0-9']+", normalized)
+        if len(tokens) >= 24:
+            unique_ratio = len(set(tokens)) / max(len(tokens), 1)
+            if unique_ratio < 0.45:
+                return True
+        for n in (2, 3):
+            if len(tokens) < n * 3:
+                continue
+            counts = {}
+            for idx in range(len(tokens) - n + 1):
+                ngram = tuple(tokens[idx: idx + n])
+                counts[ngram] = counts.get(ngram, 0) + 1
+            if any(count >= 3 for count in counts.values()):
+                return True
+        return False
 
     @staticmethod
     def _is_np_like_caption(caption):
@@ -861,50 +892,13 @@ class Sa2VAOPSDModelV2(BaseModel):
             loc = f"in the {vert} {horiz}"
         return f"The target is {size} and located {loc}."
 
-    def _template_suffix(self, model=None):
-        template = getattr(model, "template", None)
-        if isinstance(template, dict):
-            suffix = template.get("SUFFIX")
-            if isinstance(suffix, str) and suffix:
-                return suffix
-        return None
-
-    def _end_token_ids_for_completion(self, model=None):
-        suffix = self._template_suffix(model)
-        if suffix:
-            suffix_ids = self.tokenizer(
-                suffix,
-                add_special_tokens=False,
-                return_tensors="pt",
-            ).input_ids.to(self.device)
-            if suffix_ids.numel() > 0:
-                return suffix_ids
-        eos_token_id = self.tokenizer.eos_token_id
-        if eos_token_id is None:
-            return torch.empty((1, 0), device=self.device, dtype=torch.long)
-        return torch.tensor([[eos_token_id]], device=self.device, dtype=torch.long)
-
-    def _encode_completion_from_caption(self, caption, *, model=None, add_end_token=False):
-        caption_ids = self.tokenizer(
+    def _encode_completion_from_caption(self, caption, *, model=None):
+        del model
+        return self.tokenizer(
             caption,
             add_special_tokens=False,
             return_tensors="pt",
         ).input_ids.to(self.device)
-        if not add_end_token:
-            return caption_ids
-        end_token_ids = self._end_token_ids_for_completion(model)
-        if end_token_ids.numel() == 0:
-            return caption_ids
-        if caption_ids.numel() == 0:
-            return end_token_ids
-        return torch.cat([caption_ids, end_token_ids], dim=1)
-
-    def _encode_training_completion_from_caption(self, caption, *, model=None):
-        return self._encode_completion_from_caption(
-            caption,
-            model=model,
-            add_end_token=self.enable_explicit_caption_eos_supervision,
-        )
 
     @staticmethod
     def _mask_bbox(mask):
@@ -1059,12 +1053,10 @@ class Sa2VAOPSDModelV2(BaseModel):
         if status == "ok" and not self._is_caption_content_sufficient(clean_caption):
             status = "truncated_caption"
         completion_ids = self._encode_completion_from_caption(clean_caption, model=model)
-        training_completion_ids = self._encode_training_completion_from_caption(clean_caption, model=model)
         return DescriptionResult(
             raw_prediction=raw_prediction,
             clean_caption=clean_caption,
             completion_ids=completion_ids,
-            training_completion_ids=training_completion_ids,
             status=status,
         )
 
@@ -1548,16 +1540,12 @@ class Sa2VAOPSDModelV2(BaseModel):
         apply_mask_focus=True,
     ):
         student_caption = self._clean_caption_text(student_caption or "")
-        student_completion_ids = self._encode_training_completion_from_caption(
-            student_caption,
-            model=self.teacher_model if self.has_teacher_model() else self.student_model,
-        )
+        student_completion_ids = self._encode_completion_from_caption(student_caption)
         if student_completion_ids.shape[1] == 0:
             return DescriptionResult(
                 raw_prediction="",
                 clean_caption="",
                 completion_ids=student_completion_ids,
-                training_completion_ids=student_completion_ids,
                 status="empty",
             )
 
@@ -1581,7 +1569,6 @@ class Sa2VAOPSDModelV2(BaseModel):
             raw_prediction=raw_prediction,
             clean_caption=clean_caption,
             completion_ids=predicted_ids,
-            training_completion_ids=predicted_ids,
             status=status,
         )
 
@@ -1623,7 +1610,6 @@ class Sa2VAOPSDModelV2(BaseModel):
             raw_prediction=raw_prediction,
             clean_caption=clean_caption,
             completion_ids=self._encode_completion_from_caption(clean_caption, model=model),
-            training_completion_ids=self._encode_training_completion_from_caption(clean_caption, model=model),
             status=status,
         )
 
@@ -2266,8 +2252,8 @@ class Sa2VAOPSDModelV2(BaseModel):
         )
         for description in descriptions:
             quality_reward = self._caption_quality_reward(description.clean_caption, description.status)
-            training_completion_ids = description.training_completion_ids
-            if training_completion_ids.shape[1] == 0:
+            completion_ids = description.completion_ids
+            if completion_ids.shape[1] == 0:
                 continue
             reconstruction = self.reconstruct_mask(
                 image=image,
@@ -2290,19 +2276,19 @@ class Sa2VAOPSDModelV2(BaseModel):
                         image,
                         prompt_masks,
                         student_question,
-                        training_completion_ids,
+                        completion_ids,
                         apply_mask_focus=True,
                     )
                     old_token_log_probs = self._token_log_probs_from_logits(
                         old_policy_logits,
-                        training_completion_ids,
+                        completion_ids,
                     )
             old_token_log_probs = self._materialize_autograd_input(old_token_log_probs.detach())
             quality_reward_sum += quality_reward
             iou_reward_sum += iou_reward
             rollout_entries.append(
                 {
-                    "completion_ids": training_completion_ids,
+                    "completion_ids": completion_ids,
                     "old_token_log_probs": old_token_log_probs,
                     "reward_value": reward_value,
                 }
@@ -2534,7 +2520,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                             "image": image,
                             "prompt_masks": prompt_masks,
                             "student_question": student_question,
-                            "completion_ids": teacher_regenerate.training_completion_ids,
+                            "completion_ids": teacher_regenerate.completion_ids,
                         }
                     )
                     teacher_regenerate_count += 1
@@ -2613,7 +2599,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                         "image": image,
                         "prompt_masks": prompt_masks,
                         "student_question": student_question,
-                        "completion_ids": teacher_regenerate.training_completion_ids,
+                        "completion_ids": teacher_regenerate.completion_ids,
                     }
                 )
                 last_caption = teacher_regenerate.clean_caption or description.clean_caption
@@ -2633,7 +2619,6 @@ class Sa2VAOPSDModelV2(BaseModel):
                     ref_mask=ref_mask_np,
                     teacher_fields=teacher_fields,
                 )
-                teacher_prompt = self._route_prompt_tag(route)
                 teacher_prompt_masks = np.stack(
                     [
                         gt_mask_np.astype(np.float32),
@@ -2647,7 +2632,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                         "prompt_masks": prompt_masks,
                         "student_question": student_question,
                         "teacher_prompt": teacher_prompt,
-                        "completion_ids": description.training_completion_ids,
+                        "completion_ids": description.completion_ids,
                         "teacher_prompt_masks": teacher_prompt_masks,
                         "iou": iou,
                     }

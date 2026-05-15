@@ -61,6 +61,7 @@ model = dict(
     description_max_new_tokens=96,
     description_repetition_penalty=1.1,
     description_no_repeat_ngram_size=4,
+    caption_reward_repetition_penalty=0.1,
     grpo_sample_max_new_tokens=64,
     low_iou_regen_max_new_tokens=64,
     min_caption_tokens=4,
