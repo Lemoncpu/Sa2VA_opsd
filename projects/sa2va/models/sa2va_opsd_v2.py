@@ -1843,6 +1843,18 @@ class Sa2VAOPSDModelV2(BaseModel):
             "caption_to_mask_seg_correct": bool(float(iou) >= 0.5),
         }
 
+    @staticmethod
+    def _route_prompt_tag(route):
+        if route == TEACHER_REGENERATE_ROUTE:
+            return "[TEACHER_REGENERATE_ROUTE]"
+        if route == ON_POLICY_DISTILL_ROUTE:
+            return "[ON_POLICY_DISTILL_ROUTE]"
+        if route == GRPO_POSITIVE_ROUTE:
+            return "[GRPO_ROUTE]"
+        if route:
+            return f"[{str(route).upper()}]"
+        return ""
+
     def estimate_opsd_route_for_sample_with_model(
         self,
         *,
@@ -2425,7 +2437,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                     iou=iou,
                     teacher_fields=teacher_fields,
                 )
-                teacher_prompt = teacher_regenerate.raw_prediction
+                teacher_prompt = self._route_prompt_tag(route)
                 regen_entries.append(
                     {
                         "image": image,
@@ -2451,6 +2463,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                     ref_mask=ref_mask_np,
                     teacher_fields=teacher_fields,
                 )
+                teacher_prompt = self._route_prompt_tag(route)
                 teacher_prompt_masks = np.stack(
                     [
                         gt_mask_np.astype(np.float32),
@@ -2480,7 +2493,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                         "gt_mask": gt_mask_np,
                     }
                 )
-                teacher_prompt = "[GRPO_ROUTE]"
+                teacher_prompt = self._route_prompt_tag(route)
                 last_caption = description.clean_caption
 
             last_sample_key = sample_key
@@ -2583,6 +2596,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "opsd_grpo_cum": self._metric_tensor(cumulative_grpo, zero.dtype),
                 "grpo_reward_mean": zero,
                 "grpo_reward_mean_cum": self._metric_tensor(cumulative_grpo_reward_mean, zero.dtype),
+                "grpo_group_size": self._metric_tensor(float(self.grpo_group_size), zero.dtype),
                 "verifier_iou": self._metric_tensor(cumulative_verifier_iou, zero.dtype),
                 "seg_correct_rate": self._metric_tensor(cumulative_seg_correct_rate, zero.dtype),
                 "nonempty_caption_rate": self._metric_tensor(cumulative_nonempty_caption_rate, zero.dtype),
@@ -2658,6 +2672,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             "opsd_grpo_cum": self._metric_tensor(cumulative_grpo, avg_total_loss.dtype),
             "grpo_reward_mean": self._metric_tensor(batch_grpo_reward_mean, avg_total_loss.dtype),
             "grpo_reward_mean_cum": self._metric_tensor(cumulative_grpo_reward_mean, avg_total_loss.dtype),
+            "grpo_group_size": self._metric_tensor(float(self.grpo_group_size), avg_total_loss.dtype),
             "verifier_iou": self._metric_tensor(cumulative_verifier_iou, avg_total_loss.dtype),
             "seg_correct_rate": self._metric_tensor(cumulative_seg_correct_rate, avg_total_loss.dtype),
             "nonempty_caption_rate": self._metric_tensor(cumulative_nonempty_caption_rate, avg_total_loss.dtype),
