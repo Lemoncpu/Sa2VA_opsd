@@ -32,6 +32,7 @@ ACCUMULATIVE_COUNTS_OVERRIDE="${ACCUMULATIVE_COUNTS_OVERRIDE:-}"
 PYTORCH_CUDA_ALLOC_CONF_VALUE="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 RESUME_PATH=""
 LOAD_FROM_PATH=""
+ROUTE_MODE="${ROUTE_MODE:-manifest}"
 DEFAULT_GPUS=8
 
 count_csv_items() {
@@ -159,6 +160,7 @@ usage() {
   echo "  --deepspeed NAME        DeepSpeed config alias used by tools/dist.sh. Default: deepspeed_zero2"
   echo "  --batch-size N          Override per-device training batch size in config."
   echo "  --accumulative-counts N Override gradient accumulation steps in config."
+  echo "  --route-mode MODE       manifest | online. Default: manifest"
   echo "  --resume PATH           Resume from a checkpoint path."
   echo "  --load-from PATH        Load model weights from a checkpoint without restoring training state."
   echo "  -h, --help              Show this help."
@@ -227,6 +229,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --accumulative-counts|--grad-accum)
       ACCUMULATIVE_COUNTS_OVERRIDE="$2"
+      shift 2
+      ;;
+    --route-mode)
+      ROUTE_MODE="$2"
       shift 2
       ;;
     --resume)
@@ -344,6 +350,11 @@ if [[ -n "${LOAD_FROM_PATH}" && ! -e "${LOAD_FROM_PATH}" ]]; then
   exit 1
 fi
 
+if [[ "${ROUTE_MODE}" != "manifest" && "${ROUTE_MODE}" != "online" ]]; then
+  echo "--route-mode must be 'manifest' or 'online', got: ${ROUTE_MODE}" >&2
+  exit 1
+fi
+
 mkdir -p "${WORK_DIR}"
 
 EFFECTIVE_BATCH_SIZE="${BATCH_SIZE_OVERRIDE:-1}"
@@ -353,10 +364,17 @@ ROUTE_CACHE_DIR="${WORK_DIR}/route_cache"
 ROUTE_MANIFEST_PATH="${ROUTE_CACHE_DIR}/routes_step_0000000.jsonl"
 ROUTE_MANIFEST_LATEST_PATH="${ROUTE_CACHE_DIR}/routes_latest.jsonl"
 
-if [[ ! -f "${ROUTE_MANIFEST_PATH}" ]]; then
-  echo "Initial OPSD route manifest does not exist: ${ROUTE_MANIFEST_PATH}" >&2
-  echo "Run tools/export_refcoco_opsd_${MODEL_FLAVOR}_routes.sh first to export the full route jsonl before training." >&2
+if [[ "${ROUTE_MODE}" == "online" && "${EFFECTIVE_BATCH_SIZE}" -ne 1 ]]; then
+  echo "--route-mode online currently requires per-device --batch-size 1 to avoid mixed online OPSD routes within one batch." >&2
   exit 1
+fi
+
+if [[ "${ROUTE_MODE}" == "manifest" ]]; then
+  if [[ ! -f "${ROUTE_MANIFEST_PATH}" ]]; then
+    echo "Initial OPSD route manifest does not exist: ${ROUTE_MANIFEST_PATH}" >&2
+    echo "Run tools/export_refcoco_opsd_${MODEL_FLAVOR}_routes.sh first to export the full route jsonl before training." >&2
+    exit 1
+  fi
 fi
 
 TRAIN_ARGS=(--work-dir "${WORK_DIR}")
@@ -371,15 +389,21 @@ TRAIN_ARGS+=(
   "train_dataset.dataset_name=${DATASET}"
   "train_dataset.split=${SPLIT}"
   "train_dataset.image_root=${IMAGE_ROOT}"
+  "route_mode=${ROUTE_MODE}"
   "train_dataloader.dataset.data_root=${DATA_ROOT}"
   "train_dataloader.dataset.dataset_name=${DATASET}"
   "train_dataloader.dataset.split=${SPLIT}"
   "train_dataloader.dataset.image_root=${IMAGE_ROOT}"
-  "train_dataset.route_manifest_path=${ROUTE_MANIFEST_PATH}"
-  "train_dataset.route_manifest_latest_path=${ROUTE_MANIFEST_LATEST_PATH}"
-  "train_dataloader.dataset.route_manifest_path=${ROUTE_MANIFEST_PATH}"
-  "train_dataloader.dataset.route_manifest_latest_path=${ROUTE_MANIFEST_LATEST_PATH}"
+  "train_dataloader.dataset.route_mode=${ROUTE_MODE}"
 )
+if [[ "${ROUTE_MODE}" == "manifest" ]]; then
+  TRAIN_ARGS+=(
+    "train_dataset.route_manifest_path=${ROUTE_MANIFEST_PATH}"
+    "train_dataset.route_manifest_latest_path=${ROUTE_MANIFEST_LATEST_PATH}"
+    "train_dataloader.dataset.route_manifest_path=${ROUTE_MANIFEST_PATH}"
+    "train_dataloader.dataset.route_manifest_latest_path=${ROUTE_MANIFEST_LATEST_PATH}"
+  )
+fi
 if [[ -n "${BATCH_SIZE_OVERRIDE}" ]]; then
   TRAIN_ARGS+=(
     "batch_size=${BATCH_SIZE_OVERRIDE}"
@@ -424,6 +448,7 @@ echo "  PORT=${PORT}"
 echo "  DEEPSPEED=${DEEPSPEED}"
 echo "  BATCH_SIZE_OVERRIDE=${BATCH_SIZE_OVERRIDE}"
 echo "  ACCUMULATIVE_COUNTS_OVERRIDE=${ACCUMULATIVE_COUNTS_OVERRIDE}"
+echo "  ROUTE_MODE=${ROUTE_MODE}"
 echo "  LOAD_FROM_PATH=${LOAD_FROM_PATH}"
 echo "  RESUME_PATH=${RESUME_PATH}"
 echo "  PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF_VALUE}"

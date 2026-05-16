@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from projects.sa2va.datasets.refcoco_opsd import build_refcoco_opsd_records
+from projects.sa2va.datasets.refcoco_opsd import SKIP_OPSD_ROUTE, build_refcoco_opsd_records
 
 
 def parse_args():
@@ -274,6 +274,18 @@ def build_manifest_record(route_info: dict, *, sample_key: str, global_step: int
     }
 
 
+def build_skip_manifest_record(*, sample_key: str, global_step: int, timestamp: str):
+    return {
+        "sample_key": sample_key,
+        "route": SKIP_OPSD_ROUTE,
+        "iou": 0.0,
+        "description_status": "skipped",
+        "reconstruct_status": "skipped",
+        "timestamp": timestamp,
+        "global_step": int(global_step),
+    }
+
+
 def build_rank_shard_path(out_path: Path, rank: int, world_size: int) -> Path:
     return out_path.parent / f"{out_path.stem}.rank{rank:05d}-of-{world_size:05d}{out_path.suffix}"
 
@@ -344,6 +356,14 @@ def summarize_route_counts(records: Sequence[Dict]) -> Dict[str, int]:
     return summary
 
 
+def count_active_records(records: Sequence[Dict]) -> int:
+    return sum(
+        1
+        for record in records
+        if record.get("sample_key") and record.get("route") not in {None, "", SKIP_OPSD_ROUTE}
+    )
+
+
 def merge_manifest_records(
     *,
     existing_records: Sequence[Dict],
@@ -396,31 +416,66 @@ def export_routes(
     global_step: int = 0,
     route_model: str = "teacher",
     update_latest: bool = False,
+    limit: Optional[int] = None,
     consumed_sample_keys: Optional[Sequence[str]] = None,
     existing_manifest_path: Optional[str] = None,
     only_missing_from_manifest: bool = False,
+    active_window_size: Optional[int] = None,
+    restrict_manifest_to_active_window: bool = False,
 ):
+    if restrict_manifest_to_active_window and only_missing_from_manifest:
+        raise ValueError(
+            "restrict_manifest_to_active_window=True is incompatible with only_missing_from_manifest=True."
+        )
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     rank = get_rank()
     world_size = get_world_size()
     consumed_sample_key_set = {str(sample_key) for sample_key in consumed_sample_keys or [] if sample_key}
-    samples_to_export = filter_samples_by_sample_keys(samples, excluded_sample_keys=consumed_sample_key_set)
     existing_records: List[Dict] = []
     if existing_manifest_path:
         existing_manifest = Path(existing_manifest_path)
         if existing_manifest.exists():
             existing_records = load_jsonl_records(existing_manifest)
+    carried_records: List[Dict] = []
+    carried_sample_keys: Set[str] = set()
+    if restrict_manifest_to_active_window:
+        for record in existing_records:
+            sample_key = record.get("sample_key")
+            route = record.get("route")
+            if not sample_key or sample_key in consumed_sample_key_set:
+                continue
+            if route in {None, "", SKIP_OPSD_ROUTE}:
+                continue
+            carried_records.append(record)
+            carried_sample_keys.add(str(sample_key))
+
+    excluded_sample_keys = set(consumed_sample_key_set)
+    excluded_sample_keys.update(carried_sample_keys)
+    candidate_samples = filter_samples_by_sample_keys(samples, excluded_sample_keys=excluded_sample_keys)
     if only_missing_from_manifest and existing_records:
         existing_sample_keys = {
             str(record["sample_key"])
             for record in existing_records
             if record.get("sample_key")
         }
-        samples_to_export = filter_samples_by_sample_keys(
-            samples_to_export,
+        candidate_samples = filter_samples_by_sample_keys(
+            candidate_samples,
             excluded_sample_keys=existing_sample_keys,
         )
+    if active_window_size is not None:
+        if active_window_size <= 0:
+            raise ValueError(f"active_window_size must be positive, got {active_window_size}.")
+        export_capacity = max(int(active_window_size) - len(carried_records), 0)
+        if limit is not None:
+            export_capacity = min(export_capacity, int(limit))
+    elif limit is not None:
+        export_capacity = int(limit)
+    else:
+        export_capacity = None
+    samples_to_export = list(candidate_samples)
+    if export_capacity is not None:
+        samples_to_export = samples_to_export[:export_capacity]
     coord_dir = get_coord_dir(out_path)
     if is_rank0():
         if coord_dir.exists():
@@ -486,13 +541,50 @@ def export_routes(
                 )
                 raise RuntimeError(f"Distributed OPSD export failed before merge. {error_details}")
             merged_counts = merge_route_counts([status.get("route_counts", {}) for status in rank_statuses])
-            record_count = int(sum(int(status.get("record_count", 0)) for status in rank_statuses))
+            exported_record_count = int(sum(int(status.get("record_count", 0)) for status in rank_statuses))
             merge_shards(
                 out_path=out_path,
                 shard_paths=shard_paths,
                 update_latest=update_latest,
             )
-            if existing_records:
+            if restrict_manifest_to_active_window:
+                exported_records = load_jsonl_records(out_path)
+                active_records = merge_manifest_records(
+                    existing_records=carried_records,
+                    updated_records=exported_records,
+                )
+                active_sample_keys = {
+                    str(record["sample_key"])
+                    for record in active_records
+                    if record.get("sample_key")
+                }
+                skip_records = [
+                    build_skip_manifest_record(
+                        sample_key=sample["sample_key"],
+                        global_step=global_step,
+                        timestamp=timestamp,
+                    )
+                    for sample in samples
+                    if sample["sample_key"] not in active_sample_keys
+                ]
+                final_records = merge_manifest_records(
+                    existing_records=skip_records,
+                    updated_records=active_records,
+                )
+                write_jsonl_records(out_path, final_records)
+                if update_latest:
+                    latest_path = out_path.parent / "routes_latest.jsonl"
+                    if latest_path.exists() or latest_path.is_symlink():
+                        latest_path.unlink()
+                    try:
+                        latest_path.symlink_to(out_path.name)
+                    except OSError:
+                        shutil.copyfile(out_path, latest_path)
+                merged_counts = summarize_route_counts(final_records)
+                manifest_record_count = len(final_records)
+                active_record_count = count_active_records(final_records)
+                carried_record_count = len(carried_records)
+            elif existing_records:
                 merged_records = merge_manifest_records(
                     existing_records=existing_records,
                     updated_records=load_jsonl_records(out_path),
@@ -507,14 +599,25 @@ def export_routes(
                     except OSError:
                         shutil.copyfile(out_path, latest_path)
                 merged_counts = summarize_route_counts(merged_records)
-                record_count = len(merged_records)
+                manifest_record_count = len(merged_records)
+                active_record_count = count_active_records(merged_records)
+                carried_record_count = 0
+            else:
+                manifest_records = load_jsonl_records(out_path)
+                manifest_record_count = len(manifest_records)
+                active_record_count = count_active_records(manifest_records)
+                carried_record_count = 0
             cleanup_shards(shard_paths)
             atomic_write_json(
                 result_path,
                 {
                     "ok": True,
                     "route_counts": merged_counts,
-                    "record_count": record_count,
+                    "record_count": manifest_record_count,
+                    "manifest_record_count": manifest_record_count,
+                    "active_record_count": active_record_count,
+                    "exported_record_count": exported_record_count,
+                    "carried_record_count": carried_record_count,
                     "world_size": world_size,
                     "out": str(out_path),
                 },
@@ -540,6 +643,10 @@ def export_routes(
     return {
         "route_counts": result_payload["route_counts"],
         "record_count": int(result_payload["record_count"]),
+        "manifest_record_count": int(result_payload["manifest_record_count"]),
+        "active_record_count": int(result_payload["active_record_count"]),
+        "exported_record_count": int(result_payload["exported_record_count"]),
+        "carried_record_count": int(result_payload["carried_record_count"]),
         "world_size": int(result_payload["world_size"]),
     }
 
@@ -553,10 +660,12 @@ def export_routes_from_runner(
     limit: int = None,
     consumed_sample_keys: Optional[Sequence[str]] = None,
     only_missing_from_manifest: bool = False,
+    active_window_size: Optional[int] = None,
+    restrict_manifest_to_active_window: bool = False,
 ):
     model = runner.model.module if hasattr(runner.model, "module") else runner.model
     cfg = runner.cfg
-    samples = collect_refcoco_samples_from_cfg(cfg, limit=limit)
+    samples = collect_refcoco_samples_from_cfg(cfg)
     dataset = getattr(getattr(getattr(runner, "train_loop", None), "dataloader", None), "dataset", None)
     existing_manifest_path = None
     if dataset is not None and hasattr(dataset, "resolve_active_route_manifest_path"):
@@ -568,17 +677,23 @@ def export_routes_from_runner(
         global_step=global_step,
         route_model=route_model,
         update_latest=True,
+        limit=limit,
         consumed_sample_keys=consumed_sample_keys,
         existing_manifest_path=existing_manifest_path,
         only_missing_from_manifest=only_missing_from_manifest,
+        active_window_size=active_window_size,
+        restrict_manifest_to_active_window=restrict_manifest_to_active_window,
     )
     if is_rank0():
         runner.logger.info(
-            "OPSD route export finished: step=%s route_model=%s world_size=%s records=%s consumed=%s route_counts=%s out=%s",
+            "OPSD route export finished: step=%s route_model=%s world_size=%s exported=%s carried=%s active=%s manifest=%s consumed=%s route_counts=%s out=%s",
             global_step,
             route_model,
             export_summary["world_size"],
-            export_summary["record_count"],
+            export_summary["exported_record_count"],
+            export_summary["carried_record_count"],
+            export_summary["active_record_count"],
+            export_summary["manifest_record_count"],
             len(consumed_sample_keys or []),
             export_summary["route_counts"],
             out_path,
@@ -607,6 +722,7 @@ def main():
             global_step=args.global_step,
             route_model=args.route_model,
             update_latest=args.update_latest,
+            limit=args.limit,
             existing_manifest_path=args.out if args.only_missing_from_manifest else None,
             only_missing_from_manifest=args.only_missing_from_manifest,
         )

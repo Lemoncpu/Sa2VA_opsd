@@ -1,5 +1,6 @@
 from mmengine.hooks import CheckpointHook, DistSamplerSeedHook, IterTimerHook, LoggerHook, ParamSchedulerHook
 from mmengine.optim import CosineAnnealingLR, LinearLR, OptimWrapper
+from mmengine.dataset.sampler import DefaultSampler
 from torch.optim import AdamW
 
 from xtuner.engine.runner import TrainLoop
@@ -37,6 +38,12 @@ route_refresh_interval = 200
 route_cache_dir = "./work_dirs/sa2va_opsd_refcoco_internvl3_4b_v3/route_cache"
 route_manifest_path = f"{route_cache_dir}/routes_step_0000000.jsonl"
 route_manifest_latest_path = f"{route_cache_dir}/routes_latest.jsonl"
+route_mode = "manifest"
+
+if route_mode not in {"manifest", "online"}:
+    raise ValueError(f"Unsupported route_mode={route_mode!r}. Expected 'manifest' or 'online'.")
+
+use_manifest_routes = route_mode == "manifest"
 
 model = dict(
     type=Sa2VAOPSDModelV3,
@@ -62,10 +69,12 @@ model = dict(
     description_repetition_penalty=1.1,
     description_no_repeat_ngram_size=4,
     caption_reward_repetition_penalty=0.1,
+    grpo_low_iou_penalty=0.3,
     grpo_sample_max_new_tokens=64,
     low_iou_regen_max_new_tokens=64,
     min_caption_tokens=4,
     enable_ddp_route_safety_loss=True,
+    use_online_route_for_loss=not use_manifest_routes,
     reconstruct_question_template="<image>Please segment the region described as: {caption}",
 )
 
@@ -84,23 +93,32 @@ train_dataset = dict(
     shuffle=False,
     skip_empty_masks=True,
     student_question=DEFAULT_MASK_TO_CAPTION_QUESTION,
-    route_manifest_path=route_manifest_path,
-    route_manifest_latest_path=route_manifest_latest_path,
-    route_manifest_required=True,
-    skip_route_manifest_skip_samples=True,
+    route_manifest_path=route_manifest_path if use_manifest_routes else None,
+    route_manifest_latest_path=route_manifest_latest_path if use_manifest_routes else None,
+    route_manifest_required=use_manifest_routes,
+    skip_route_manifest_skip_samples=use_manifest_routes,
+)
+
+train_sampler = (
+    dict(
+        type=RouteGroupedSampler,
+        per_device_batch_size=batch_size * accumulative_counts,
+        shuffle=True,
+        drop_last=True,
+        require_routes=True,
+    )
+    if use_manifest_routes
+    else dict(
+        type=DefaultSampler,
+        shuffle=True,
+    )
 )
 
 train_dataloader = dict(
     batch_size=batch_size,
     num_workers=dataloader_num_workers,
     dataset=train_dataset,
-    sampler=dict(
-        type=RouteGroupedSampler,
-        per_device_batch_size=batch_size * accumulative_counts,
-        shuffle=True,
-        drop_last=True,
-        require_routes=True,
-    ),
+    sampler=train_sampler,
     collate_fn=dict(type=sa2va_opsd_collect_fn_v2),
 )
 
@@ -138,15 +156,16 @@ param_scheduler = [
 
 train_cfg = dict(type=TrainLoop, max_epochs=max_epochs)
 
-custom_hooks = [
-    dict(type=EMATeacherHook),
-    dict(
-        type=OpsdRouteRefreshHook,
-        interval=route_refresh_interval,
-        route_cache_dir="route_cache",
-        route_model="teacher",
-    ),
-]
+custom_hooks = [dict(type=EMATeacherHook)]
+if use_manifest_routes:
+    custom_hooks.append(
+        dict(
+            type=OpsdRouteRefreshHook,
+            interval=route_refresh_interval,
+            route_cache_dir="route_cache",
+            route_model="teacher",
+        )
+    )
 
 default_hooks = dict(
     timer=dict(type=IterTimerHook),

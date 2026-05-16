@@ -16,6 +16,7 @@ class OpsdRouteRefreshHook(Hook):
         route_cache_dir: str = "route_cache",
         route_model: str = "teacher",
         export_limit: int = None,
+        restrict_manifest_to_active_window: bool = True,
     ):
         if interval <= 0:
             raise ValueError(f"interval must be positive, got {interval}.")
@@ -23,6 +24,7 @@ class OpsdRouteRefreshHook(Hook):
         self.route_cache_dir = route_cache_dir
         self.route_model = str(route_model)
         self.export_limit = export_limit
+        self.restrict_manifest_to_active_window = bool(restrict_manifest_to_active_window)
 
     @staticmethod
     def _unwrap_model(runner):
@@ -93,11 +95,23 @@ class OpsdRouteRefreshHook(Hook):
         latest_path = cache_dir / "routes_latest.jsonl"
         return manifest_path, latest_path
 
+    def _resolve_active_window_size(self, runner) -> int:
+        train_loop, _, sampler = self._get_dataset_and_sampler(runner)
+        dataloader = getattr(train_loop, "dataloader", None)
+        if sampler is None and dataloader is None:
+            return self.interval
+        world_size = int(getattr(sampler, "world_size", 1) or 1) if sampler is not None else 1
+        per_iter_batch_size = int(getattr(dataloader, "batch_size", 1) or 1) if dataloader is not None else 1
+        return max(self.interval * world_size * per_iter_batch_size, 1)
+
     def _export_routes(self, runner, global_step: int):
         from tools.export_opsd_routes import export_routes_from_runner
 
         consumed_sample_keys = self._get_global_consumed_sample_keys(runner)
         manifest_path, _ = self._build_export_paths(runner, global_step)
+        active_window_size = None
+        if self.restrict_manifest_to_active_window:
+            active_window_size = self._resolve_active_window_size(runner)
         export_routes_from_runner(
             runner=runner,
             out_path=str(manifest_path),
@@ -105,12 +119,15 @@ class OpsdRouteRefreshHook(Hook):
             route_model=self.route_model,
             limit=self.export_limit,
             consumed_sample_keys=consumed_sample_keys,
+            active_window_size=active_window_size,
+            restrict_manifest_to_active_window=self.restrict_manifest_to_active_window,
         )
         if self._is_rank0():
             runner.logger.info(
-                "Exported OPSD route manifest to %s after excluding %s consumed samples",
+                "Exported OPSD route manifest to %s after excluding %s consumed samples; active_window_size=%s",
                 manifest_path,
                 len(consumed_sample_keys),
+                active_window_size,
             )
 
     def before_train_epoch(self, runner) -> None:

@@ -99,6 +99,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         caption_reward_repetition_penalty=0.1,
         caption_reward_truncated_penalty=0.2,
         caption_reward_empty_penalty=0.3,
+        grpo_low_iou_penalty=0.3,
         enable_invalid_caption_recovery=True,
         use_online_route_for_loss=True,
     ):
@@ -164,6 +165,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         self.caption_reward_repetition_penalty = float(caption_reward_repetition_penalty)
         self.caption_reward_truncated_penalty = float(caption_reward_truncated_penalty)
         self.caption_reward_empty_penalty = float(caption_reward_empty_penalty)
+        self.grpo_low_iou_penalty = float(grpo_low_iou_penalty)
         self.enable_invalid_caption_recovery = bool(enable_invalid_caption_recovery)
         self.use_online_route_for_loss = bool(use_online_route_for_loss)
         self.debug_print_limit = 3
@@ -2325,11 +2327,15 @@ class Sa2VAOPSDModelV2(BaseModel):
             )
             pred_mask = None if reconstruction is None else reconstruction.pred_mask
             iou_reward = 0.0
+            effective_iou = 0.0
             if pred_mask is None:
                 reward_value = self.caption_quality_reward_weight * quality_reward
             else:
                 iou_reward = float(self._compute_iou(gt_mask, pred_mask))
+                effective_iou = iou_reward
                 reward_value = iou_reward + self.caption_quality_reward_weight * quality_reward
+            if effective_iou < self.iou_low_threshold:
+                reward_value -= self.grpo_low_iou_penalty
             with self._temporary_eval_model(self.student_model):
                 with torch.inference_mode():
                     old_policy_logits = self._forward_sequence_with_model(
@@ -2606,7 +2612,10 @@ class Sa2VAOPSDModelV2(BaseModel):
             iou = self._compute_iou(gt_mask_np, pred_mask)
             ref_mask_np = self._to_numpy_mask(pred_mask)
             online_route = self._route_from_iou(iou)
-            route = batch_route or route_from_manifest or online_route
+            if self.use_online_route_for_loss:
+                route = online_route
+            else:
+                route = batch_route or route_from_manifest or online_route
             routed_count += 1
             if iou >= 0.5:
                 seg_correct_count += 1
