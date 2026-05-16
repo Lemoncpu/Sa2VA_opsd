@@ -93,15 +93,23 @@ class Sa2VAOPSDModelV2(BaseModel):
         use_mask_focused_caption_image=True,
         mask_focused_context_mode="grayscale",
         caption_quality_reward_weight=0.1,
-        caption_reward_valid_bonus=0.1,
-        caption_reward_sufficient_bonus=0.05,
-        caption_reward_generic_penalty=0.05,
-        caption_reward_repetition_penalty=0.1,
-        caption_reward_truncated_penalty=0.2,
-        caption_reward_empty_penalty=0.3,
+        caption_reward_valid_bonus=0.05,
+        caption_reward_sufficient_bonus=0.1,
+        caption_reward_generic_penalty=0.25,
+        caption_reward_repetition_penalty=0.2,
+        caption_reward_truncated_penalty=0.35,
+        caption_reward_empty_penalty=0.5,
+        caption_reward_scene_spill_penalty=0.2,
+        caption_reward_low_density_penalty=0.2,
+        caption_low_density_length_threshold=28,
         grpo_low_iou_penalty=0.3,
+        grpo_very_low_iou_penalty=0.45,
+        grpo_zero_iou_penalty=0.7,
+        grpo_missing_mask_penalty=0.9,
         enable_invalid_caption_recovery=True,
         use_online_route_for_loss=True,
+        max_teacher_regenerate_fraction=0.2,
+        max_recovery_fraction=0.1,
     ):
         super().__init__()
         if teacher_model_path == "__skip__":
@@ -165,9 +173,17 @@ class Sa2VAOPSDModelV2(BaseModel):
         self.caption_reward_repetition_penalty = float(caption_reward_repetition_penalty)
         self.caption_reward_truncated_penalty = float(caption_reward_truncated_penalty)
         self.caption_reward_empty_penalty = float(caption_reward_empty_penalty)
+        self.caption_reward_scene_spill_penalty = float(caption_reward_scene_spill_penalty)
+        self.caption_reward_low_density_penalty = float(caption_reward_low_density_penalty)
+        self.caption_low_density_length_threshold = max(int(caption_low_density_length_threshold), 1)
         self.grpo_low_iou_penalty = float(grpo_low_iou_penalty)
+        self.grpo_very_low_iou_penalty = float(grpo_very_low_iou_penalty)
+        self.grpo_zero_iou_penalty = float(grpo_zero_iou_penalty)
+        self.grpo_missing_mask_penalty = float(grpo_missing_mask_penalty)
         self.enable_invalid_caption_recovery = bool(enable_invalid_caption_recovery)
         self.use_online_route_for_loss = bool(use_online_route_for_loss)
+        self.max_teacher_regenerate_fraction = float(max_teacher_regenerate_fraction)
+        self.max_recovery_fraction = float(max_recovery_fraction)
         self.debug_print_limit = 3
         self._debug_print_count = 0
         self._cumulative_valid_count = 0
@@ -201,6 +217,16 @@ class Sa2VAOPSDModelV2(BaseModel):
         self._cumulative_grpo_iou_reward_sum = 0.0
         self._cumulative_recovery_caption_count = 0
         self._cumulative_invalid_caption_penalty_count = 0
+        self._cumulative_hard_reconstruct_failure_count = 0
+        self._cumulative_teacher_regenerate_ce_applied_count = 0
+        self._cumulative_teacher_regenerate_suppressed_count = 0
+        self._cumulative_recovery_ce_applied_count = 0
+        self._cumulative_recovery_suppressed_count = 0
+        self._cumulative_scene_spill_caption_count = 0
+        self._cumulative_low_density_long_caption_count = 0
+        self._cumulative_detail_sufficient_caption_count = 0
+        self._cumulative_generic_caption_count = 0
+        self._cumulative_repetitive_caption_count = 0
 
         self.teacher_summary_template = teacher_summary_template or (
             "You are optimizing the following task: given a gtmask, generate a caption that describes it. "
@@ -701,7 +727,53 @@ class Sa2VAOPSDModelV2(BaseModel):
             remainder = lowered[len(prefix):].strip() if lowered.startswith(prefix) else None
             if remainder is not None and len(re.findall(r"[a-z0-9']+", remainder)) < max(self.min_caption_tokens - 1, 2):
                 return False
+        detail_patterns = (
+            r"\b(wearing|holding|sitting|standing|lying|parked|placed|next to|on top of|near|with)\b",
+            r"\b(red|blue|green|yellow|black|white|brown|pink|purple|orange|gray|grey|wooden|metal|striped|plaid)\b",
+            r"\b(head|face|hair|shirt|jacket|pants|hat|helmet|glasses|bag|phone|book|plate|cup|bench|chair|table)\b",
+        )
+        detail_hit_count = sum(bool(re.search(pattern, lowered)) for pattern in detail_patterns)
+        if detail_hit_count == 0 and token_count < max(self.min_caption_tokens + 2, 6):
+            return False
         return True
+
+    @staticmethod
+    def _caption_scene_spill_hit_count(caption):
+        lowered = re.sub(r"\s+", " ", (caption or "").strip().lower())
+        if not lowered:
+            return 0
+        spill_phrases = (
+            "another person",
+            "other people",
+            "someone else",
+            "group of people",
+            "surrounded by",
+            "in the background",
+            "appears to be",
+            "seems to be",
+            "possibly",
+            "suggests that",
+            "engaged in",
+            "participating in",
+            "watching an event",
+            "while another",
+            "this scene suggests",
+            "adds a sense of",
+            "providing a sense of",
+        )
+        return sum(1 for phrase in spill_phrases if phrase in lowered)
+
+    def _is_low_density_long_caption(self, caption):
+        token_count = self._caption_token_count(caption)
+        if token_count < self.caption_low_density_length_threshold:
+            return False
+        if self._has_repetitive_caption_pattern(caption):
+            return True
+        if self._is_overly_generic_caption(caption):
+            return True
+        if self._caption_scene_spill_hit_count(caption) >= 2:
+            return True
+        return False
 
     def _description_quality_score(self, raw_prediction, clean_caption, status):
         token_count = self._caption_token_count(clean_caption)
@@ -732,7 +804,28 @@ class Sa2VAOPSDModelV2(BaseModel):
                 reward -= self.caption_reward_generic_penalty
             if self._has_repetitive_caption_pattern(clean_caption):
                 reward -= self.caption_reward_repetition_penalty
+            spill_hit_count = self._caption_scene_spill_hit_count(clean_caption)
+            if spill_hit_count >= 4:
+                reward -= self.caption_reward_scene_spill_penalty + 0.15
+            elif spill_hit_count >= 2:
+                reward -= self.caption_reward_scene_spill_penalty
+            if self._is_low_density_long_caption(clean_caption):
+                reward -= self.caption_reward_low_density_penalty
         return reward
+
+    def _grpo_low_iou_penalty_for_value(self, *, iou, pred_mask_missing):
+        if pred_mask_missing:
+            return self.grpo_missing_mask_penalty
+        iou = float(iou)
+        if iou == 0.0:
+            return self.grpo_zero_iou_penalty
+        if iou < 0.1:
+            return 0.6
+        if iou < 0.2:
+            return self.grpo_very_low_iou_penalty
+        if iou < self.iou_low_threshold:
+            return self.grpo_low_iou_penalty
+        return 0.0
 
     @staticmethod
     def _has_repetitive_caption_pattern(caption):
@@ -2334,8 +2427,10 @@ class Sa2VAOPSDModelV2(BaseModel):
                 iou_reward = float(self._compute_iou(gt_mask, pred_mask))
                 effective_iou = iou_reward
                 reward_value = iou_reward + self.caption_quality_reward_weight * quality_reward
-            if effective_iou < self.iou_low_threshold:
-                reward_value -= self.grpo_low_iou_penalty
+            reward_value -= self._grpo_low_iou_penalty_for_value(
+                iou=effective_iou,
+                pred_mask_missing=pred_mask is None,
+            )
             with self._temporary_eval_model(self.student_model):
                 with torch.inference_mode():
                     old_policy_logits = self._forward_sequence_with_model(
@@ -2489,6 +2584,16 @@ class Sa2VAOPSDModelV2(BaseModel):
         grpo_iou_reward_sum = 0.0
         recovery_caption_count = 0
         invalid_caption_penalty_count = 0
+        hard_reconstruct_failure_count = 0
+        teacher_regenerate_ce_applied_count = 0
+        teacher_regenerate_suppressed_count = 0
+        recovery_ce_applied_count = 0
+        recovery_suppressed_count = 0
+        scene_spill_caption_count = 0
+        low_density_long_caption_count = 0
+        detail_sufficient_caption_count = 0
+        generic_caption_count = 0
+        repetitive_caption_count = 0
         last_sample_key = None
         last_caption = ""
         last_teacher_prompt = ""
@@ -2530,6 +2635,16 @@ class Sa2VAOPSDModelV2(BaseModel):
             if caption_token_count > 0:
                 nonempty_caption_count += 1
                 caption_token_sum += caption_token_count
+            if self._is_caption_content_sufficient(description.clean_caption):
+                detail_sufficient_caption_count += 1
+            if self._is_overly_generic_caption(description.clean_caption):
+                generic_caption_count += 1
+            if self._has_repetitive_caption_pattern(description.clean_caption):
+                repetitive_caption_count += 1
+            if self._caption_scene_spill_hit_count(description.clean_caption) >= 2:
+                scene_spill_caption_count += 1
+            if self._is_low_density_long_caption(description.clean_caption):
+                low_density_long_caption_count += 1
             if description.status == "ok":
                 description_ok_count += 1
             elif description.status == "empty":
@@ -2562,35 +2677,52 @@ class Sa2VAOPSDModelV2(BaseModel):
                 reconstruct_skip_count += 1
                 last_sample_key = sample_key
                 last_route = TEACHER_REGENERATE_ROUTE
-                zero_ref_mask = np.zeros_like(gt_mask_np, dtype=np.uint8)
-                teacher_fields = self._build_training_teacher_fields(
-                    route=TEACHER_REGENERATE_ROUTE,
-                    iou=0.0,
-                )
-                recovery_reconstruction = reconstruction or self._invalid_reconstruction_placeholder("skipped_invalid_description")
-                teacher_regenerate = self.generate_teacher_caption_with_privileged_prompt(
-                    image=image,
-                    gt_mask=gt_mask_np,
-                    ref_mask=zero_ref_mask,
-                    student_question=student_question,
-                    student_caption=description.clean_caption,
-                    description_status=description.status,
-                    reconstruction=recovery_reconstruction,
-                    iou=0.0,
-                    teacher_fields=teacher_fields,
-                )
-                regen_entries.append(
-                    {
-                        "image": image,
-                        "prompt_masks": prompt_masks,
-                        "student_question": student_question,
-                        "completion_ids": teacher_regenerate.completion_ids,
-                    }
-                )
                 teacher_regenerate_count += 1
-                recovery_caption_count += 1
+                is_recovery_case = description.status != "ok"
+                if is_recovery_case:
+                    recovery_caption_count += 1
+                max_regen_count = max(int(np.ceil(self.max_teacher_regenerate_fraction * max(nonempty_gt_count, 1))), 1)
+                max_recovery_count = max(int(np.ceil(self.max_recovery_fraction * max(nonempty_gt_count, 1))), 1)
+                allow_teacher_ce = teacher_regenerate_ce_applied_count < max_regen_count
+                if is_recovery_case:
+                    allow_teacher_ce = allow_teacher_ce and (recovery_ce_applied_count < max_recovery_count)
+                if allow_teacher_ce:
+                    zero_ref_mask = np.zeros_like(gt_mask_np, dtype=np.uint8)
+                    teacher_fields = self._build_training_teacher_fields(
+                        route=TEACHER_REGENERATE_ROUTE,
+                        iou=0.0,
+                    )
+                    recovery_reconstruction = reconstruction or self._invalid_reconstruction_placeholder("skipped_invalid_description")
+                    teacher_regenerate = self.generate_teacher_caption_with_privileged_prompt(
+                        image=image,
+                        gt_mask=gt_mask_np,
+                        ref_mask=zero_ref_mask,
+                        student_question=student_question,
+                        student_caption=description.clean_caption,
+                        description_status=description.status,
+                        reconstruction=recovery_reconstruction,
+                        iou=0.0,
+                        teacher_fields=teacher_fields,
+                    )
+                    regen_entries.append(
+                        {
+                            "image": image,
+                            "prompt_masks": prompt_masks,
+                            "student_question": student_question,
+                            "completion_ids": teacher_regenerate.completion_ids,
+                        }
+                    )
+                    teacher_regenerate_ce_applied_count += 1
+                    if is_recovery_case:
+                        recovery_ce_applied_count += 1
+                    last_caption = teacher_regenerate.clean_caption or description.clean_caption
+                else:
+                    teacher_regenerate_suppressed_count += 1
+                    hard_reconstruct_failure_count += 1
+                    if is_recovery_case:
+                        recovery_suppressed_count += 1
+                    last_caption = description.clean_caption
                 last_teacher_prompt = self._route_prompt_tag(TEACHER_REGENERATE_ROUTE)
-                last_caption = teacher_regenerate.clean_caption or description.clean_caption
                 self._debug_sample(
                     sample_key=sample_key,
                     route=TEACHER_REGENERATE_ROUTE,
@@ -2644,31 +2776,38 @@ class Sa2VAOPSDModelV2(BaseModel):
             teacher_prompt = ""
             if route == TEACHER_REGENERATE_ROUTE:
                 teacher_regenerate_count += 1
-                teacher_fields = self._build_training_teacher_fields(
-                    route=route,
-                    iou=iou,
-                )
-                teacher_regenerate = self.generate_teacher_caption_with_privileged_prompt(
-                    image=image,
-                    gt_mask=gt_mask_np,
-                    ref_mask=ref_mask_np,
-                    student_question=student_question,
-                    student_caption=description.clean_caption,
-                    description_status=description.status,
-                    reconstruction=reconstruction,
-                    iou=iou,
-                    teacher_fields=teacher_fields,
-                )
                 teacher_prompt = self._route_prompt_tag(route)
-                regen_entries.append(
-                    {
-                        "image": image,
-                        "prompt_masks": prompt_masks,
-                        "student_question": student_question,
-                        "completion_ids": teacher_regenerate.completion_ids,
-                    }
-                )
-                last_caption = teacher_regenerate.clean_caption or description.clean_caption
+                max_regen_count = max(int(np.ceil(self.max_teacher_regenerate_fraction * max(nonempty_gt_count, 1))), 1)
+                if teacher_regenerate_ce_applied_count < max_regen_count:
+                    teacher_fields = self._build_training_teacher_fields(
+                        route=route,
+                        iou=iou,
+                    )
+                    teacher_regenerate = self.generate_teacher_caption_with_privileged_prompt(
+                        image=image,
+                        gt_mask=gt_mask_np,
+                        ref_mask=ref_mask_np,
+                        student_question=student_question,
+                        student_caption=description.clean_caption,
+                        description_status=description.status,
+                        reconstruction=reconstruction,
+                        iou=iou,
+                        teacher_fields=teacher_fields,
+                    )
+                    regen_entries.append(
+                        {
+                            "image": image,
+                            "prompt_masks": prompt_masks,
+                            "student_question": student_question,
+                            "completion_ids": teacher_regenerate.completion_ids,
+                        }
+                    )
+                    teacher_regenerate_ce_applied_count += 1
+                    last_caption = teacher_regenerate.clean_caption or description.clean_caption
+                else:
+                    teacher_regenerate_suppressed_count += 1
+                    hard_reconstruct_failure_count += 1
+                    last_caption = description.clean_caption
             elif route == ON_POLICY_DISTILL_ROUTE:
                 on_policy_distill_count += 1
                 teacher_fields = self._build_training_teacher_fields(
@@ -2780,6 +2919,16 @@ class Sa2VAOPSDModelV2(BaseModel):
         self._cumulative_grpo_iou_reward_sum += grpo_iou_reward_sum
         self._cumulative_recovery_caption_count += recovery_caption_count
         self._cumulative_invalid_caption_penalty_count += invalid_caption_penalty_count
+        self._cumulative_hard_reconstruct_failure_count += hard_reconstruct_failure_count
+        self._cumulative_teacher_regenerate_ce_applied_count += teacher_regenerate_ce_applied_count
+        self._cumulative_teacher_regenerate_suppressed_count += teacher_regenerate_suppressed_count
+        self._cumulative_recovery_ce_applied_count += recovery_ce_applied_count
+        self._cumulative_recovery_suppressed_count += recovery_suppressed_count
+        self._cumulative_scene_spill_caption_count += scene_spill_caption_count
+        self._cumulative_low_density_long_caption_count += low_density_long_caption_count
+        self._cumulative_detail_sufficient_caption_count += detail_sufficient_caption_count
+        self._cumulative_generic_caption_count += generic_caption_count
+        self._cumulative_repetitive_caption_count += repetitive_caption_count
         if total_loss is not None:
             self._cumulative_total_loss_sum += float(total_loss.detach().item())
         if total_regen_ce is not None:
@@ -2820,6 +2969,11 @@ class Sa2VAOPSDModelV2(BaseModel):
         cumulative_grpo_iou_reward_mean = self._cumulative_grpo_iou_reward_sum / max(self._cumulative_grpo_reward_count, 1)
         cumulative_recovery_caption_rate = self._cumulative_recovery_caption_count / cumulative_nonempty_gt_count
         cumulative_invalid_caption_penalty_rate = self._cumulative_invalid_caption_penalty_count / cumulative_nonempty_gt_count
+        cumulative_detail_sufficient_caption_rate = self._cumulative_detail_sufficient_caption_count / cumulative_nonempty_gt_count
+        cumulative_generic_caption_rate = self._cumulative_generic_caption_count / cumulative_nonempty_gt_count
+        cumulative_repetitive_caption_rate = self._cumulative_repetitive_caption_count / cumulative_nonempty_gt_count
+        cumulative_scene_spill_caption_rate = self._cumulative_scene_spill_caption_count / cumulative_nonempty_gt_count
+        cumulative_low_density_long_caption_rate = self._cumulative_low_density_long_caption_count / cumulative_nonempty_gt_count
 
         if optimized_count == 0:
             metrics = {
@@ -2856,12 +3010,22 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "reconstruct_ok_count": self._metric_tensor(self._cumulative_reconstruct_ok_count, zero.dtype),
                 "reconstruct_failed_count": self._metric_tensor(self._cumulative_reconstruct_failed_count, zero.dtype),
                 "reconstruct_skip_count": self._metric_tensor(self._cumulative_reconstruct_skip_count, zero.dtype),
+                "hard_reconstruct_failure_count": self._metric_tensor(self._cumulative_hard_reconstruct_failure_count, zero.dtype),
                 "empty_gt_mask_count": self._metric_tensor(self._cumulative_empty_gt_mask_count, zero.dtype),
                 "teacher_regenerate_rate": self._metric_tensor(cumulative_teacher_regenerate_rate, zero.dtype),
                 "on_policy_distill_rate": self._metric_tensor(cumulative_on_policy_distill_rate, zero.dtype),
                 "grpo_positive_rate": self._metric_tensor(cumulative_grpo_positive_rate, zero.dtype),
                 "recovery_caption_rate": self._metric_tensor(cumulative_recovery_caption_rate, zero.dtype),
                 "invalid_caption_penalty_rate": self._metric_tensor(cumulative_invalid_caption_penalty_rate, zero.dtype),
+                "detail_sufficient_caption_rate": self._metric_tensor(cumulative_detail_sufficient_caption_rate, zero.dtype),
+                "generic_caption_rate": self._metric_tensor(cumulative_generic_caption_rate, zero.dtype),
+                "repetitive_caption_rate": self._metric_tensor(cumulative_repetitive_caption_rate, zero.dtype),
+                "scene_spill_caption_rate": self._metric_tensor(cumulative_scene_spill_caption_rate, zero.dtype),
+                "low_density_long_caption_rate": self._metric_tensor(cumulative_low_density_long_caption_rate, zero.dtype),
+                "teacher_regenerate_ce_applied_count": self._metric_tensor(self._cumulative_teacher_regenerate_ce_applied_count, zero.dtype),
+                "teacher_regenerate_suppressed_count": self._metric_tensor(self._cumulative_teacher_regenerate_suppressed_count, zero.dtype),
+                "recovery_ce_applied_count": self._metric_tensor(self._cumulative_recovery_ce_applied_count, zero.dtype),
+                "recovery_suppressed_count": self._metric_tensor(self._cumulative_recovery_suppressed_count, zero.dtype),
             }
             return metrics
 
@@ -2874,6 +3038,8 @@ class Sa2VAOPSDModelV2(BaseModel):
         batch_grpo_positive_rate = grpo_positive_count / max(routed_count, 1)
         batch_grpo_reward_mean = grpo_reward_sum / max(grpo_reward_count, 1)
         batch_recovery_caption_rate = recovery_caption_count / max(nonempty_gt_count, 1)
+        batch_detail_sufficient_caption_rate = detail_sufficient_caption_count / max(nonempty_gt_count, 1)
+        batch_scene_spill_caption_rate = scene_spill_caption_count / max(nonempty_gt_count, 1)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             if torch.distributed.get_rank() == 0:
                 print(
@@ -2891,10 +3057,17 @@ class Sa2VAOPSDModelV2(BaseModel):
                     f"cum_valid_caption_cond_seg_correct_rate={cumulative_valid_caption_cond_seg_correct_rate:.4f} "
                     f"cum_valid_caption_rate={cumulative_valid_caption_rate:.4f} "
                     f"batch_recovery_caption_rate={batch_recovery_caption_rate:.4f} "
+                    f"batch_detail_sufficient_caption_rate={batch_detail_sufficient_caption_rate:.4f} "
+                    f"batch_scene_spill_caption_rate={batch_scene_spill_caption_rate:.4f} "
                     f"cum_recovery_caption_rate={cumulative_recovery_caption_rate:.4f} "
                     f"cum_teacher_regenerate_rate={cumulative_teacher_regenerate_rate:.4f} "
                     f"cum_on_policy_distill_rate={cumulative_on_policy_distill_rate:.4f} "
                     f"cum_grpo_positive_rate={cumulative_grpo_positive_rate:.4f} "
+                    f"teacher_regenerate_ce_applied={teacher_regenerate_ce_applied_count} "
+                    f"teacher_regenerate_suppressed={teacher_regenerate_suppressed_count} "
+                    f"recovery_ce_applied={recovery_ce_applied_count} "
+                    f"recovery_suppressed={recovery_suppressed_count} "
+                    f"hard_reconstruct_failure_count={hard_reconstruct_failure_count} "
                     f"cum_avg_caption_tokens={cumulative_avg_caption_tokens:.2f}\n"
                     f"[Sa2VA_OPSD_V2] teacher_prompt={last_teacher_prompt}"
                 )
@@ -2914,10 +3087,17 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"cum_valid_caption_cond_seg_correct_rate={cumulative_valid_caption_cond_seg_correct_rate:.4f} "
                 f"cum_valid_caption_rate={cumulative_valid_caption_rate:.4f} "
                 f"batch_recovery_caption_rate={batch_recovery_caption_rate:.4f} "
+                f"batch_detail_sufficient_caption_rate={batch_detail_sufficient_caption_rate:.4f} "
+                f"batch_scene_spill_caption_rate={batch_scene_spill_caption_rate:.4f} "
                 f"cum_recovery_caption_rate={cumulative_recovery_caption_rate:.4f} "
                 f"cum_teacher_regenerate_rate={cumulative_teacher_regenerate_rate:.4f} "
                 f"cum_on_policy_distill_rate={cumulative_on_policy_distill_rate:.4f} "
                 f"cum_grpo_positive_rate={cumulative_grpo_positive_rate:.4f} "
+                f"teacher_regenerate_ce_applied={teacher_regenerate_ce_applied_count} "
+                f"teacher_regenerate_suppressed={teacher_regenerate_suppressed_count} "
+                f"recovery_ce_applied={recovery_ce_applied_count} "
+                f"recovery_suppressed={recovery_suppressed_count} "
+                f"hard_reconstruct_failure_count={hard_reconstruct_failure_count} "
                 f"cum_avg_caption_tokens={cumulative_avg_caption_tokens:.2f}\n"
                 f"[Sa2VA_OPSD_V2] teacher_prompt={last_teacher_prompt}"
             )
@@ -2959,11 +3139,21 @@ class Sa2VAOPSDModelV2(BaseModel):
             "reconstruct_ok_count": self._metric_tensor(self._cumulative_reconstruct_ok_count, avg_total_loss.dtype),
             "reconstruct_failed_count": self._metric_tensor(self._cumulative_reconstruct_failed_count, avg_total_loss.dtype),
             "reconstruct_skip_count": self._metric_tensor(self._cumulative_reconstruct_skip_count, avg_total_loss.dtype),
+            "hard_reconstruct_failure_count": self._metric_tensor(self._cumulative_hard_reconstruct_failure_count, avg_total_loss.dtype),
             "empty_gt_mask_count": self._metric_tensor(self._cumulative_empty_gt_mask_count, avg_total_loss.dtype),
             "teacher_regenerate_rate": self._metric_tensor(cumulative_teacher_regenerate_rate, avg_total_loss.dtype),
             "on_policy_distill_rate": self._metric_tensor(cumulative_on_policy_distill_rate, avg_total_loss.dtype),
             "grpo_positive_rate": self._metric_tensor(cumulative_grpo_positive_rate, avg_total_loss.dtype),
             "recovery_caption_rate": self._metric_tensor(cumulative_recovery_caption_rate, avg_total_loss.dtype),
             "invalid_caption_penalty_rate": self._metric_tensor(cumulative_invalid_caption_penalty_rate, avg_total_loss.dtype),
+            "detail_sufficient_caption_rate": self._metric_tensor(cumulative_detail_sufficient_caption_rate, avg_total_loss.dtype),
+            "generic_caption_rate": self._metric_tensor(cumulative_generic_caption_rate, avg_total_loss.dtype),
+            "repetitive_caption_rate": self._metric_tensor(cumulative_repetitive_caption_rate, avg_total_loss.dtype),
+            "scene_spill_caption_rate": self._metric_tensor(cumulative_scene_spill_caption_rate, avg_total_loss.dtype),
+            "low_density_long_caption_rate": self._metric_tensor(cumulative_low_density_long_caption_rate, avg_total_loss.dtype),
+            "teacher_regenerate_ce_applied_count": self._metric_tensor(self._cumulative_teacher_regenerate_ce_applied_count, avg_total_loss.dtype),
+            "teacher_regenerate_suppressed_count": self._metric_tensor(self._cumulative_teacher_regenerate_suppressed_count, avg_total_loss.dtype),
+            "recovery_ce_applied_count": self._metric_tensor(self._cumulative_recovery_ce_applied_count, avg_total_loss.dtype),
+            "recovery_suppressed_count": self._metric_tensor(self._cumulative_recovery_suppressed_count, avg_total_loss.dtype),
         }
         return metrics
