@@ -1,4 +1,7 @@
-from projects.sa2va.configs.sa2va_opsd_refcoco_internvl3_2b_v3 import *  # noqa: F401,F403
+from mmengine.config import read_base
+
+with read_base():
+    from .sa2va_opsd_refcoco_internvl3_2b_v3 import *  # noqa: F401,F403
 
 
 route_mode = "online"
