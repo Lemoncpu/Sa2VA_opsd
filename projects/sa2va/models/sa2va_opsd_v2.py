@@ -811,6 +811,56 @@ class Sa2VAOPSDModelV2(BaseModel):
             return True
         if len(words) <= 3 and lowered.startswith(generic_prefixes):
             return True
+        generic_phrases = (
+            "seems interested",
+            "looks calm",
+            "appears calm",
+            "kindness and care",
+            "attention to detail",
+            "enjoying time",
+            "spending time",
+            "having fun",
+            "leisure time",
+            "social interactions",
+            "culture and",
+            "local customs",
+            "take care of",
+            "taking care of",
+            "staying hydrated",
+        )
+        generic_phrase_hits = sum(1 for phrase in generic_phrases if phrase in lowered)
+        if generic_phrase_hits >= 2:
+            return True
+        if len(words) >= 28:
+            generic_token_count = sum(
+                1
+                for token in words
+                if token
+                in {
+                    "someone",
+                    "something",
+                    "person",
+                    "people",
+                    "man",
+                    "woman",
+                    "child",
+                    "time",
+                    "thing",
+                    "activity",
+                    "activities",
+                    "interest",
+                    "interested",
+                    "calm",
+                    "care",
+                    "kindness",
+                    "culture",
+                    "social",
+                    "outdoors",
+                    "nature",
+                }
+            )
+            if generic_token_count >= max(6, len(words) // 5):
+                return True
         return False
 
     def _resolve_reconstruct_questions(self, caption):
@@ -1685,7 +1735,6 @@ class Sa2VAOPSDModelV2(BaseModel):
         )
 
     def reconstruct_mask(self, image, caption, description_status, spatial_hint="", gt_mask=None):
-        del spatial_hint
         if description_status != "ok":
             return ReconstructionResult(
                 pred_mask=None,
@@ -1697,56 +1746,61 @@ class Sa2VAOPSDModelV2(BaseModel):
         best_result = None
         best_iou = -1.0
         for reconstruct_question_base in self._resolve_reconstruct_questions(caption):
-            reconstruct_question = reconstruct_question_base
-            predict_dict = self._predict_forward_eval(
-                self.student_model,
-                image=image,
-                text=reconstruct_question,
-                past_text="",
-                mask_prompts=None,
-                tokenizer=self.tokenizer,
-            )
-            raw_prediction = predict_dict.get("prediction", "")
-            prediction_masks = predict_dict.get("prediction_masks")
-            prediction_masks_count = 0 if prediction_masks is None else len(prediction_masks)
-            if not prediction_masks:
-                result = ReconstructionResult(
-                    pred_mask=None,
-                    question=reconstruct_question,
-                    raw_prediction=raw_prediction,
-                    prediction_masks_count=prediction_masks_count,
-                    status="empty_prediction_masks",
+            reconstruct_question_variants = [reconstruct_question_base]
+            if spatial_hint:
+                reconstruct_question_variants.append(
+                    self._append_spatial_hint_to_question(reconstruct_question_base, spatial_hint)
                 )
-                candidate_iou = -1.0
-            else:
-                first_mask = prediction_masks[0]
-                if isinstance(first_mask, torch.Tensor):
-                    first_mask = first_mask.detach().cpu().numpy()
-                first_mask = np.asarray(first_mask)
-                if first_mask.ndim == 3 and first_mask.shape[0] == 1:
-                    first_mask = first_mask[0]
-                pred_mask = self._to_numpy_mask(first_mask)
-                status = "ok" if pred_mask.sum() > 0 else "zero_area_mask"
-                result = ReconstructionResult(
-                    pred_mask=pred_mask,
-                    question=reconstruct_question,
-                    raw_prediction=raw_prediction,
-                    prediction_masks_count=prediction_masks_count,
-                    status=status,
+            for reconstruct_question in reconstruct_question_variants:
+                predict_dict = self._predict_forward_eval(
+                    self.student_model,
+                    image=image,
+                    text=reconstruct_question,
+                    past_text="",
+                    mask_prompts=None,
+                    tokenizer=self.tokenizer,
                 )
-                candidate_iou = self._compute_iou(gt_mask, pred_mask) if gt_mask is not None else -1.0
-            if gt_mask is not None:
-                if candidate_iou > best_iou:
+                raw_prediction = predict_dict.get("prediction", "")
+                prediction_masks = predict_dict.get("prediction_masks")
+                prediction_masks_count = 0 if prediction_masks is None else len(prediction_masks)
+                if not prediction_masks:
+                    result = ReconstructionResult(
+                        pred_mask=None,
+                        question=reconstruct_question,
+                        raw_prediction=raw_prediction,
+                        prediction_masks_count=prediction_masks_count,
+                        status="empty_prediction_masks",
+                    )
+                    candidate_iou = -1.0
+                else:
+                    first_mask = prediction_masks[0]
+                    if isinstance(first_mask, torch.Tensor):
+                        first_mask = first_mask.detach().cpu().numpy()
+                    first_mask = np.asarray(first_mask)
+                    if first_mask.ndim == 3 and first_mask.shape[0] == 1:
+                        first_mask = first_mask[0]
+                    pred_mask = self._to_numpy_mask(first_mask)
+                    status = "ok" if pred_mask.sum() > 0 else "zero_area_mask"
+                    result = ReconstructionResult(
+                        pred_mask=pred_mask,
+                        question=reconstruct_question,
+                        raw_prediction=raw_prediction,
+                        prediction_masks_count=prediction_masks_count,
+                        status=status,
+                    )
+                    candidate_iou = self._compute_iou(gt_mask, pred_mask) if gt_mask is not None else -1.0
+                if gt_mask is not None:
+                    if candidate_iou > best_iou:
+                        best_result = result
+                        best_iou = candidate_iou
+                elif best_result is None or (
+                    best_result.status != "ok" and result.status == "ok"
+                ) or (
+                    best_result.status == "ok"
+                    and result.status == "ok"
+                    and int(np.asarray(result.pred_mask).sum()) > int(np.asarray(best_result.pred_mask).sum())
+                ):
                     best_result = result
-                    best_iou = candidate_iou
-            elif best_result is None or (
-                best_result.status != "ok" and result.status == "ok"
-            ) or (
-                best_result.status == "ok"
-                and result.status == "ok"
-                and int(np.asarray(result.pred_mask).sum()) > int(np.asarray(best_result.pred_mask).sum())
-            ):
-                best_result = result
         if best_result is None:
             return ReconstructionResult(
                 pred_mask=None,
@@ -2501,43 +2555,39 @@ class Sa2VAOPSDModelV2(BaseModel):
             if pred_mask is None:
                 reconstruct_skip_count += 1
                 last_sample_key = sample_key
-                last_route = "reconstruct_skip"
-                last_teacher_prompt = ""
-                last_caption = description.clean_caption
-                if self.enable_invalid_caption_recovery and description.status != "ok":
-                    zero_ref_mask = np.zeros_like(gt_mask_np, dtype=np.uint8)
-                    teacher_fields = self._build_training_teacher_fields(
-                        route=TEACHER_REGENERATE_ROUTE,
-                        iou=0.0,
-                    )
-                    recovery_reconstruction = reconstruction or self._invalid_reconstruction_placeholder("skipped_invalid_description")
-                    teacher_regenerate = self.generate_teacher_caption_with_privileged_prompt(
-                        image=image,
-                        gt_mask=gt_mask_np,
-                        ref_mask=zero_ref_mask,
-                        student_question=student_question,
-                        student_caption=description.clean_caption,
-                        description_status=description.status,
-                        reconstruction=recovery_reconstruction,
-                        iou=0.0,
-                        teacher_fields=teacher_fields,
-                    )
-                    regen_entries.append(
-                        {
-                            "image": image,
-                            "prompt_masks": prompt_masks,
-                            "student_question": student_question,
-                            "completion_ids": teacher_regenerate.completion_ids,
-                        }
-                    )
-                    teacher_regenerate_count += 1
-                    recovery_caption_count += 1
-                    last_route = TEACHER_REGENERATE_ROUTE
-                    last_teacher_prompt = self._route_prompt_tag(TEACHER_REGENERATE_ROUTE)
-                    last_caption = teacher_regenerate.clean_caption or description.clean_caption
+                last_route = TEACHER_REGENERATE_ROUTE
+                zero_ref_mask = np.zeros_like(gt_mask_np, dtype=np.uint8)
+                teacher_fields = self._build_training_teacher_fields(
+                    route=TEACHER_REGENERATE_ROUTE,
+                    iou=0.0,
+                )
+                recovery_reconstruction = reconstruction or self._invalid_reconstruction_placeholder("skipped_invalid_description")
+                teacher_regenerate = self.generate_teacher_caption_with_privileged_prompt(
+                    image=image,
+                    gt_mask=gt_mask_np,
+                    ref_mask=zero_ref_mask,
+                    student_question=student_question,
+                    student_caption=description.clean_caption,
+                    description_status=description.status,
+                    reconstruction=recovery_reconstruction,
+                    iou=0.0,
+                    teacher_fields=teacher_fields,
+                )
+                regen_entries.append(
+                    {
+                        "image": image,
+                        "prompt_masks": prompt_masks,
+                        "student_question": student_question,
+                        "completion_ids": teacher_regenerate.completion_ids,
+                    }
+                )
+                teacher_regenerate_count += 1
+                recovery_caption_count += 1
+                last_teacher_prompt = self._route_prompt_tag(TEACHER_REGENERATE_ROUTE)
+                last_caption = teacher_regenerate.clean_caption or description.clean_caption
                 self._debug_sample(
                     sample_key=sample_key,
-                    route="reconstruct_skip",
+                    route=TEACHER_REGENERATE_ROUTE,
                     student_question=student_question,
                     raw_prediction=description.raw_prediction,
                     caption=description.clean_caption,
