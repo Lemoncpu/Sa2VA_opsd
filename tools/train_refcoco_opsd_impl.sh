@@ -6,6 +6,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
 DEFAULT_CONFIG="${SA2VA_REFCOCO_OPSD_CONFIG:?SA2VA_REFCOCO_OPSD_CONFIG must be set by the entry wrapper.}"
+DEFAULT_ONLINE_CONFIG="${SA2VA_REFCOCO_OPSD_ONLINE_CONFIG:-}"
 DEFAULT_WORK_DIR="${SA2VA_REFCOCO_OPSD_DEFAULT_WORK_DIR:?SA2VA_REFCOCO_OPSD_DEFAULT_WORK_DIR must be set by the entry wrapper.}"
 DEFAULT_MODEL_PATH="${SA2VA_REFCOCO_OPSD_DEFAULT_MODEL_PATH:?SA2VA_REFCOCO_OPSD_DEFAULT_MODEL_PATH must be set by the entry wrapper.}"
 DEFAULT_TOKENIZER_PATH="${SA2VA_REFCOCO_OPSD_DEFAULT_TOKENIZER_PATH:-${DEFAULT_MODEL_PATH}}"
@@ -355,6 +356,23 @@ if [[ "${ROUTE_MODE}" != "manifest" && "${ROUTE_MODE}" != "online" ]]; then
   exit 1
 fi
 
+if [[ "${ROUTE_MODE}" == "online" ]]; then
+  if [[ -n "${DEFAULT_ONLINE_CONFIG}" ]]; then
+    CONFIG="${DEFAULT_ONLINE_CONFIG}"
+  elif [[ "${CONFIG}" == *.py ]]; then
+    ONLINE_CONFIG_CANDIDATE="${CONFIG%.py}_online.py"
+    if [[ -f "${ONLINE_CONFIG_CANDIDATE}" ]]; then
+      CONFIG="${ONLINE_CONFIG_CANDIDATE}"
+    else
+      echo "Online route mode requires an online config file, but not found: ${ONLINE_CONFIG_CANDIDATE}" >&2
+      exit 1
+    fi
+  else
+    echo "Online route mode requires a python config path, got: ${CONFIG}" >&2
+    exit 1
+  fi
+fi
+
 mkdir -p "${WORK_DIR}"
 
 EFFECTIVE_BATCH_SIZE="${BATCH_SIZE_OVERRIDE:-1}"
@@ -458,6 +476,5 @@ CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_IDS}" \
 PORT="${PORT}" \
 MASTER_ADDR="${MASTER_ADDR}" \
 DEEPSPEED="${DEEPSPEED}" \
-SA2VA_OPSD_ROUTE_MODE="${ROUTE_MODE}" \
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF_VALUE}" \
 bash tools/dist.sh train "${CONFIG}" "${GPUS}" "${TRAIN_ARGS[@]}"

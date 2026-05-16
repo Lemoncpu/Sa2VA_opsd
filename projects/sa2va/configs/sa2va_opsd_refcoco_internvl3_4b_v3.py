@@ -1,5 +1,3 @@
-import os
-
 from mmengine.hooks import CheckpointHook, DistSamplerSeedHook, IterTimerHook, LoggerHook, ParamSchedulerHook
 from mmengine.optim import CosineAnnealingLR, LinearLR, OptimWrapper
 from mmengine.dataset.sampler import DefaultSampler
@@ -40,7 +38,7 @@ route_refresh_interval = 200
 route_cache_dir = "./work_dirs/sa2va_opsd_refcoco_internvl3_4b_v3/route_cache"
 route_manifest_path = f"{route_cache_dir}/routes_step_0000000.jsonl"
 route_manifest_latest_path = f"{route_cache_dir}/routes_latest.jsonl"
-route_mode = os.environ.get("SA2VA_OPSD_ROUTE_MODE", "manifest")
+route_mode = "manifest"
 
 if route_mode not in {"manifest", "online"}:
     raise ValueError(f"Unsupported route_mode={route_mode!r}. Expected 'manifest' or 'online'.")
