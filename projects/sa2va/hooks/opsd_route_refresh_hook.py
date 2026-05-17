@@ -112,7 +112,7 @@ class OpsdRouteRefreshHook(Hook):
         active_window_size = None
         if self.restrict_manifest_to_active_window:
             active_window_size = self._resolve_active_window_size(runner)
-        export_routes_from_runner(
+        route_counts = export_routes_from_runner(
             runner=runner,
             out_path=str(manifest_path),
             global_step=global_step,
@@ -123,9 +123,11 @@ class OpsdRouteRefreshHook(Hook):
             restrict_manifest_to_active_window=self.restrict_manifest_to_active_window,
         )
         if self._is_rank0():
+            exported_route_count = int(sum(route_counts.values())) if route_counts else 0
             runner.logger.info(
-                "Exported OPSD route manifest to %s after excluding %s consumed samples; active_window_size=%s",
+                "Exported OPSD route manifest to %s with exported_routes=%s after excluding %s consumed samples; active_window_size=%s",
                 manifest_path,
+                exported_route_count,
                 len(consumed_sample_keys),
                 active_window_size,
             )

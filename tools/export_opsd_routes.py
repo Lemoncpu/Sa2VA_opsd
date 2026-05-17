@@ -686,7 +686,7 @@ def export_routes_from_runner(
     )
     if is_rank0():
         runner.logger.info(
-            "OPSD route export finished: step=%s route_model=%s world_size=%s exported=%s carried=%s active=%s manifest=%s consumed=%s route_counts=%s out=%s",
+            "OPSD route export finished: step=%s route_model=%s world_size=%s exported_routes=%s carried=%s active=%s manifest=%s consumed=%s route_counts=%s out=%s",
             global_step,
             route_model,
             export_summary["world_size"],
