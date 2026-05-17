@@ -196,6 +196,8 @@ class Sa2VAOPSDModelV2(BaseModel):
         self._cumulative_reconstruct_ok_count = 0
         self._cumulative_reconstruct_failed_count = 0
         self._cumulative_reconstruct_skip_count = 0
+        self._cumulative_reconstruct_invalid_caption_skip_count = 0
+        self._cumulative_reconstruct_empty_prediction_masks_count = 0
         self._cumulative_empty_gt_mask_count = 0
         self._cumulative_seg_correct_count = 0
         self._cumulative_iou_sum = 0.0
@@ -2604,6 +2606,8 @@ class Sa2VAOPSDModelV2(BaseModel):
         teacher_regenerate_verified_iou_sum = 0.0
         recovery_ce_applied_count = 0
         recovery_suppressed_count = 0
+        reconstruct_invalid_caption_skip_count = 0
+        reconstruct_empty_prediction_masks_count = 0
         scene_spill_caption_count = 0
         low_density_long_caption_count = 0
         detail_sufficient_caption_count = 0
@@ -2689,6 +2693,10 @@ class Sa2VAOPSDModelV2(BaseModel):
             prediction_masks_count = 0 if reconstruction is None else reconstruction.prediction_masks_count
             pred_mask = None if reconstruction is None else reconstruction.pred_mask
             if pred_mask is None:
+                if reconstruct_status == "skipped_invalid_description":
+                    reconstruct_invalid_caption_skip_count += 1
+                elif reconstruct_status == "empty_prediction_masks":
+                    reconstruct_empty_prediction_masks_count += 1
                 reconstruct_skip_count += 1
                 last_sample_key = sample_key
                 last_route = TEACHER_REGENERATE_ROUTE
@@ -2969,6 +2977,8 @@ class Sa2VAOPSDModelV2(BaseModel):
         self._cumulative_reconstruct_ok_count += reconstruct_ok_count
         self._cumulative_reconstruct_failed_count += reconstruct_failed_count
         self._cumulative_reconstruct_skip_count += reconstruct_skip_count
+        self._cumulative_reconstruct_invalid_caption_skip_count += reconstruct_invalid_caption_skip_count
+        self._cumulative_reconstruct_empty_prediction_masks_count += reconstruct_empty_prediction_masks_count
         self._cumulative_empty_gt_mask_count += empty_gt_mask_count
         self._cumulative_seg_correct_count += seg_correct_count
         self._cumulative_teacher_regenerate_count += teacher_regenerate_count
@@ -3043,6 +3053,15 @@ class Sa2VAOPSDModelV2(BaseModel):
         cumulative_grpo_iou_reward_mean = self._cumulative_grpo_iou_reward_sum / max(self._cumulative_grpo_reward_count, 1)
         cumulative_recovery_caption_rate = self._cumulative_recovery_caption_count / cumulative_nonempty_gt_count
         cumulative_invalid_caption_penalty_rate = self._cumulative_invalid_caption_penalty_count / cumulative_nonempty_gt_count
+        cumulative_caption_empty_rate = self._cumulative_description_empty_count / cumulative_nonempty_gt_count
+        cumulative_caption_truncated_rate = self._cumulative_description_truncated_count / cumulative_nonempty_gt_count
+        cumulative_caption_seg_style_rate = self._cumulative_description_seg_style_count / cumulative_nonempty_gt_count
+        cumulative_reconstruct_invalid_caption_skip_rate = (
+            self._cumulative_reconstruct_invalid_caption_skip_count / cumulative_nonempty_gt_count
+        )
+        cumulative_reconstruct_empty_prediction_masks_rate = (
+            self._cumulative_reconstruct_empty_prediction_masks_count / cumulative_nonempty_gt_count
+        )
         cumulative_detail_sufficient_caption_rate = self._cumulative_detail_sufficient_caption_count / cumulative_nonempty_gt_count
         cumulative_generic_caption_rate = self._cumulative_generic_caption_count / cumulative_nonempty_gt_count
         cumulative_repetitive_caption_rate = self._cumulative_repetitive_caption_count / cumulative_nonempty_gt_count
@@ -3077,6 +3096,16 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "teacher_regenerate_rate": self._metric_tensor(cumulative_teacher_regenerate_rate, zero.dtype),
                 "on_policy_distill_rate": self._metric_tensor(cumulative_on_policy_distill_rate, zero.dtype),
                 "grpo_positive_rate": self._metric_tensor(cumulative_grpo_positive_rate, zero.dtype),
+                "caption_invalid_rate": self._metric_tensor(cumulative_invalid_caption_penalty_rate, zero.dtype),
+                "caption_empty_rate": self._metric_tensor(cumulative_caption_empty_rate, zero.dtype),
+                "caption_truncated_rate": self._metric_tensor(cumulative_caption_truncated_rate, zero.dtype),
+                "caption_seg_style_rate": self._metric_tensor(cumulative_caption_seg_style_rate, zero.dtype),
+                "reconstruct_invalid_caption_skip_rate": self._metric_tensor(
+                    cumulative_reconstruct_invalid_caption_skip_rate, zero.dtype
+                ),
+                "reconstruct_empty_prediction_masks_rate": self._metric_tensor(
+                    cumulative_reconstruct_empty_prediction_masks_rate, zero.dtype
+                ),
                 "detail_sufficient_caption_rate": self._metric_tensor(cumulative_detail_sufficient_caption_rate, zero.dtype),
                 "scene_spill_caption_rate": self._metric_tensor(cumulative_scene_spill_caption_rate, zero.dtype),
                 "teacher_regenerate_ce_applied_count": self._metric_tensor(self._cumulative_teacher_regenerate_ce_applied_count, zero.dtype),
@@ -3163,6 +3192,16 @@ class Sa2VAOPSDModelV2(BaseModel):
             "teacher_regenerate_rate": self._metric_tensor(cumulative_teacher_regenerate_rate, avg_total_loss.dtype),
             "on_policy_distill_rate": self._metric_tensor(cumulative_on_policy_distill_rate, avg_total_loss.dtype),
             "grpo_positive_rate": self._metric_tensor(cumulative_grpo_positive_rate, avg_total_loss.dtype),
+            "caption_invalid_rate": self._metric_tensor(cumulative_invalid_caption_penalty_rate, avg_total_loss.dtype),
+            "caption_empty_rate": self._metric_tensor(cumulative_caption_empty_rate, avg_total_loss.dtype),
+            "caption_truncated_rate": self._metric_tensor(cumulative_caption_truncated_rate, avg_total_loss.dtype),
+            "caption_seg_style_rate": self._metric_tensor(cumulative_caption_seg_style_rate, avg_total_loss.dtype),
+            "reconstruct_invalid_caption_skip_rate": self._metric_tensor(
+                cumulative_reconstruct_invalid_caption_skip_rate, avg_total_loss.dtype
+            ),
+            "reconstruct_empty_prediction_masks_rate": self._metric_tensor(
+                cumulative_reconstruct_empty_prediction_masks_rate, avg_total_loss.dtype
+            ),
             "detail_sufficient_caption_rate": self._metric_tensor(cumulative_detail_sufficient_caption_rate, avg_total_loss.dtype),
             "scene_spill_caption_rate": self._metric_tensor(cumulative_scene_spill_caption_rate, avg_total_loss.dtype),
             "teacher_regenerate_ce_applied_count": self._metric_tensor(self._cumulative_teacher_regenerate_ce_applied_count, avg_total_loss.dtype),
