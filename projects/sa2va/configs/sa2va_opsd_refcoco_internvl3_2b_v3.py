@@ -70,7 +70,7 @@ model = dict(
     caption_reward_repetition_penalty=0.2,
     caption_reward_truncated_penalty=0.35,
     caption_reward_empty_penalty=0.5,
-    caption_reward_scene_spill_penalty=0.2,
+    caption_reward_scene_spill_penalty=0.35,
     caption_reward_low_density_penalty=0.2,
     caption_low_density_length_threshold=28,
     grpo_low_iou_penalty=0.3,
@@ -84,7 +84,14 @@ model = dict(
     use_online_route_for_loss=not use_manifest_routes,
     max_teacher_regenerate_fraction=0.2,
     max_recovery_fraction=0.1,
-    reconstruct_question_template="<image>Please segment the region described as: {caption}",
+    enable_debug_sample_logging=False,
+    reconstruct_question_template=(
+        "<image>\n"
+        "Return the segmentation mask for the target region referred to by the description below.\n"
+        "Use nearby objects, scene cues, or local relations only to identify the target region.\n"
+        "Do not include those contextual regions in the mask unless they are explicitly part of the described target.\n"
+        "Description: {caption}"
+    ),
 )
 
 train_dataset = dict(

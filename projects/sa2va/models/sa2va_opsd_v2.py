@@ -110,6 +110,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         use_online_route_for_loss=True,
         max_teacher_regenerate_fraction=0.2,
         max_recovery_fraction=0.1,
+        enable_debug_sample_logging=False,
     ):
         super().__init__()
         if teacher_model_path == "__skip__":
@@ -184,6 +185,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         self.use_online_route_for_loss = bool(use_online_route_for_loss)
         self.max_teacher_regenerate_fraction = float(max_teacher_regenerate_fraction)
         self.max_recovery_fraction = float(max_recovery_fraction)
+        self.enable_debug_sample_logging = bool(enable_debug_sample_logging)
         self.debug_print_limit = 3
         self._debug_print_count = 0
         self._cumulative_valid_count = 0
@@ -220,6 +222,9 @@ class Sa2VAOPSDModelV2(BaseModel):
         self._cumulative_hard_reconstruct_failure_count = 0
         self._cumulative_teacher_regenerate_ce_applied_count = 0
         self._cumulative_teacher_regenerate_suppressed_count = 0
+        self._cumulative_teacher_regenerate_verified_count = 0
+        self._cumulative_teacher_regenerate_rejected_count = 0
+        self._cumulative_teacher_regenerate_verified_iou_sum = 0.0
         self._cumulative_recovery_ce_applied_count = 0
         self._cumulative_recovery_suppressed_count = 0
         self._cumulative_scene_spill_caption_count = 0
@@ -247,7 +252,11 @@ class Sa2VAOPSDModelV2(BaseModel):
             "Use that strategy to better model the student's caption tokens."
         )
         self.reconstruct_question_template = reconstruct_question_template or (
-            "<image>What is {caption} in this image? Please respond with segmentation mask."
+            "<image>\n"
+            "Return the segmentation mask for the target region referred to by the description below.\n"
+            "Use nearby objects, scene cues, or local relations only to identify the target region.\n"
+            "Do not include those contextual regions in the mask unless they are explicitly part of the described target.\n"
+            "Description: {caption}"
         )
         self.reconstruct_question_templates = tuple(
             reconstruct_question_templates
@@ -743,8 +752,17 @@ class Sa2VAOPSDModelV2(BaseModel):
         if not lowered:
             return 0
         spill_phrases = (
+            "in the image",
+            "in this image",
+            "in the picture",
+            "in this picture",
+            "in the photo",
+            "in this photo",
+            "in the scene",
             "another person",
             "other people",
+            "another object",
+            "other objects",
             "someone else",
             "group of people",
             "surrounded by",
@@ -752,11 +770,22 @@ class Sa2VAOPSDModelV2(BaseModel):
             "appears to be",
             "seems to be",
             "possibly",
+            "might be",
+            "may be",
+            "likely",
+            "probably",
+            "suggesting that",
             "suggests that",
             "engaged in",
             "participating in",
             "watching an event",
             "while another",
+            "next to another",
+            "standing next to another",
+            "part of a larger",
+            "one of several",
+            "among other",
+            "with other",
             "this scene suggests",
             "adds a sense of",
             "providing a sense of",
@@ -780,8 +809,10 @@ class Sa2VAOPSDModelV2(BaseModel):
         has_seg_markup = int(bool(re.search(r"\[SEG\]|</?p>", raw_prediction or "", flags=re.IGNORECASE)))
         np_like = int(self._is_np_like_caption(clean_caption))
         overly_generic = int(self._is_overly_generic_caption(clean_caption))
+        spill_hits = self._caption_scene_spill_hit_count(clean_caption)
         return (
             int(status == "ok"),
+            -spill_hits,
             np_like,
             min(token_count, 16),
             -overly_generic,
@@ -797,17 +828,24 @@ class Sa2VAOPSDModelV2(BaseModel):
         if status in {"truncated_caption", "seg_style_answer", "decode_error"}:
             return -self.caption_reward_truncated_penalty
         if status == "ok":
+            spill_hit_count = self._caption_scene_spill_hit_count(clean_caption)
+            has_scene_spill = spill_hit_count >= 1
             reward += self.caption_reward_valid_bonus
-            if self._is_caption_content_sufficient(clean_caption) and not self._is_overly_generic_caption(clean_caption):
+            if (
+                self._is_caption_content_sufficient(clean_caption)
+                and not self._is_overly_generic_caption(clean_caption)
+                and not has_scene_spill
+            ):
                 reward += self.caption_reward_sufficient_bonus
             if self._is_overly_generic_caption(clean_caption):
                 reward -= self.caption_reward_generic_penalty
             if self._has_repetitive_caption_pattern(clean_caption):
                 reward -= self.caption_reward_repetition_penalty
-            spill_hit_count = self._caption_scene_spill_hit_count(clean_caption)
             if spill_hit_count >= 4:
-                reward -= self.caption_reward_scene_spill_penalty + 0.15
+                reward -= self.caption_reward_scene_spill_penalty + 0.25
             elif spill_hit_count >= 2:
+                reward -= self.caption_reward_scene_spill_penalty + 0.1
+            elif spill_hit_count >= 1:
                 reward -= self.caption_reward_scene_spill_penalty
             if self._is_low_density_long_caption(clean_caption):
                 reward -= self.caption_reward_low_density_penalty
@@ -962,6 +1000,9 @@ class Sa2VAOPSDModelV2(BaseModel):
         primary_template = self.reconstruct_question_templates[0]
         return [primary_template.format(caption=caption, class_name=caption)]
 
+    def _teacher_regenerate_iou_threshold(self, student_iou):
+        return max(float(self.iou_low_threshold), float(student_iou) + 0.1)
+
     @staticmethod
     def _invalid_reconstruction_placeholder(status):
         return ReconstructionResult(
@@ -1063,6 +1104,8 @@ class Sa2VAOPSDModelV2(BaseModel):
         return (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
 
     def _should_debug_print(self):
+        if not self.enable_debug_sample_logging:
+            return False
         if self._debug_print_count >= self.debug_print_limit:
             return False
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -1830,6 +1873,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         )
 
     def reconstruct_mask(self, image, caption, description_status, spatial_hint="", gt_mask=None):
+        del spatial_hint
         if description_status != "ok":
             return ReconstructionResult(
                 pred_mask=None,
@@ -1838,73 +1882,41 @@ class Sa2VAOPSDModelV2(BaseModel):
                 prediction_masks_count=0,
                 status="skipped_invalid_description",
             )
-        best_result = None
-        best_iou = -1.0
-        for reconstruct_question_base in self._resolve_reconstruct_questions(caption):
-            reconstruct_question_variants = [reconstruct_question_base]
-            if spatial_hint:
-                reconstruct_question_variants.append(
-                    self._append_spatial_hint_to_question(reconstruct_question_base, spatial_hint)
-                )
-            for reconstruct_question in reconstruct_question_variants:
-                predict_dict = self._predict_forward_eval(
-                    self.student_model,
-                    image=image,
-                    text=reconstruct_question,
-                    past_text="",
-                    mask_prompts=None,
-                    tokenizer=self.tokenizer,
-                )
-                raw_prediction = predict_dict.get("prediction", "")
-                prediction_masks = predict_dict.get("prediction_masks")
-                prediction_masks_count = 0 if prediction_masks is None else len(prediction_masks)
-                if not prediction_masks:
-                    result = ReconstructionResult(
-                        pred_mask=None,
-                        question=reconstruct_question,
-                        raw_prediction=raw_prediction,
-                        prediction_masks_count=prediction_masks_count,
-                        status="empty_prediction_masks",
-                    )
-                    candidate_iou = -1.0
-                else:
-                    first_mask = prediction_masks[0]
-                    if isinstance(first_mask, torch.Tensor):
-                        first_mask = first_mask.detach().cpu().numpy()
-                    first_mask = np.asarray(first_mask)
-                    if first_mask.ndim == 3 and first_mask.shape[0] == 1:
-                        first_mask = first_mask[0]
-                    pred_mask = self._to_numpy_mask(first_mask)
-                    status = "ok" if pred_mask.sum() > 0 else "zero_area_mask"
-                    result = ReconstructionResult(
-                        pred_mask=pred_mask,
-                        question=reconstruct_question,
-                        raw_prediction=raw_prediction,
-                        prediction_masks_count=prediction_masks_count,
-                        status=status,
-                    )
-                    candidate_iou = self._compute_iou(gt_mask, pred_mask) if gt_mask is not None else -1.0
-                if gt_mask is not None:
-                    if candidate_iou > best_iou:
-                        best_result = result
-                        best_iou = candidate_iou
-                elif best_result is None or (
-                    best_result.status != "ok" and result.status == "ok"
-                ) or (
-                    best_result.status == "ok"
-                    and result.status == "ok"
-                    and int(np.asarray(result.pred_mask).sum()) > int(np.asarray(best_result.pred_mask).sum())
-                ):
-                    best_result = result
-        if best_result is None:
+        reconstruct_question = self._resolve_reconstruct_questions(caption)[0]
+        predict_dict = self._predict_forward_eval(
+            self.student_model,
+            image=image,
+            text=reconstruct_question,
+            past_text="",
+            mask_prompts=None,
+            tokenizer=self.tokenizer,
+        )
+        raw_prediction = predict_dict.get("prediction", "")
+        prediction_masks = predict_dict.get("prediction_masks")
+        prediction_masks_count = 0 if prediction_masks is None else len(prediction_masks)
+        if not prediction_masks:
             return ReconstructionResult(
                 pred_mask=None,
-                question=None,
-                raw_prediction="",
-                prediction_masks_count=0,
-                status="missing_reconstruction_result",
+                question=reconstruct_question,
+                raw_prediction=raw_prediction,
+                prediction_masks_count=prediction_masks_count,
+                status="empty_prediction_masks",
             )
-        return best_result
+        first_mask = prediction_masks[0]
+        if isinstance(first_mask, torch.Tensor):
+            first_mask = first_mask.detach().cpu().numpy()
+        first_mask = np.asarray(first_mask)
+        if first_mask.ndim == 3 and first_mask.shape[0] == 1:
+            first_mask = first_mask[0]
+        pred_mask = self._to_numpy_mask(first_mask)
+        status = "ok" if pred_mask.sum() > 0 else "zero_area_mask"
+        return ReconstructionResult(
+            pred_mask=pred_mask,
+            question=reconstruct_question,
+            raw_prediction=raw_prediction,
+            prediction_masks_count=prediction_masks_count,
+            status=status,
+        )
 
     def _compute_iou(self, gt_mask, pred_mask):
         if pred_mask is None:
@@ -2587,6 +2599,9 @@ class Sa2VAOPSDModelV2(BaseModel):
         hard_reconstruct_failure_count = 0
         teacher_regenerate_ce_applied_count = 0
         teacher_regenerate_suppressed_count = 0
+        teacher_regenerate_verified_count = 0
+        teacher_regenerate_rejected_count = 0
+        teacher_regenerate_verified_iou_sum = 0.0
         recovery_ce_applied_count = 0
         recovery_suppressed_count = 0
         scene_spill_caption_count = 0
@@ -2704,18 +2719,44 @@ class Sa2VAOPSDModelV2(BaseModel):
                         iou=0.0,
                         teacher_fields=teacher_fields,
                     )
-                    regen_entries.append(
-                        {
-                            "image": image,
-                            "prompt_masks": prompt_masks,
-                            "student_question": student_question,
-                            "completion_ids": teacher_regenerate.completion_ids,
-                        }
+                    teacher_reconstruction = self.reconstruct_mask(
+                        image=image,
+                        caption=teacher_regenerate.clean_caption,
+                        description_status=teacher_regenerate.status,
+                        gt_mask=gt_mask_np,
                     )
-                    teacher_regenerate_ce_applied_count += 1
-                    if is_recovery_case:
-                        recovery_ce_applied_count += 1
-                    last_caption = teacher_regenerate.clean_caption or description.clean_caption
+                    teacher_pred_mask = None if teacher_reconstruction is None else teacher_reconstruction.pred_mask
+                    teacher_iou_plain = (
+                        self._compute_iou(gt_mask_np, teacher_pred_mask) if teacher_pred_mask is not None else 0.0
+                    )
+                    teacher_gate_threshold = self._teacher_regenerate_iou_threshold(0.0)
+                    teacher_reconstruct_ok = (
+                        teacher_reconstruction is not None
+                        and teacher_reconstruction.status == "ok"
+                        and teacher_pred_mask is not None
+                    )
+                    if teacher_reconstruct_ok and teacher_iou_plain >= teacher_gate_threshold:
+                        regen_entries.append(
+                            {
+                                "image": image,
+                                "prompt_masks": prompt_masks,
+                                "student_question": student_question,
+                                "completion_ids": teacher_regenerate.completion_ids,
+                            }
+                        )
+                        teacher_regenerate_ce_applied_count += 1
+                        teacher_regenerate_verified_count += 1
+                        teacher_regenerate_verified_iou_sum += teacher_iou_plain
+                        if is_recovery_case:
+                            recovery_ce_applied_count += 1
+                        last_caption = teacher_regenerate.clean_caption or description.clean_caption
+                    else:
+                        teacher_regenerate_suppressed_count += 1
+                        teacher_regenerate_rejected_count += 1
+                        hard_reconstruct_failure_count += 1
+                        if is_recovery_case:
+                            recovery_suppressed_count += 1
+                        last_caption = description.clean_caption
                 else:
                     teacher_regenerate_suppressed_count += 1
                     hard_reconstruct_failure_count += 1
@@ -2794,16 +2835,40 @@ class Sa2VAOPSDModelV2(BaseModel):
                         iou=iou,
                         teacher_fields=teacher_fields,
                     )
-                    regen_entries.append(
-                        {
-                            "image": image,
-                            "prompt_masks": prompt_masks,
-                            "student_question": student_question,
-                            "completion_ids": teacher_regenerate.completion_ids,
-                        }
+                    teacher_reconstruction = self.reconstruct_mask(
+                        image=image,
+                        caption=teacher_regenerate.clean_caption,
+                        description_status=teacher_regenerate.status,
+                        gt_mask=gt_mask_np,
                     )
-                    teacher_regenerate_ce_applied_count += 1
-                    last_caption = teacher_regenerate.clean_caption or description.clean_caption
+                    teacher_pred_mask = None if teacher_reconstruction is None else teacher_reconstruction.pred_mask
+                    teacher_iou_plain = (
+                        self._compute_iou(gt_mask_np, teacher_pred_mask) if teacher_pred_mask is not None else 0.0
+                    )
+                    teacher_gate_threshold = self._teacher_regenerate_iou_threshold(iou)
+                    teacher_reconstruct_ok = (
+                        teacher_reconstruction is not None
+                        and teacher_reconstruction.status == "ok"
+                        and teacher_pred_mask is not None
+                    )
+                    if teacher_reconstruct_ok and teacher_iou_plain >= teacher_gate_threshold:
+                        regen_entries.append(
+                            {
+                                "image": image,
+                                "prompt_masks": prompt_masks,
+                                "student_question": student_question,
+                                "completion_ids": teacher_regenerate.completion_ids,
+                            }
+                        )
+                        teacher_regenerate_ce_applied_count += 1
+                        teacher_regenerate_verified_count += 1
+                        teacher_regenerate_verified_iou_sum += teacher_iou_plain
+                        last_caption = teacher_regenerate.clean_caption or description.clean_caption
+                    else:
+                        teacher_regenerate_suppressed_count += 1
+                        teacher_regenerate_rejected_count += 1
+                        hard_reconstruct_failure_count += 1
+                        last_caption = description.clean_caption
                 else:
                     teacher_regenerate_suppressed_count += 1
                     hard_reconstruct_failure_count += 1
@@ -2922,6 +2987,9 @@ class Sa2VAOPSDModelV2(BaseModel):
         self._cumulative_hard_reconstruct_failure_count += hard_reconstruct_failure_count
         self._cumulative_teacher_regenerate_ce_applied_count += teacher_regenerate_ce_applied_count
         self._cumulative_teacher_regenerate_suppressed_count += teacher_regenerate_suppressed_count
+        self._cumulative_teacher_regenerate_verified_count += teacher_regenerate_verified_count
+        self._cumulative_teacher_regenerate_rejected_count += teacher_regenerate_rejected_count
+        self._cumulative_teacher_regenerate_verified_iou_sum += teacher_regenerate_verified_iou_sum
         self._cumulative_recovery_ce_applied_count += recovery_ce_applied_count
         self._cumulative_recovery_suppressed_count += recovery_suppressed_count
         self._cumulative_scene_spill_caption_count += scene_spill_caption_count
@@ -2958,9 +3026,15 @@ class Sa2VAOPSDModelV2(BaseModel):
         cumulative_avg_caption_tokens = (
             self._cumulative_caption_token_sum / cumulative_nonempty_caption_count
         )
-        cumulative_teacher_regenerate_rate = self._cumulative_teacher_regenerate_count / cumulative_valid_count
-        cumulative_on_policy_distill_rate = self._cumulative_on_policy_distill_count / cumulative_valid_count
-        cumulative_grpo_positive_rate = self._cumulative_grpo_positive_count / cumulative_valid_count
+        cumulative_route_count = max(
+            self._cumulative_teacher_regenerate_count
+            + self._cumulative_on_policy_distill_count
+            + self._cumulative_grpo_positive_count,
+            1,
+        )
+        cumulative_teacher_regenerate_rate = self._cumulative_teacher_regenerate_count / cumulative_route_count
+        cumulative_on_policy_distill_rate = self._cumulative_on_policy_distill_count / cumulative_route_count
+        cumulative_grpo_positive_rate = self._cumulative_grpo_positive_count / cumulative_route_count
         cumulative_regen_ce = self._cumulative_regen_ce_sum / max(self._cumulative_regen_loss_count, 1)
         cumulative_onpolicy_jsd = self._cumulative_onpolicy_jsd_sum / max(self._cumulative_onpolicy_loss_count, 1)
         cumulative_grpo = self._cumulative_grpo_sum / max(self._cumulative_grpo_loss_count, 1)
@@ -2974,58 +3048,47 @@ class Sa2VAOPSDModelV2(BaseModel):
         cumulative_repetitive_caption_rate = self._cumulative_repetitive_caption_count / cumulative_nonempty_gt_count
         cumulative_scene_spill_caption_rate = self._cumulative_scene_spill_caption_count / cumulative_nonempty_gt_count
         cumulative_low_density_long_caption_rate = self._cumulative_low_density_long_caption_count / cumulative_nonempty_gt_count
+        cumulative_teacher_regenerate_gate_pass_rate = (
+            self._cumulative_teacher_regenerate_verified_count
+            / max(
+                self._cumulative_teacher_regenerate_verified_count
+                + self._cumulative_teacher_regenerate_rejected_count,
+                1,
+            )
+        )
+        cumulative_teacher_regenerate_verified_iou_mean = (
+            self._cumulative_teacher_regenerate_verified_iou_sum
+            / max(self._cumulative_teacher_regenerate_verified_count, 1)
+        )
 
         if optimized_count == 0:
             metrics = {
                 "loss_opsd_total": zero,
-                "opsd_total_cum": self._metric_tensor(cumulative_loss_opsd_total, zero.dtype),
                 "opsd_regen_ce": zero,
-                "opsd_regen_ce_cum": self._metric_tensor(cumulative_regen_ce, zero.dtype),
                 "opsd_onpolicy_jsd": zero,
-                "opsd_onpolicy_jsd_cum": self._metric_tensor(cumulative_onpolicy_jsd, zero.dtype),
                 "opsd_grpo": zero,
-                "opsd_grpo_cum": self._metric_tensor(cumulative_grpo, zero.dtype),
                 "grpo_reward_mean": zero,
-                "grpo_reward_mean_cum": self._metric_tensor(cumulative_grpo_reward_mean, zero.dtype),
-                "grpo_quality_reward_mean_cum": self._metric_tensor(cumulative_grpo_quality_reward_mean, zero.dtype),
-                "grpo_iou_reward_mean_cum": self._metric_tensor(cumulative_grpo_iou_reward_mean, zero.dtype),
                 "grpo_group_size": self._metric_tensor(float(self.grpo_group_size), zero.dtype),
                 "verifier_iou": self._metric_tensor(cumulative_verifier_iou, zero.dtype),
                 "seg_correct_rate": self._metric_tensor(cumulative_seg_correct_rate, zero.dtype),
-                "all_sample_reconstruct_attempt_rate": self._metric_tensor(
-                    cumulative_all_sample_reconstruct_attempt_rate, zero.dtype
-                ),
                 "all_sample_seg_success_rate": self._metric_tensor(cumulative_all_sample_seg_success_rate, zero.dtype),
                 "all_sample_seg_correct_rate": self._metric_tensor(cumulative_all_sample_seg_correct_rate, zero.dtype),
-                "valid_caption_cond_seg_correct_rate": self._metric_tensor(
-                    cumulative_valid_caption_cond_seg_correct_rate, zero.dtype
-                ),
-                "nonempty_caption_rate": self._metric_tensor(cumulative_nonempty_caption_rate, zero.dtype),
-                "valid_caption_rate": self._metric_tensor(cumulative_valid_caption_rate, zero.dtype),
                 "avg_caption_tokens": self._metric_tensor(cumulative_avg_caption_tokens, zero.dtype),
-                "description_ok_count": self._metric_tensor(self._cumulative_description_ok_count, zero.dtype),
-                "description_empty_count": self._metric_tensor(self._cumulative_description_empty_count, zero.dtype),
-                "description_truncated_count": self._metric_tensor(self._cumulative_description_truncated_count, zero.dtype),
-                "description_seg_style_count": self._metric_tensor(self._cumulative_description_seg_style_count, zero.dtype),
-                "reconstruct_ok_count": self._metric_tensor(self._cumulative_reconstruct_ok_count, zero.dtype),
-                "reconstruct_failed_count": self._metric_tensor(self._cumulative_reconstruct_failed_count, zero.dtype),
-                "reconstruct_skip_count": self._metric_tensor(self._cumulative_reconstruct_skip_count, zero.dtype),
-                "hard_reconstruct_failure_count": self._metric_tensor(self._cumulative_hard_reconstruct_failure_count, zero.dtype),
-                "empty_gt_mask_count": self._metric_tensor(self._cumulative_empty_gt_mask_count, zero.dtype),
                 "teacher_regenerate_rate": self._metric_tensor(cumulative_teacher_regenerate_rate, zero.dtype),
                 "on_policy_distill_rate": self._metric_tensor(cumulative_on_policy_distill_rate, zero.dtype),
                 "grpo_positive_rate": self._metric_tensor(cumulative_grpo_positive_rate, zero.dtype),
-                "recovery_caption_rate": self._metric_tensor(cumulative_recovery_caption_rate, zero.dtype),
-                "invalid_caption_penalty_rate": self._metric_tensor(cumulative_invalid_caption_penalty_rate, zero.dtype),
                 "detail_sufficient_caption_rate": self._metric_tensor(cumulative_detail_sufficient_caption_rate, zero.dtype),
-                "generic_caption_rate": self._metric_tensor(cumulative_generic_caption_rate, zero.dtype),
-                "repetitive_caption_rate": self._metric_tensor(cumulative_repetitive_caption_rate, zero.dtype),
                 "scene_spill_caption_rate": self._metric_tensor(cumulative_scene_spill_caption_rate, zero.dtype),
-                "low_density_long_caption_rate": self._metric_tensor(cumulative_low_density_long_caption_rate, zero.dtype),
                 "teacher_regenerate_ce_applied_count": self._metric_tensor(self._cumulative_teacher_regenerate_ce_applied_count, zero.dtype),
                 "teacher_regenerate_suppressed_count": self._metric_tensor(self._cumulative_teacher_regenerate_suppressed_count, zero.dtype),
-                "recovery_ce_applied_count": self._metric_tensor(self._cumulative_recovery_ce_applied_count, zero.dtype),
-                "recovery_suppressed_count": self._metric_tensor(self._cumulative_recovery_suppressed_count, zero.dtype),
+                "teacher_regenerate_verified_count": self._metric_tensor(self._cumulative_teacher_regenerate_verified_count, zero.dtype),
+                "teacher_regenerate_rejected_count": self._metric_tensor(self._cumulative_teacher_regenerate_rejected_count, zero.dtype),
+                "teacher_regenerate_gate_pass_rate": self._metric_tensor(
+                    cumulative_teacher_regenerate_gate_pass_rate, zero.dtype
+                ),
+                "teacher_regenerate_verified_iou_mean": self._metric_tensor(
+                    cumulative_teacher_regenerate_verified_iou_mean, zero.dtype
+                ),
             }
             return metrics
 
@@ -3033,127 +3096,82 @@ class Sa2VAOPSDModelV2(BaseModel):
         avg_regen_ce = zero if total_regen_ce is None else total_regen_ce / max(regen_loss_count, 1)
         avg_onpolicy_jsd = zero if total_onpolicy_jsd is None else total_onpolicy_jsd / max(onpolicy_loss_count, 1)
         avg_grpo = zero if total_grpo is None else total_grpo / max(grpo_loss_count, 1)
-        batch_teacher_regenerate_rate = teacher_regenerate_count / max(routed_count, 1)
-        batch_on_policy_distill_rate = on_policy_distill_count / max(routed_count, 1)
-        batch_grpo_positive_rate = grpo_positive_count / max(routed_count, 1)
+        batch_route_count = max(
+            teacher_regenerate_count + on_policy_distill_count + grpo_positive_count,
+            1,
+        )
+        batch_teacher_regenerate_rate = teacher_regenerate_count / batch_route_count
+        batch_on_policy_distill_rate = on_policy_distill_count / batch_route_count
+        batch_grpo_positive_rate = grpo_positive_count / batch_route_count
         batch_grpo_reward_mean = grpo_reward_sum / max(grpo_reward_count, 1)
-        batch_recovery_caption_rate = recovery_caption_count / max(nonempty_gt_count, 1)
-        batch_detail_sufficient_caption_rate = detail_sufficient_caption_count / max(nonempty_gt_count, 1)
-        batch_scene_spill_caption_rate = scene_spill_caption_count / max(nonempty_gt_count, 1)
+        batch_teacher_regenerate_gate_pass_rate = (
+            teacher_regenerate_verified_count
+            / max(teacher_regenerate_verified_count + teacher_regenerate_rejected_count, 1)
+        )
+        batch_teacher_regenerate_verified_iou_mean = (
+            teacher_regenerate_verified_iou_sum / max(teacher_regenerate_verified_count, 1)
+        )
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             if torch.distributed.get_rank() == 0:
                 print(
                     f"[Sa2VA_OPSD_V2] last_sample_key={last_sample_key!r} last_route={last_route} "
-                    f"last_caption='{last_caption}' batch_avg_iou={total_iou / max(routed_count, 1):.4f} "
+                    f"batch_avg_iou={total_iou / max(routed_count, 1):.4f} "
                     f"batch_seg_correct_rate={seg_correct_count / max(routed_count, 1):.4f} "
                     f"batch_regen_rate={batch_teacher_regenerate_rate:.4f} "
                     f"batch_onpolicy_rate={batch_on_policy_distill_rate:.4f} "
                     f"batch_grpo_rate={batch_grpo_positive_rate:.4f} "
-                    f"grpo_reward_mean={batch_grpo_reward_mean:.4f} "
-                    f"cum_iou={cumulative_verifier_iou:.4f} "
-                    f"cum_seg_correct_rate={cumulative_seg_correct_rate:.4f} "
-                    f"cum_all_sample_seg_success_rate={cumulative_all_sample_seg_success_rate:.4f} "
-                    f"cum_all_sample_seg_correct_rate={cumulative_all_sample_seg_correct_rate:.4f} "
-                    f"cum_valid_caption_cond_seg_correct_rate={cumulative_valid_caption_cond_seg_correct_rate:.4f} "
-                    f"cum_valid_caption_rate={cumulative_valid_caption_rate:.4f} "
-                    f"batch_recovery_caption_rate={batch_recovery_caption_rate:.4f} "
-                    f"batch_detail_sufficient_caption_rate={batch_detail_sufficient_caption_rate:.4f} "
-                    f"batch_scene_spill_caption_rate={batch_scene_spill_caption_rate:.4f} "
-                    f"cum_recovery_caption_rate={cumulative_recovery_caption_rate:.4f} "
-                    f"cum_teacher_regenerate_rate={cumulative_teacher_regenerate_rate:.4f} "
-                    f"cum_on_policy_distill_rate={cumulative_on_policy_distill_rate:.4f} "
-                    f"cum_grpo_positive_rate={cumulative_grpo_positive_rate:.4f} "
+                    f"teacher_regen_verified={teacher_regenerate_verified_count} "
+                    f"teacher_regen_rejected={teacher_regenerate_rejected_count} "
+                    f"teacher_regen_gate_pass_rate={batch_teacher_regenerate_gate_pass_rate:.4f} "
+                    f"teacher_regen_verified_iou_mean={batch_teacher_regenerate_verified_iou_mean:.4f} "
                     f"teacher_regenerate_ce_applied={teacher_regenerate_ce_applied_count} "
                     f"teacher_regenerate_suppressed={teacher_regenerate_suppressed_count} "
-                    f"recovery_ce_applied={recovery_ce_applied_count} "
-                    f"recovery_suppressed={recovery_suppressed_count} "
-                    f"hard_reconstruct_failure_count={hard_reconstruct_failure_count} "
-                    f"cum_avg_caption_tokens={cumulative_avg_caption_tokens:.2f}\n"
-                    f"[Sa2VA_OPSD_V2] teacher_prompt={last_teacher_prompt}"
+                    f"cum_avg_caption_tokens={cumulative_avg_caption_tokens:.2f}"
                 )
         else:
             print(
                 f"[Sa2VA_OPSD_V2] last_sample_key={last_sample_key!r} last_route={last_route} "
-                f"last_caption='{last_caption}' batch_avg_iou={total_iou / max(routed_count, 1):.4f} "
+                f"batch_avg_iou={total_iou / max(routed_count, 1):.4f} "
                 f"batch_seg_correct_rate={seg_correct_count / max(routed_count, 1):.4f} "
                 f"batch_regen_rate={batch_teacher_regenerate_rate:.4f} "
                 f"batch_onpolicy_rate={batch_on_policy_distill_rate:.4f} "
                 f"batch_grpo_rate={batch_grpo_positive_rate:.4f} "
-                f"grpo_reward_mean={batch_grpo_reward_mean:.4f} "
-                f"cum_iou={cumulative_verifier_iou:.4f} "
-                f"cum_seg_correct_rate={cumulative_seg_correct_rate:.4f} "
-                f"cum_all_sample_seg_success_rate={cumulative_all_sample_seg_success_rate:.4f} "
-                f"cum_all_sample_seg_correct_rate={cumulative_all_sample_seg_correct_rate:.4f} "
-                f"cum_valid_caption_cond_seg_correct_rate={cumulative_valid_caption_cond_seg_correct_rate:.4f} "
-                f"cum_valid_caption_rate={cumulative_valid_caption_rate:.4f} "
-                f"batch_recovery_caption_rate={batch_recovery_caption_rate:.4f} "
-                f"batch_detail_sufficient_caption_rate={batch_detail_sufficient_caption_rate:.4f} "
-                f"batch_scene_spill_caption_rate={batch_scene_spill_caption_rate:.4f} "
-                f"cum_recovery_caption_rate={cumulative_recovery_caption_rate:.4f} "
-                f"cum_teacher_regenerate_rate={cumulative_teacher_regenerate_rate:.4f} "
-                f"cum_on_policy_distill_rate={cumulative_on_policy_distill_rate:.4f} "
-                f"cum_grpo_positive_rate={cumulative_grpo_positive_rate:.4f} "
+                f"teacher_regen_verified={teacher_regenerate_verified_count} "
+                f"teacher_regen_rejected={teacher_regenerate_rejected_count} "
+                f"teacher_regen_gate_pass_rate={batch_teacher_regenerate_gate_pass_rate:.4f} "
+                f"teacher_regen_verified_iou_mean={batch_teacher_regenerate_verified_iou_mean:.4f} "
                 f"teacher_regenerate_ce_applied={teacher_regenerate_ce_applied_count} "
                 f"teacher_regenerate_suppressed={teacher_regenerate_suppressed_count} "
-                f"recovery_ce_applied={recovery_ce_applied_count} "
-                f"recovery_suppressed={recovery_suppressed_count} "
-                f"hard_reconstruct_failure_count={hard_reconstruct_failure_count} "
-                f"cum_avg_caption_tokens={cumulative_avg_caption_tokens:.2f}\n"
-                f"[Sa2VA_OPSD_V2] teacher_prompt={last_teacher_prompt}"
+                f"cum_avg_caption_tokens={cumulative_avg_caption_tokens:.2f}"
             )
         metrics = {
             "loss_opsd_total": avg_total_loss,
-            "opsd_total_cum": self._metric_tensor(cumulative_loss_opsd_total, avg_total_loss.dtype),
             "opsd_regen_ce": avg_regen_ce.detach(),
-            "opsd_regen_ce_cum": self._metric_tensor(cumulative_regen_ce, avg_total_loss.dtype),
             "opsd_onpolicy_jsd": avg_onpolicy_jsd.detach(),
-            "opsd_onpolicy_jsd_cum": self._metric_tensor(cumulative_onpolicy_jsd, avg_total_loss.dtype),
             "opsd_grpo": avg_grpo.detach(),
-            "opsd_grpo_cum": self._metric_tensor(cumulative_grpo, avg_total_loss.dtype),
             "grpo_reward_mean": self._metric_tensor(batch_grpo_reward_mean, avg_total_loss.dtype),
-            "grpo_reward_mean_cum": self._metric_tensor(cumulative_grpo_reward_mean, avg_total_loss.dtype),
-            "grpo_quality_reward_mean_cum": self._metric_tensor(cumulative_grpo_quality_reward_mean, avg_total_loss.dtype),
-            "grpo_iou_reward_mean_cum": self._metric_tensor(cumulative_grpo_iou_reward_mean, avg_total_loss.dtype),
             "grpo_group_size": self._metric_tensor(float(self.grpo_group_size), avg_total_loss.dtype),
             "verifier_iou": self._metric_tensor(cumulative_verifier_iou, avg_total_loss.dtype),
             "seg_correct_rate": self._metric_tensor(cumulative_seg_correct_rate, avg_total_loss.dtype),
-            "all_sample_reconstruct_attempt_rate": self._metric_tensor(
-                cumulative_all_sample_reconstruct_attempt_rate, avg_total_loss.dtype
-            ),
             "all_sample_seg_success_rate": self._metric_tensor(
                 cumulative_all_sample_seg_success_rate, avg_total_loss.dtype
             ),
             "all_sample_seg_correct_rate": self._metric_tensor(
                 cumulative_all_sample_seg_correct_rate, avg_total_loss.dtype
             ),
-            "valid_caption_cond_seg_correct_rate": self._metric_tensor(
-                cumulative_valid_caption_cond_seg_correct_rate, avg_total_loss.dtype
-            ),
-            "nonempty_caption_rate": self._metric_tensor(cumulative_nonempty_caption_rate, avg_total_loss.dtype),
-            "valid_caption_rate": self._metric_tensor(cumulative_valid_caption_rate, avg_total_loss.dtype),
             "avg_caption_tokens": self._metric_tensor(cumulative_avg_caption_tokens, avg_total_loss.dtype),
-            "description_ok_count": self._metric_tensor(self._cumulative_description_ok_count, avg_total_loss.dtype),
-            "description_empty_count": self._metric_tensor(self._cumulative_description_empty_count, avg_total_loss.dtype),
-            "description_truncated_count": self._metric_tensor(self._cumulative_description_truncated_count, avg_total_loss.dtype),
-            "description_seg_style_count": self._metric_tensor(self._cumulative_description_seg_style_count, avg_total_loss.dtype),
-            "reconstruct_ok_count": self._metric_tensor(self._cumulative_reconstruct_ok_count, avg_total_loss.dtype),
-            "reconstruct_failed_count": self._metric_tensor(self._cumulative_reconstruct_failed_count, avg_total_loss.dtype),
-            "reconstruct_skip_count": self._metric_tensor(self._cumulative_reconstruct_skip_count, avg_total_loss.dtype),
-            "hard_reconstruct_failure_count": self._metric_tensor(self._cumulative_hard_reconstruct_failure_count, avg_total_loss.dtype),
-            "empty_gt_mask_count": self._metric_tensor(self._cumulative_empty_gt_mask_count, avg_total_loss.dtype),
             "teacher_regenerate_rate": self._metric_tensor(cumulative_teacher_regenerate_rate, avg_total_loss.dtype),
             "on_policy_distill_rate": self._metric_tensor(cumulative_on_policy_distill_rate, avg_total_loss.dtype),
             "grpo_positive_rate": self._metric_tensor(cumulative_grpo_positive_rate, avg_total_loss.dtype),
-            "recovery_caption_rate": self._metric_tensor(cumulative_recovery_caption_rate, avg_total_loss.dtype),
-            "invalid_caption_penalty_rate": self._metric_tensor(cumulative_invalid_caption_penalty_rate, avg_total_loss.dtype),
             "detail_sufficient_caption_rate": self._metric_tensor(cumulative_detail_sufficient_caption_rate, avg_total_loss.dtype),
-            "generic_caption_rate": self._metric_tensor(cumulative_generic_caption_rate, avg_total_loss.dtype),
-            "repetitive_caption_rate": self._metric_tensor(cumulative_repetitive_caption_rate, avg_total_loss.dtype),
             "scene_spill_caption_rate": self._metric_tensor(cumulative_scene_spill_caption_rate, avg_total_loss.dtype),
-            "low_density_long_caption_rate": self._metric_tensor(cumulative_low_density_long_caption_rate, avg_total_loss.dtype),
             "teacher_regenerate_ce_applied_count": self._metric_tensor(self._cumulative_teacher_regenerate_ce_applied_count, avg_total_loss.dtype),
             "teacher_regenerate_suppressed_count": self._metric_tensor(self._cumulative_teacher_regenerate_suppressed_count, avg_total_loss.dtype),
-            "recovery_ce_applied_count": self._metric_tensor(self._cumulative_recovery_ce_applied_count, avg_total_loss.dtype),
-            "recovery_suppressed_count": self._metric_tensor(self._cumulative_recovery_suppressed_count, avg_total_loss.dtype),
+            "teacher_regenerate_verified_count": self._metric_tensor(self._cumulative_teacher_regenerate_verified_count, avg_total_loss.dtype),
+            "teacher_regenerate_rejected_count": self._metric_tensor(self._cumulative_teacher_regenerate_rejected_count, avg_total_loss.dtype),
+            "teacher_regenerate_gate_pass_rate": self._metric_tensor(cumulative_teacher_regenerate_gate_pass_rate, avg_total_loss.dtype),
+            "teacher_regenerate_verified_iou_mean": self._metric_tensor(
+                cumulative_teacher_regenerate_verified_iou_mean, avg_total_loss.dtype
+            ),
         }
         return metrics

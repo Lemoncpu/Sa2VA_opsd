@@ -1,9 +1,11 @@
 DEFAULT_MASK_TO_CAPTION_QUESTION = (
     "<image>"
-    "Describe the region marked by region1 in detail. "
-    "Focus on the region's appearance, attributes, parts, and any relevant local context that helps understand it. "
-    "Use a natural and complete sentence. "
-    "Avoid hallucinations and describe only what is visible. "
+    "Describe the target marked by region1 with one detailed caption that helps uniquely localize it. "
+    "Focus first on the target itself: its category, visible appearance, color, material, texture, parts, pose, "
+    "and other distinctive attributes. Include only the minimum local spatial or relational cues that are necessary "
+    "to distinguish this target from nearby similar objects. Use a natural and complete sentence. "
+    "Avoid broad scene descriptions, avoid unrelated objects or people unless they are necessary for localization, "
+    "and describe only what is directly visible. "
     "Do not output segmentation tokens, tags, or placeholder text."
 )
 
