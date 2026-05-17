@@ -14,7 +14,7 @@ class OpsdRouteRefreshHook(Hook):
         self,
         interval: int = 5000,
         route_cache_dir: str = "route_cache",
-        route_model: str = "teacher",
+        route_model: str = "student",
         export_limit: int = None,
         restrict_manifest_to_active_window: bool = True,
     ):

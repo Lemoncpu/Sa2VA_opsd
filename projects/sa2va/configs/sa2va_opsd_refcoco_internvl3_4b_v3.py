@@ -183,7 +183,7 @@ if use_manifest_routes:
             type=OpsdRouteRefreshHook,
             interval=route_refresh_interval,
             route_cache_dir="route_cache",
-            route_model="teacher",
+            route_model="student",
         )
     )
 

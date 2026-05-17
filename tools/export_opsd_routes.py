@@ -28,7 +28,7 @@ def parse_args():
     parser.add_argument("--limit", type=int, default=None, help="Optional sample cap.")
     parser.add_argument(
         "--route-model",
-        default="teacher",
+        default="student",
         choices=["teacher", "student"],
         help="Model used for description->reconstruct route estimation.",
     )
@@ -440,15 +440,9 @@ def export_routes(
     carried_records: List[Dict] = []
     carried_sample_keys: Set[str] = set()
     if restrict_manifest_to_active_window:
-        for record in existing_records:
-            sample_key = record.get("sample_key")
-            route = record.get("route")
-            if not sample_key or sample_key in consumed_sample_key_set:
-                continue
-            if route in {None, "", SKIP_OPSD_ROUTE}:
-                continue
-            carried_records.append(record)
-            carried_sample_keys.add(str(sample_key))
+        # Active-window mode should fully refresh the active route set on each export.
+        # Do not carry historical active routes forward; otherwise the window never turns over.
+        existing_records = []
 
     excluded_sample_keys = set(consumed_sample_key_set)
     excluded_sample_keys.update(carried_sample_keys)
