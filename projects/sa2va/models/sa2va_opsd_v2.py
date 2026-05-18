@@ -53,6 +53,7 @@ class ReconstructionResult:
     question: object
     raw_prediction: str
     prediction_masks_count: int
+    seg_token_count: int
     status: str
 
 
@@ -186,8 +187,6 @@ class Sa2VAOPSDModelV2(BaseModel):
         self.max_teacher_regenerate_fraction = float(max_teacher_regenerate_fraction)
         self.max_recovery_fraction = float(max_recovery_fraction)
         self.enable_debug_sample_logging = bool(enable_debug_sample_logging)
-        self.debug_print_limit = 3
-        self._debug_print_count = 0
         self._cumulative_valid_count = 0
         self._cumulative_description_ok_count = 0
         self._cumulative_description_empty_count = 0
@@ -1108,8 +1107,6 @@ class Sa2VAOPSDModelV2(BaseModel):
     def _should_debug_print(self):
         if not self.enable_debug_sample_logging:
             return False
-        if self._debug_print_count >= self.debug_print_limit:
-            return False
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             return torch.distributed.get_rank() == 0
         return True
@@ -1126,6 +1123,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         reconstruct_question,
         raw_reconstruct_prediction,
         reconstruct_status,
+        seg_token_count,
         prediction_masks_count,
         pred_mask,
         gt_mask,
@@ -1146,26 +1144,25 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"pred_mask_shape_after_resize={pred_shape_after_resize} resized_for_iou={resized}"
             )
         print(
-            "[Sa2VA_OPSD_V2_DEBUG] "
             f"sample_key={sample_key!r}\n"
-            f"[Sa2VA_OPSD_V2_DEBUG] route={route} low_iou_threshold={self.iou_low_threshold:.4f} "
+            f"route={route} low_iou_threshold={self.iou_low_threshold:.4f} "
             f"high_iou_threshold={self.iou_high_threshold:.4f}\n"
-            f"[Sa2VA_OPSD_V2_DEBUG] student_question={student_question!r}\n"
-            f"[Sa2VA_OPSD_V2_DEBUG] raw_prediction={raw_prediction!r}\n"
-            f"[Sa2VA_OPSD_V2_DEBUG] clean_caption={caption!r}\n"
-            f"[Sa2VA_OPSD_V2_DEBUG] description_status={description_status}\n"
-            f"[Sa2VA_OPSD_V2_DEBUG] reconstruct_question={reconstruct_question!r}\n"
-            f"[Sa2VA_OPSD_V2_DEBUG] raw_reconstruct_prediction={raw_reconstruct_prediction!r}\n"
-            f"[Sa2VA_OPSD_V2_DEBUG] reconstruct_status={reconstruct_status}\n"
-            f"[Sa2VA_OPSD_V2_DEBUG] prediction_masks_count={prediction_masks_count}\n"
-            f"[Sa2VA_OPSD_V2_DEBUG] pred_mask_sum={pred_sum} gt_mask_sum={gt_sum}\n"
-            f"[Sa2VA_OPSD_V2_DEBUG] pred_mask_shape={None if pred_mask is None else tuple(np.asarray(pred_mask).shape)} "
+            f"student_question={student_question!r}\n"
+            f"student_caption={caption!r}\n"
+            f"raw_prediction={raw_prediction!r}\n"
+            f"description_status={description_status}\n"
+            f"reconstruct_question={reconstruct_question!r}\n"
+            f"raw_reconstruct_prediction={raw_reconstruct_prediction!r}\n"
+            f"reconstruct_status={reconstruct_status}\n"
+            f"seg_token_count={seg_token_count}\n"
+            f"prediction_masks_count={prediction_masks_count}\n"
+            f"pred_mask_sum={pred_sum} gt_mask_sum={gt_sum}\n"
+            f"pred_mask_shape={None if pred_mask is None else tuple(np.asarray(pred_mask).shape)} "
             f"gt_mask_shape={None if gt_mask is None else tuple(np.asarray(gt_mask).shape)}\n"
-            f"[Sa2VA_OPSD_V2_DEBUG] pred_bbox={self._mask_bbox(pred_mask)} gt_bbox={self._mask_bbox(gt_mask)}\n"
-            f"[Sa2VA_OPSD_V2_DEBUG] empty_gt_mask={empty_gt_mask} iou={iou:.4f}"
+            f"pred_bbox={self._mask_bbox(pred_mask)} gt_bbox={self._mask_bbox(gt_mask)}\n"
+            f"empty_gt_mask={empty_gt_mask} iou={iou:.4f}"
             f"{resize_info}"
         )
-        self._debug_print_count += 1
 
     @staticmethod
     @contextmanager
@@ -1817,13 +1814,6 @@ class Sa2VAOPSDModelV2(BaseModel):
             mask_prompts=mask_prompts,
             student_question=student_question,
             apply_mask_focus=True,
-            generation_overrides={
-                "max_new_tokens": self.description_max_new_tokens,
-                "do_sample": False,
-                "num_beams": 1,
-                "repetition_penalty": self.description_repetition_penalty,
-                "no_repeat_ngram_size": self.description_no_repeat_ngram_size,
-            },
         )
 
     def generate_teacher_caption_with_privileged_prompt(
@@ -1882,6 +1872,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                 question=None,
                 raw_prediction="",
                 prediction_masks_count=0,
+                seg_token_count=0,
                 status="skipped_invalid_description",
             )
         reconstruct_question = self._resolve_reconstruct_questions(caption)[0]
@@ -1896,12 +1887,14 @@ class Sa2VAOPSDModelV2(BaseModel):
         raw_prediction = predict_dict.get("prediction", "")
         prediction_masks = predict_dict.get("prediction_masks")
         prediction_masks_count = 0 if prediction_masks is None else len(prediction_masks)
+        seg_token_count = int(predict_dict.get("seg_token_count", 0) or 0)
         if not prediction_masks:
             return ReconstructionResult(
                 pred_mask=None,
                 question=reconstruct_question,
                 raw_prediction=raw_prediction,
                 prediction_masks_count=prediction_masks_count,
+                seg_token_count=seg_token_count,
                 status="empty_prediction_masks",
             )
         first_mask = prediction_masks[0]
@@ -1917,6 +1910,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             question=reconstruct_question,
             raw_prediction=raw_prediction,
             prediction_masks_count=prediction_masks_count,
+            seg_token_count=seg_token_count,
             status=status,
         )
 
@@ -1985,14 +1979,15 @@ class Sa2VAOPSDModelV2(BaseModel):
         route = teacher_fields.get("teacher_route", ON_POLICY_DISTILL_ROUTE)
         if route == TEACHER_REGENERATE_ROUTE:
             route_guidance = (
-                f"The current IoU is below {self.iou_low_threshold:.2f}, so the caption-to-mask reconstruction is too far from the gtmask. "
-                "Use the teacher to regenerate a new target caption instead of preserving the student's current wording."
+                f"The current IoU is below {self.iou_low_threshold:.2f}, so the student's caption leads the reconstruction too far away from the gtmask. "
+                "The teacher must diagnose why the current caption causes the refmask to differ from the gtmask, identify which visual descriptions are wrong, missing, too generic, or overemphasized, and then regenerate a better caption for the gtmask."
             )
         elif route == ON_POLICY_DISTILL_ROUTE:
             route_guidance = (
                 f"The current IoU is between {self.iou_low_threshold:.2f} and {self.iou_high_threshold:.2f}, so this sample enters the on-policy correction branch. "
-                "Compare gtmask and refmask pixel by pixel: pixels present only in gtmask are missing target evidence, while pixels present only in refmask are distractor evidence. "
-                "Use these pixel-level differences to score the student's trajectory and guide probability mass toward tokens that explain the missing gtmask pixels while suppressing tokens that explain refmask-only pixels."
+                "The teacher must first compare the two masks in detail, identify what content is shared, what target evidence is missing from the refmask, and what distractor evidence is wrongly included in the refmask. "
+                "Then the teacher must analyze the student caption and infer which words, attributes, parts, or local relations likely caused those errors. "
+                "Use that diagnosis to supervise the student's token trajectory: increase probability on tokens that better explain the gtmask and suppress tokens that explain refmask-only distractor regions."
             )
         else:
             route_guidance = (
@@ -2001,9 +1996,9 @@ class Sa2VAOPSDModelV2(BaseModel):
             )
         prompt = (
             "<image>\n"
-            "You are optimizing the following task: given a gtmask, generate a caption that describes it. "
-            "You are now given the original input, the student question, and privileged verification information. "
-            "Use these privileged signals to improve the caption generation.\n"
+            "You are a teacher supervising a caption-to-mask model. The student first writes a caption for the target, and that caption is then used to reconstruct a segmentation mask. "
+            "You are given privileged access to the target mask (region1 = gtmask) and the reconstructed mask (region2 = refmask). "
+            "Your job is to analyze, at pixel and region level, why the current student caption produces the current reconstructed mask, and then provide the correct supervision for this route.\n"
             f"Teacher route: {route}\n"
             f"Student prompt: {clean_question}\n"
             f"Student caption: {student_caption}\n"
@@ -2012,32 +2007,44 @@ class Sa2VAOPSDModelV2(BaseModel):
             f"Reconstruction question: {reconstruction.question or ''}\n"
             f"caption_to_mask_seg_correct: {'true' if seg_correct else 'false'}\n"
             "IoU is the intersection-over-union between gtmask and refmask: intersection / union.\n"
-            f"If IoU is below {self.iou_low_threshold:.2f}, the reconstruction is too inaccurate and the teacher should regenerate a better caption.\n"
-            f"If IoU is between {self.iou_low_threshold:.2f} and {self.iou_high_threshold:.2f}, use on-policy supervision: compare gtmask and refmask pixel by pixel, identify missing gtmask-only pixels and erroneous refmask-only pixels, then use those differences to score and supervise the student's token trajectory.\n"
-            f"If IoU is at least {self.iou_high_threshold:.2f}, gtmask and refmask are highly aligned and only light correction is needed.\n"
             f"Current IoU between gtmask(region1) and refmask(region2): {iou:.4f}\n"
-            f"Unique non-overlap area in gtmask: {relation_context['gt_only_summary']}\n"
-            f"Unique non-overlap area in refmask: {relation_context['ref_only_summary']}\n"
+            f"Shared overlap summary between region1 and region2: {relation_context['overlap_summary']}\n"
+            f"Unique non-overlap area in gtmask (region1-only pixels, missing from refmask): {relation_context['gt_only_summary']}\n"
+            f"Unique non-overlap area in refmask (region2-only pixels, erroneous distractor pixels): {relation_context['ref_only_summary']}\n"
+            "Required reasoning order:\n"
+            "1. Analyze region1 (gtmask) carefully and summarize what object content it truly contains.\n"
+            "2. Analyze region2 (refmask) carefully and summarize what object content it currently captures.\n"
+            "3. Compare the two masks pixel by pixel and region by region: identify what target evidence is missing from region2 and what extra distractor evidence appears only in region2.\n"
+            "4. Read the student caption and explain why that wording leads the model toward region2 instead of region1. Identify which descriptions are wrong, missing, too vague, misleading, or overemphasized.\n"
+            "5. Use that diagnosis to decide the correct supervision for this route.\n"
             f"{route_guidance}\n"
-            "Judge what problem the current IoU indicates from the facts above. Do not rely on any pre-labeled failure category. "
-            "Use the IoU value, the caption_to_mask_seg_correct flag, and the difference between the non-overlap areas of gtmask and refmask. "
-            "Use this routed evidence to better model the target caption token sequence."
+            "Do not rely on any pre-labeled failure category beyond the route. Base your supervision on the actual visual content of region1 and region2, their pixel-level differences, and the failure mode implied by the student caption."
         )
         if generation_mode == "regenerate_caption":
             prompt = (
                 "<image>\n"
-                "Write one natural and complete sentence that describes region1 (gtmask) in detail.\n"
-                "The student's caption failed. Do not preserve it if it still points to region2.\n"
-                "Use region2 only as a negative example to avoid.\n"
+                "You are a teacher supervising a failed caption-to-mask reconstruction.\n"
+                "Region1 is the gtmask and region2 is the mask reconstructed from the student's caption.\n"
                 f"Student prompt: {clean_question}\n"
                 f"Failed student caption: {student_caption}\n"
+                f"Description status: {description_status}\n"
+                f"Reconstruction status: {reconstruction.status}\n"
                 f"Current IoU between region1 and region2: {iou:.4f}\n"
+                f"Shared overlap summary: {relation_context['overlap_summary']}\n"
+                f"Region1-only summary (missing target pixels): {relation_context['gt_only_summary']}\n"
+                f"Region2-only summary (distractor pixels wrongly predicted): {relation_context['ref_only_summary']}\n"
+                "Before writing the new caption, reason in this order internally:\n"
+                "1. Analyze what region1 actually contains.\n"
+                "2. Analyze what region2 actually contains.\n"
+                "3. Compare the two masks and identify missing target evidence and extra distractor evidence.\n"
+                "4. Diagnose why the student's caption leads to region2 instead of region1, and which phrases are wrong, missing, too generic, or misleading.\n"
+                "5. Regenerate a better caption that would move reconstruction from region2 toward region1.\n"
                 f"{route_guidance}\n"
-                "Compare region1 and region2 directly from the privileged masks and image evidence, then write a better caption for region1.\n"
                 "Output requirements:\n"
                 "- Return exactly one natural and complete sentence describing region1.\n"
-                "- Focus on visible appearance, attributes, parts, and relevant local context that helps understand the target.\n"
+                "- Focus on visible appearance, attributes, parts, markings, clothing, pose, and only the minimum local context needed to localize the target.\n"
                 "- Prefer concrete visible details over generic statements.\n"
+                "- Fix the specific mistakes that caused region2 to differ from region1.\n"
                 "- Do not explain.\n"
                 "- Do not output labels.\n"
                 "- Do not mention region1 or region2.\n"
@@ -2155,6 +2162,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                 question=None,
                 raw_prediction="",
                 prediction_masks_count=0,
+                seg_token_count=0,
                 status="skipped_invalid_description",
             )
         else:
@@ -2185,6 +2193,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                             question=reconstruct_question,
                             raw_prediction=raw_prediction,
                             prediction_masks_count=prediction_masks_count,
+                            seg_token_count=int(predict_dict.get("seg_token_count", 0) or 0),
                             status="empty_prediction_masks",
                         )
                         candidate_iou = -1.0
@@ -2201,6 +2210,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                             question=reconstruct_question,
                             raw_prediction=raw_prediction,
                             prediction_masks_count=prediction_masks_count,
+                            seg_token_count=int(predict_dict.get("seg_token_count", 0) or 0),
                             status="ok" if pred_mask.sum() > 0 else "zero_area_mask",
                         )
                         candidate_iou = self._compute_iou(gt_mask_np, pred_mask)
@@ -2229,6 +2239,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                 reconstruct_question=None if reconstruction is None else reconstruction.question,
                 raw_reconstruct_prediction="" if reconstruction is None else reconstruction.raw_prediction,
                 reconstruct_status=reconstruct_status,
+                seg_token_count=0 if reconstruction is None else reconstruction.seg_token_count,
                 prediction_masks_count=0 if reconstruction is None else reconstruction.prediction_masks_count,
                 pred_mask=pred_mask,
                 gt_mask=gt_mask_np,
@@ -2639,6 +2650,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                     reconstruct_question=None,
                     raw_reconstruct_prediction="",
                     reconstruct_status="skipped_invalid_description",
+                    seg_token_count=0,
                     prediction_masks_count=0,
                     pred_mask=None,
                     gt_mask=gt_mask_np,
@@ -2691,6 +2703,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             reconstruct_question = None if reconstruction is None else reconstruction.question
             raw_reconstruct_prediction = "" if reconstruction is None else reconstruction.raw_prediction
             prediction_masks_count = 0 if reconstruction is None else reconstruction.prediction_masks_count
+            seg_token_count = 0 if reconstruction is None else reconstruction.seg_token_count
             pred_mask = None if reconstruction is None else reconstruction.pred_mask
             if pred_mask is None:
                 if reconstruct_status == "skipped_invalid_description":
@@ -2782,6 +2795,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                     reconstruct_question=reconstruct_question,
                     raw_reconstruct_prediction=raw_reconstruct_prediction,
                     reconstruct_status=reconstruct_status,
+                    seg_token_count=seg_token_count,
                     prediction_masks_count=prediction_masks_count,
                     pred_mask=None,
                     gt_mask=gt_mask_np,
@@ -2815,6 +2829,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                 reconstruct_question=reconstruct_question,
                 raw_reconstruct_prediction=raw_reconstruct_prediction,
                 reconstruct_status=reconstruct_status,
+                seg_token_count=seg_token_count,
                 prediction_masks_count=prediction_masks_count,
                 pred_mask=pred_mask,
                 gt_mask=gt_mask_np,

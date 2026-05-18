@@ -1,3 +1,5 @@
+import json
+import os
 from pathlib import Path
 
 import torch
@@ -10,6 +12,20 @@ class OpsdRouteRefreshHook(Hook):
 
     priority = "LOW"
 
+    class _SkipAdvanceIterator:
+        def __init__(self, iterator, skip_budget: int):
+            self._iterator = iterator
+            self._skip_budget = max(int(skip_budget), 0)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self._skip_budget > 0:
+                self._skip_budget -= 1
+                return None
+            return next(self._iterator)
+
     def __init__(
         self,
         interval: int = 5000,
@@ -17,6 +33,8 @@ class OpsdRouteRefreshHook(Hook):
         route_model: str = "student",
         export_limit: int = None,
         restrict_manifest_to_active_window: bool = True,
+        save_checkpoint_route_snapshot: bool = False,
+        export_resume_route_window: bool = True,
     ):
         if interval <= 0:
             raise ValueError(f"interval must be positive, got {interval}.")
@@ -25,6 +43,8 @@ class OpsdRouteRefreshHook(Hook):
         self.route_model = str(route_model)
         self.export_limit = export_limit
         self.restrict_manifest_to_active_window = bool(restrict_manifest_to_active_window)
+        self.save_checkpoint_route_snapshot = bool(save_checkpoint_route_snapshot)
+        self.export_resume_route_window = bool(export_resume_route_window)
 
     @staticmethod
     def _unwrap_model(runner):
@@ -104,10 +124,11 @@ class OpsdRouteRefreshHook(Hook):
         per_iter_batch_size = int(getattr(dataloader, "batch_size", 1) or 1) if dataloader is not None else 1
         return max(self.interval * world_size * per_iter_batch_size, 1)
 
-    def _export_routes(self, runner, global_step: int):
+    def _export_routes(self, runner, global_step: int, consumed_sample_keys=None):
         from tools.export_opsd_routes import export_routes_from_runner
 
-        consumed_sample_keys = self._get_global_consumed_sample_keys(runner)
+        if consumed_sample_keys is None:
+            consumed_sample_keys = self._get_global_consumed_sample_keys(runner)
         manifest_path, _ = self._build_export_paths(runner, global_step)
         active_window_size = None
         if self.restrict_manifest_to_active_window:
@@ -132,6 +153,145 @@ class OpsdRouteRefreshHook(Hook):
                 active_window_size,
             )
 
+    @staticmethod
+    def _route_state_from_route(route):
+        if route == "skip":
+            return "skip"
+        if route:
+            return "active"
+        return "missing"
+
+    @staticmethod
+    def _atomic_write_jsonl(path: Path, records) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        os.replace(tmp_path, path)
+
+    def _resolve_checkpoint_interval(self, runner):
+        hooks = getattr(runner, "_hooks", None) or []
+        for hook in hooks:
+            if hook.__class__.__name__ != "CheckpointHook":
+                continue
+            if getattr(hook, "by_epoch", False):
+                continue
+            interval = getattr(hook, "interval", None)
+            if interval is None:
+                continue
+            interval = int(interval)
+            if interval > 0:
+                return interval
+        return None
+
+    def _build_route_state_snapshot_records(self, dataset, consumed_sample_keys, global_step: int):
+        route_info_by_key = getattr(dataset, "route_info_by_key", None) or {}
+        active_manifest_path = (
+            getattr(dataset, "active_route_manifest_path", None)
+            or getattr(dataset, "route_manifest_path", None)
+        )
+        all_sample_keys = []
+        base_records = getattr(dataset, "_base_records", None)
+        if base_records:
+            all_sample_keys.extend(
+                str(record["sample_key"]) for record in base_records if record.get("sample_key")
+            )
+        else:
+            records = getattr(dataset, "records", None) or []
+            all_sample_keys.extend(
+                str(record["sample_key"]) for record in records if record.get("sample_key")
+            )
+        for sample_key in route_info_by_key.keys():
+            sample_key = str(sample_key)
+            if sample_key not in all_sample_keys:
+                all_sample_keys.append(sample_key)
+        for sample_key in consumed_sample_keys or []:
+            sample_key = str(sample_key)
+            if sample_key not in all_sample_keys:
+                all_sample_keys.append(sample_key)
+        consumed_set = {str(sample_key) for sample_key in consumed_sample_keys or [] if sample_key}
+        records = []
+        for sample_key in all_sample_keys:
+            route_info = route_info_by_key.get(sample_key, {})
+            route = route_info.get("route")
+            route_state = self._route_state_from_route(route)
+            records.append(
+                {
+                    "sample_key": sample_key,
+                    "snapshot_global_step": int(global_step),
+                    "route_manifest_path": active_manifest_path,
+                    "route": route,
+                    "route_state": route_state,
+                    "is_active": route_state == "active",
+                    "is_skip": route_state == "skip",
+                    "is_consumed": sample_key in consumed_set,
+                    "route_global_step": route_info.get("global_step"),
+                    "route_timestamp": route_info.get("timestamp"),
+                    "route_iou": route_info.get("iou"),
+                }
+            )
+        records.sort(key=lambda item: item["sample_key"])
+        return records
+
+    def _save_checkpoint_route_snapshot(self, runner, global_step: int, consumed_sample_keys=None) -> None:
+        if not self.save_checkpoint_route_snapshot or not self._is_rank0():
+            return
+        if consumed_sample_keys is None:
+            consumed_sample_keys = self._get_global_consumed_sample_keys(runner)
+        train_loop, dataset, _ = self._get_dataset_and_sampler(runner)
+        del train_loop
+        if dataset is None:
+            return
+        records = self._build_route_state_snapshot_records(dataset, consumed_sample_keys, global_step)
+        cache_dir = Path(runner.work_dir) / self.route_cache_dir
+        snapshot_path = cache_dir / f"route_state_step_{global_step:07d}.jsonl"
+        latest_path = cache_dir / "route_state_latest.jsonl"
+        self._atomic_write_jsonl(snapshot_path, records)
+        try:
+            if latest_path.exists() or latest_path.is_symlink():
+                latest_path.unlink()
+            latest_path.symlink_to(snapshot_path.name)
+        except OSError:
+            self._atomic_write_jsonl(latest_path, records)
+        consumed_count = sum(1 for item in records if item["is_consumed"])
+        active_count = sum(1 for item in records if item["is_active"])
+        skip_count = sum(1 for item in records if item["is_skip"])
+        runner.logger.info(
+            "Saved OPSD route state snapshot to %s consumed=%s active=%s skip=%s",
+            snapshot_path,
+            consumed_count,
+            active_count,
+            skip_count,
+        )
+
+    def _maybe_bootstrap_resume_routes(self, runner, train_loop, dataloader) -> None:
+        if not self.export_resume_route_window:
+            return
+        if getattr(train_loop, "_opsd_resume_route_bootstrap_done", False):
+            return
+        resume_iter = int(getattr(train_loop, "_iter", 0) or 0)
+        if resume_iter <= 0:
+            return
+        consumed_sample_keys = []
+        self._export_routes(runner, resume_iter, consumed_sample_keys=consumed_sample_keys)
+        self._refresh_dataset_and_log(runner, train_loop, dataloader)
+        train_loop.dataloader_iterator = self._SkipAdvanceIterator(
+            train_loop.dataloader_iterator,
+            skip_budget=resume_iter,
+        )
+        train_loop._opsd_resume_route_bootstrap_done = True
+        if self.save_checkpoint_route_snapshot:
+            self._save_checkpoint_route_snapshot(
+                runner,
+                resume_iter,
+                consumed_sample_keys=consumed_sample_keys,
+            )
+        runner.logger.info(
+            "Resume bootstrap exported OPSD routes for step=%s and reset dataloader advance on the new active manifest.",
+            resume_iter,
+        )
+
     def before_train_epoch(self, runner) -> None:
         train_loop, _, sampler = self._get_dataset_and_sampler(runner)
         if train_loop is None:
@@ -142,6 +302,7 @@ class OpsdRouteRefreshHook(Hook):
         if dataloader is None:
             return
         self._refresh_dataset_and_log(runner, train_loop, dataloader)
+        self._maybe_bootstrap_resume_routes(runner, train_loop, dataloader)
 
     def _refresh_dataset_and_log(self, runner, train_loop, dataloader) -> None:
         dataset = getattr(dataloader, "dataset", None)
@@ -166,10 +327,27 @@ class OpsdRouteRefreshHook(Hook):
         # on one rank rather than 5000 optimizer steps after gradient accumulation.
         self._mark_batch_consumed(runner, data_batch)
         refresh_iter = int(getattr(runner, "iter", -1)) + 1
-        if refresh_iter <= 0 or refresh_iter % self.interval != 0:
+        if refresh_iter <= 0:
             return
-        self._export_routes(runner, refresh_iter)
+        checkpoint_interval = self._resolve_checkpoint_interval(runner)
+        should_refresh = refresh_iter % self.interval == 0
+        should_snapshot = (
+            self.save_checkpoint_route_snapshot
+            and checkpoint_interval is not None
+            and refresh_iter % checkpoint_interval == 0
+        )
+        if not should_refresh and not should_snapshot:
+            return
+        consumed_sample_keys = self._get_global_consumed_sample_keys(runner)
+        if should_refresh:
+            self._export_routes(runner, refresh_iter, consumed_sample_keys=consumed_sample_keys)
         train_loop = getattr(runner, "train_loop", None)
         dataloader = getattr(train_loop, "dataloader", None)
-        if dataloader is not None:
+        if should_refresh and dataloader is not None:
             self._refresh_dataset_and_log(runner, train_loop, dataloader)
+        if should_snapshot:
+            self._save_checkpoint_route_snapshot(
+                runner,
+                refresh_iter,
+                consumed_sample_keys=consumed_sample_keys,
+            )

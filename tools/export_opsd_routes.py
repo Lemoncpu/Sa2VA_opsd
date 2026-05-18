@@ -308,6 +308,8 @@ def export_routes_shard(
         reconstruct_model = teacher_model
 
     route_counts = {}
+    description_status_counts = {}
+    reconstruct_status_counts = {}
     record_count = 0
     with open(shard_out_path, "w", encoding="utf-8") as f:
         with torch.no_grad():
@@ -333,9 +335,19 @@ def export_routes_shard(
                 )
                 route = manifest_record["route"]
                 route_counts[route] = route_counts.get(route, 0) + 1
+                description_status = manifest_record.get("description_status")
+                if description_status:
+                    description_status_counts[str(description_status)] = (
+                        description_status_counts.get(str(description_status), 0) + 1
+                    )
+                reconstruct_status = manifest_record.get("reconstruct_status")
+                if reconstruct_status:
+                    reconstruct_status_counts[str(reconstruct_status)] = (
+                        reconstruct_status_counts.get(str(reconstruct_status), 0) + 1
+                    )
                 f.write(json.dumps(manifest_record, ensure_ascii=False) + "\n")
                 record_count += 1
-    return route_counts, record_count
+    return route_counts, description_status_counts, reconstruct_status_counts, record_count
 
 
 def merge_route_counts(all_counts: Sequence[Dict[str, int]]) -> Dict[str, int]:
@@ -343,6 +355,14 @@ def merge_route_counts(all_counts: Sequence[Dict[str, int]]) -> Dict[str, int]:
     for counts in all_counts:
         for route, value in counts.items():
             merged[route] = merged.get(route, 0) + int(value)
+    return merged
+
+
+def merge_counter_dicts(all_counts: Sequence[Dict[str, int]]) -> Dict[str, int]:
+    merged = {}
+    for counts in all_counts:
+        for key, value in (counts or {}).items():
+            merged[str(key)] = merged.get(str(key), 0) + int(value)
     return merged
 
 
@@ -485,11 +505,18 @@ def export_routes(
     shard_samples_local = shard_samples(samples_to_export)
     shard_out_path = build_rank_shard_path(out_path, rank, world_size)
     shard_counts = {}
+    shard_description_status_counts = {}
+    shard_reconstruct_status_counts = {}
     shard_record_count = 0
     shard_ok = True
     shard_error = None
     try:
-        shard_counts, shard_record_count = export_routes_shard(
+        (
+            shard_counts,
+            shard_description_status_counts,
+            shard_reconstruct_status_counts,
+            shard_record_count,
+        ) = export_routes_shard(
             model=model,
             samples=shard_samples_local,
             shard_out_path=shard_out_path,
@@ -512,6 +539,8 @@ def export_routes(
             "error": shard_error,
             "record_count": shard_record_count,
             "route_counts": shard_counts,
+            "description_status_counts": shard_description_status_counts,
+            "reconstruct_status_counts": shard_reconstruct_status_counts,
             "shard_out_path": str(shard_out_path),
         },
     )
@@ -535,6 +564,12 @@ def export_routes(
                 )
                 raise RuntimeError(f"Distributed OPSD export failed before merge. {error_details}")
             merged_counts = merge_route_counts([status.get("route_counts", {}) for status in rank_statuses])
+            merged_description_status_counts = merge_counter_dicts(
+                [status.get("description_status_counts", {}) for status in rank_statuses]
+            )
+            merged_reconstruct_status_counts = merge_counter_dicts(
+                [status.get("reconstruct_status_counts", {}) for status in rank_statuses]
+            )
             exported_record_count = int(sum(int(status.get("record_count", 0)) for status in rank_statuses))
             merge_shards(
                 out_path=out_path,
@@ -612,6 +647,8 @@ def export_routes(
                     "active_record_count": active_record_count,
                     "exported_record_count": exported_record_count,
                     "carried_record_count": carried_record_count,
+                    "description_status_counts": merged_description_status_counts,
+                    "reconstruct_status_counts": merged_reconstruct_status_counts,
                     "world_size": world_size,
                     "out": str(out_path),
                 },
@@ -641,6 +678,8 @@ def export_routes(
         "active_record_count": int(result_payload["active_record_count"]),
         "exported_record_count": int(result_payload["exported_record_count"]),
         "carried_record_count": int(result_payload["carried_record_count"]),
+        "description_status_counts": result_payload.get("description_status_counts", {}),
+        "reconstruct_status_counts": result_payload.get("reconstruct_status_counts", {}),
         "world_size": int(result_payload["world_size"]),
     }
 
@@ -691,6 +730,12 @@ def export_routes_from_runner(
             len(consumed_sample_keys or []),
             export_summary["route_counts"],
             out_path,
+        )
+        runner.logger.info(
+            "OPSD route export status summary: step=%s description_status_counts=%s reconstruct_status_counts=%s",
+            global_step,
+            export_summary.get("description_status_counts", {}),
+            export_summary.get("reconstruct_status_counts", {}),
         )
     return export_summary["route_counts"]
 

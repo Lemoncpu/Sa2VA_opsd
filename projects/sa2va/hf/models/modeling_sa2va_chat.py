@@ -755,6 +755,7 @@ class Sa2VAChatModel(PreTrainedModel):
             last_hidden_states, generate_output.sequences[0][:-1],
             seg_id=self.seg_token_idx
         )
+        seg_token_count = int(seg_hidden_states.shape[0])
         all_seg_hidden_states = self.text_hidden_fcs(seg_hidden_states)
 
         for seg_hidden_states in all_seg_hidden_states:
@@ -769,7 +770,7 @@ class Sa2VAChatModel(PreTrainedModel):
             masks = masks.cpu().numpy()
             ret_masks.append(masks)
 
-        return {'prediction': predict, 'prediction_masks': ret_masks,}
+        return {'prediction': predict, 'prediction_masks': ret_masks, 'seg_token_count': seg_token_count}
 
 def get_seg_hidden_states(hidden_states, output_ids, seg_id):
     seg_mask = output_ids == seg_id
@@ -894,4 +895,3 @@ def prepare_inputs_for_generation_phi3(
         }
     )
     return model_inputs
-

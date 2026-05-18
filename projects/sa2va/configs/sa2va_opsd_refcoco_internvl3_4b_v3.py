@@ -88,7 +88,7 @@ model = dict(
     use_online_route_for_loss=not use_manifest_routes,
     max_teacher_regenerate_fraction=0.2,
     max_recovery_fraction=0.1,
-    enable_debug_sample_logging=False,
+    enable_debug_sample_logging=True,
     reconstruct_question_template=(
         "<image>\n"
         "Return the segmentation mask for the target region referred to by the description below.\n"
@@ -184,6 +184,8 @@ if use_manifest_routes:
             interval=route_refresh_interval,
             route_cache_dir="route_cache",
             route_model="student",
+            save_checkpoint_route_snapshot=True,
+            export_resume_route_window=True,
         )
     )
 
