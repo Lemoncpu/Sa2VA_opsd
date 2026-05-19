@@ -276,8 +276,8 @@ def main():
         torch_dtype="auto",
         use_flash_attn=True,
         min_caption_tokens=4,
-        iou_low_threshold=cfg.get("iou_low_threshold", 0.3),
-        iou_high_threshold=cfg.get("iou_high_threshold", 0.8),
+        iou_low_threshold=cfg.get("iou_low_threshold", 0.5),
+        iou_high_threshold=cfg.get("iou_high_threshold", 0.9),
         low_iou_regen_max_new_tokens=cfg.get("low_iou_regen_max_new_tokens", 48),
     )
     model.eval()

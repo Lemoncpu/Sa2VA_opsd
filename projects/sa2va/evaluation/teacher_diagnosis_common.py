@@ -6,8 +6,8 @@ import numpy as np
 FIVE_LABELS = ("GTMASK", "REFMASK", "CAPTION_PROBLEM", "CORRECTION_DIRECTION", "REASON")
 THREE_LABELS = ("CAPTION_PROBLEM", "CORRECTION_DIRECTION", "REASON")
 CAPTION_TO_MASK_SUCCESS_IOU_THRESHOLD = 0.5
-LOW_IOU_TEACHER_REGENERATE_THRESHOLD = 0.3
-HIGH_QUALITY_IOU_THRESHOLD = 0.8
+LOW_IOU_TEACHER_REGENERATE_THRESHOLD = 0.5
+HIGH_QUALITY_IOU_THRESHOLD = 0.9
 TEACHER_REGENERATE_ROUTE = "teacher_regenerate"
 ON_POLICY_DISTILL_ROUTE = "on_policy_distill"
 GRPO_POSITIVE_ROUTE = "grpo_positive"
@@ -163,7 +163,7 @@ def classify_teacher_route(
     high_threshold=HIGH_QUALITY_IOU_THRESHOLD,
 ):
     iou = float(iou)
-    if iou <= float(low_threshold):
+    if iou < float(low_threshold):
         return TEACHER_REGENERATE_ROUTE
     if iou >= float(high_threshold):
         return GRPO_POSITIVE_ROUTE

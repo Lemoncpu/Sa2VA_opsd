@@ -71,8 +71,8 @@ class Sa2VAOPSDModelV2(BaseModel):
         teacher_temperature=1.0,
         jsd_beta=0.5,
         privileged_iou_precision=4,
-        iou_low_threshold=0.3,
-        iou_high_threshold=0.8,
+        iou_low_threshold=0.5,
+        iou_high_threshold=0.9,
         mid_iou_alpha=1.0,
         entropy_weight_beta=1.0,
         grpo_group_size=2,
@@ -93,7 +93,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         use_flash_attn=True,
         use_mask_focused_caption_image=True,
         mask_focused_context_mode="grayscale",
-        caption_quality_reward_weight=0.1,
+        caption_quality_reward_weight=0.0,
         caption_reward_valid_bonus=0.05,
         caption_reward_sufficient_bonus=0.1,
         caption_reward_generic_penalty=0.25,
@@ -103,10 +103,10 @@ class Sa2VAOPSDModelV2(BaseModel):
         caption_reward_scene_spill_penalty=0.2,
         caption_reward_low_density_penalty=0.2,
         caption_low_density_length_threshold=28,
-        grpo_low_iou_penalty=0.3,
-        grpo_very_low_iou_penalty=0.45,
-        grpo_zero_iou_penalty=0.7,
-        grpo_missing_mask_penalty=0.9,
+        grpo_low_iou_penalty=0.0,
+        grpo_very_low_iou_penalty=0.0,
+        grpo_zero_iou_penalty=0.0,
+        grpo_missing_mask_penalty=0.0,
         enable_invalid_caption_recovery=True,
         use_online_route_for_loss=True,
         max_teacher_regenerate_fraction=0.2,
@@ -168,7 +168,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         self.min_caption_tokens = max(int(min_caption_tokens), 1)
         self.use_mask_focused_caption_image = bool(use_mask_focused_caption_image)
         self.mask_focused_context_mode = str(mask_focused_context_mode).lower().strip()
-        self.caption_quality_reward_weight = float(caption_quality_reward_weight)
+        del caption_quality_reward_weight
         self.caption_reward_valid_bonus = float(caption_reward_valid_bonus)
         self.caption_reward_sufficient_bonus = float(caption_reward_sufficient_bonus)
         self.caption_reward_generic_penalty = float(caption_reward_generic_penalty)
@@ -178,10 +178,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         self.caption_reward_scene_spill_penalty = float(caption_reward_scene_spill_penalty)
         self.caption_reward_low_density_penalty = float(caption_reward_low_density_penalty)
         self.caption_low_density_length_threshold = max(int(caption_low_density_length_threshold), 1)
-        self.grpo_low_iou_penalty = float(grpo_low_iou_penalty)
-        self.grpo_very_low_iou_penalty = float(grpo_very_low_iou_penalty)
-        self.grpo_zero_iou_penalty = float(grpo_zero_iou_penalty)
-        self.grpo_missing_mask_penalty = float(grpo_missing_mask_penalty)
+        del grpo_low_iou_penalty, grpo_very_low_iou_penalty, grpo_zero_iou_penalty, grpo_missing_mask_penalty
         self.enable_invalid_caption_recovery = bool(enable_invalid_caption_recovery)
         self.use_online_route_for_loss = bool(use_online_route_for_loss)
         self.max_teacher_regenerate_fraction = float(max_teacher_regenerate_fraction)
@@ -216,8 +213,6 @@ class Sa2VAOPSDModelV2(BaseModel):
         self._cumulative_grpo_sum = 0.0
         self._cumulative_grpo_reward_sum = 0.0
         self._cumulative_grpo_reward_count = 0
-        self._cumulative_grpo_quality_reward_sum = 0.0
-        self._cumulative_grpo_iou_reward_sum = 0.0
         self._cumulative_recovery_caption_count = 0
         self._cumulative_invalid_caption_penalty_count = 0
         self._cumulative_hard_reconstruct_failure_count = 0
@@ -852,19 +847,9 @@ class Sa2VAOPSDModelV2(BaseModel):
                 reward -= self.caption_reward_low_density_penalty
         return reward
 
-    def _grpo_low_iou_penalty_for_value(self, *, iou, pred_mask_missing):
-        if pred_mask_missing:
-            return self.grpo_missing_mask_penalty
-        iou = float(iou)
-        if iou == 0.0:
-            return self.grpo_zero_iou_penalty
-        if iou < 0.1:
-            return 0.6
-        if iou < 0.2:
-            return self.grpo_very_low_iou_penalty
-        if iou < self.iou_low_threshold:
-            return self.grpo_low_iou_penalty
-        return 0.0
+    @staticmethod
+    def _format_float_list(values):
+        return "[" + ", ".join(f"{float(value):.4f}" for value in values) + "]"
 
     @staticmethod
     def _has_repetitive_caption_pattern(caption):
@@ -1001,8 +986,23 @@ class Sa2VAOPSDModelV2(BaseModel):
         primary_template = self.reconstruct_question_templates[0]
         return [primary_template.format(caption=caption, class_name=caption)]
 
-    def _teacher_regenerate_iou_threshold(self, student_iou):
-        return max(float(self.iou_low_threshold), float(student_iou) + 0.1)
+    @staticmethod
+    def _teacher_regenerate_iou_improvement(student_iou, teacher_iou):
+        return float(teacher_iou) - float(student_iou)
+
+    @staticmethod
+    def _teacher_regenerate_gate_passed(student_iou, teacher_iou):
+        return (float(teacher_iou) - float(student_iou)) > 0.5
+
+    def _grpo_reward_from_iou(self, *, iou, pred_mask_missing):
+        if pred_mask_missing:
+            return -2.0
+        iou = float(iou)
+        if iou >= self.iou_high_threshold:
+            return 1.0
+        if iou >= self.iou_low_threshold:
+            return -1.0 + (iou - self.iou_low_threshold) / (self.iou_high_threshold - self.iou_low_threshold)
+        return -2.0
 
     @staticmethod
     def _invalid_reconstruction_placeholder(status):
@@ -2424,15 +2424,14 @@ class Sa2VAOPSDModelV2(BaseModel):
         gt_mask,
     ):
         rollout_entries = []
-        quality_reward_sum = 0.0
-        iou_reward_sum = 0.0
+        rollout_ious = []
+        rollout_rewards = []
         descriptions = self._sample_grpo_descriptions(
             image=image,
             prompt_masks=prompt_masks,
             student_question=student_question,
         )
         for description in descriptions:
-            quality_reward = self._caption_quality_reward(description.clean_caption, description.status)
             completion_ids = description.completion_ids
             if completion_ids.shape[1] == 0:
                 continue
@@ -2444,16 +2443,11 @@ class Sa2VAOPSDModelV2(BaseModel):
                 gt_mask=gt_mask,
             )
             pred_mask = None if reconstruction is None else reconstruction.pred_mask
-            iou_reward = 0.0
-            effective_iou = 0.0
-            if pred_mask is None:
-                reward_value = self.caption_quality_reward_weight * quality_reward
-            else:
-                iou_reward = float(self._compute_iou(gt_mask, pred_mask))
-                effective_iou = iou_reward
-                reward_value = iou_reward + self.caption_quality_reward_weight * quality_reward
-            reward_value -= self._grpo_low_iou_penalty_for_value(
-                iou=effective_iou,
+            recon_iou = 0.0
+            if pred_mask is not None:
+                recon_iou = float(self._compute_iou(gt_mask, pred_mask))
+            reward_value = self._grpo_reward_from_iou(
+                iou=recon_iou,
                 pred_mask_missing=pred_mask is None,
             )
             with self._temporary_eval_model(self.student_model):
@@ -2471,18 +2465,24 @@ class Sa2VAOPSDModelV2(BaseModel):
                         completion_ids,
                     )
             old_token_log_probs = self._materialize_autograd_input(old_token_log_probs.detach())
-            quality_reward_sum += quality_reward
-            iou_reward_sum += iou_reward
+            rollout_ious.append(recon_iou)
+            rollout_rewards.append(reward_value)
             rollout_entries.append(
                 {
                     "completion_ids": completion_ids,
                     "old_token_log_probs": old_token_log_probs,
                     "reward_value": reward_value,
+                    "recon_iou": recon_iou,
                 }
             )
 
         if not rollout_entries:
-            return None, {"reward_sum": 0.0, "reward_count": 0, "quality_reward_sum": 0.0, "iou_reward_sum": 0.0}
+            return None, {
+                "reward_sum": 0.0,
+                "reward_count": 0,
+                "rollout_ious": [],
+                "rollout_rewards": [],
+            }
 
         reward_tensor = torch.tensor(
             [entry["reward_value"] for entry in rollout_entries],
@@ -2531,16 +2531,16 @@ class Sa2VAOPSDModelV2(BaseModel):
         return sample_losses.mean(), {
             "reward_sum": float(reward_tensor.sum().item()),
             "reward_count": len(rollout_entries),
-            "quality_reward_sum": float(quality_reward_sum),
-            "iou_reward_sum": float(iou_reward_sum),
+            "rollout_ious": rollout_ious,
+            "rollout_rewards": rollout_rewards,
         }
 
     def compute_grpo_losses_batch(self, batch_items):
         sample_losses = []
         reward_sum = 0.0
         reward_count = 0
-        quality_reward_sum = 0.0
-        iou_reward_sum = 0.0
+        rollout_ious = []
+        rollout_rewards = []
         for item in batch_items:
             sample_loss, grpo_meta = self.compute_grpo_loss(
                 image=item["image"],
@@ -2550,22 +2550,22 @@ class Sa2VAOPSDModelV2(BaseModel):
             )
             reward_sum += grpo_meta["reward_sum"]
             reward_count += grpo_meta["reward_count"]
-            quality_reward_sum += grpo_meta.get("quality_reward_sum", 0.0)
-            iou_reward_sum += grpo_meta.get("iou_reward_sum", 0.0)
+            rollout_ious.extend(grpo_meta.get("rollout_ious", []))
+            rollout_rewards.extend(grpo_meta.get("rollout_rewards", []))
             if sample_loss is not None:
                 sample_losses.append(sample_loss)
         if not sample_losses:
             return self._empty_loss_vector(), {
-                "reward_sum": 0.0,
-                "reward_count": 0,
-                "quality_reward_sum": 0.0,
-                "iou_reward_sum": 0.0,
+                "reward_sum": reward_sum,
+                "reward_count": reward_count,
+                "rollout_ious": rollout_ious,
+                "rollout_rewards": rollout_rewards,
             }
         return torch.stack(sample_losses), {
             "reward_sum": reward_sum,
             "reward_count": reward_count,
-            "quality_reward_sum": quality_reward_sum,
-            "iou_reward_sum": iou_reward_sum,
+            "rollout_ious": rollout_ious,
+            "rollout_rewards": rollout_rewards,
         }
     def forward(self, data, data_samples=None, mode="loss"):
         del data_samples, mode
@@ -2605,8 +2605,8 @@ class Sa2VAOPSDModelV2(BaseModel):
         total_grpo = None
         grpo_reward_sum = 0.0
         grpo_reward_count = 0
-        grpo_quality_reward_sum = 0.0
-        grpo_iou_reward_sum = 0.0
+        grpo_rollout_ious = []
+        grpo_rollout_rewards = []
         recovery_caption_count = 0
         invalid_caption_penalty_count = 0
         hard_reconstruct_failure_count = 0
@@ -2750,13 +2750,12 @@ class Sa2VAOPSDModelV2(BaseModel):
                     teacher_iou_plain = (
                         self._compute_iou(gt_mask_np, teacher_pred_mask) if teacher_pred_mask is not None else 0.0
                     )
-                    teacher_gate_threshold = self._teacher_regenerate_iou_threshold(0.0)
                     teacher_reconstruct_ok = (
                         teacher_reconstruction is not None
                         and teacher_reconstruction.status == "ok"
                         and teacher_pred_mask is not None
                     )
-                    if teacher_reconstruct_ok and teacher_iou_plain >= teacher_gate_threshold:
+                    if teacher_reconstruct_ok and self._teacher_regenerate_gate_passed(0.0, teacher_iou_plain):
                         regen_entries.append(
                             {
                                 "image": image,
@@ -2868,13 +2867,12 @@ class Sa2VAOPSDModelV2(BaseModel):
                     teacher_iou_plain = (
                         self._compute_iou(gt_mask_np, teacher_pred_mask) if teacher_pred_mask is not None else 0.0
                     )
-                    teacher_gate_threshold = self._teacher_regenerate_iou_threshold(iou)
                     teacher_reconstruct_ok = (
                         teacher_reconstruction is not None
                         and teacher_reconstruction.status == "ok"
                         and teacher_pred_mask is not None
                     )
-                    if teacher_reconstruct_ok and teacher_iou_plain >= teacher_gate_threshold:
+                    if teacher_reconstruct_ok and self._teacher_regenerate_gate_passed(iou, teacher_iou_plain):
                         regen_entries.append(
                             {
                                 "image": image,
@@ -2971,8 +2969,8 @@ class Sa2VAOPSDModelV2(BaseModel):
             grpo_losses, grpo_meta = self.compute_grpo_losses_batch(grpo_entries)
             grpo_reward_sum += grpo_meta["reward_sum"]
             grpo_reward_count += grpo_meta["reward_count"]
-            grpo_quality_reward_sum += grpo_meta.get("quality_reward_sum", 0.0)
-            grpo_iou_reward_sum += grpo_meta.get("iou_reward_sum", 0.0)
+            grpo_rollout_ious.extend(grpo_meta.get("rollout_ious", []))
+            grpo_rollout_rewards.extend(grpo_meta.get("rollout_rewards", []))
             if grpo_losses.numel() > 0:
                 grpo_loss_count += int(grpo_losses.shape[0])
                 grpo_loss_sum = grpo_losses.sum()
@@ -3005,8 +3003,6 @@ class Sa2VAOPSDModelV2(BaseModel):
         self._cumulative_iou_sum += total_iou
         self._cumulative_grpo_reward_sum += grpo_reward_sum
         self._cumulative_grpo_reward_count += grpo_reward_count
-        self._cumulative_grpo_quality_reward_sum += grpo_quality_reward_sum
-        self._cumulative_grpo_iou_reward_sum += grpo_iou_reward_sum
         self._cumulative_recovery_caption_count += recovery_caption_count
         self._cumulative_invalid_caption_penalty_count += invalid_caption_penalty_count
         self._cumulative_hard_reconstruct_failure_count += hard_reconstruct_failure_count
@@ -3064,8 +3060,6 @@ class Sa2VAOPSDModelV2(BaseModel):
         cumulative_onpolicy_jsd = self._cumulative_onpolicy_jsd_sum / max(self._cumulative_onpolicy_loss_count, 1)
         cumulative_grpo = self._cumulative_grpo_sum / max(self._cumulative_grpo_loss_count, 1)
         cumulative_grpo_reward_mean = self._cumulative_grpo_reward_sum / max(self._cumulative_grpo_reward_count, 1)
-        cumulative_grpo_quality_reward_mean = self._cumulative_grpo_quality_reward_sum / max(self._cumulative_grpo_reward_count, 1)
-        cumulative_grpo_iou_reward_mean = self._cumulative_grpo_iou_reward_sum / max(self._cumulative_grpo_reward_count, 1)
         cumulative_recovery_caption_rate = self._cumulative_recovery_caption_count / cumulative_nonempty_gt_count
         cumulative_invalid_caption_penalty_rate = self._cumulative_invalid_caption_penalty_count / cumulative_nonempty_gt_count
         cumulative_caption_empty_rate = self._cumulative_description_empty_count / cumulative_nonempty_gt_count
@@ -3155,6 +3149,8 @@ class Sa2VAOPSDModelV2(BaseModel):
         batch_teacher_regenerate_verified_iou_mean = (
             teacher_regenerate_verified_iou_sum / max(teacher_regenerate_verified_count, 1)
         )
+        grpo_rollout_ious_text = self._format_float_list(grpo_rollout_ious)
+        grpo_rollout_rewards_text = self._format_float_list(grpo_rollout_rewards)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             if torch.distributed.get_rank() == 0:
                 print(
@@ -3170,7 +3166,9 @@ class Sa2VAOPSDModelV2(BaseModel):
                     f"teacher_regen_verified_iou_mean={batch_teacher_regenerate_verified_iou_mean:.4f} "
                     f"teacher_regenerate_ce_applied={teacher_regenerate_ce_applied_count} "
                     f"teacher_regenerate_suppressed={teacher_regenerate_suppressed_count} "
-                    f"cum_avg_caption_tokens={cumulative_avg_caption_tokens:.2f}"
+                    f"cum_avg_caption_tokens={cumulative_avg_caption_tokens:.2f} "
+                    f"grpo_rollout_ious={grpo_rollout_ious_text} "
+                    f"grpo_rollout_rewards={grpo_rollout_rewards_text}"
                 )
         else:
             print(
@@ -3186,7 +3184,9 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"teacher_regen_verified_iou_mean={batch_teacher_regenerate_verified_iou_mean:.4f} "
                 f"teacher_regenerate_ce_applied={teacher_regenerate_ce_applied_count} "
                 f"teacher_regenerate_suppressed={teacher_regenerate_suppressed_count} "
-                f"cum_avg_caption_tokens={cumulative_avg_caption_tokens:.2f}"
+                f"cum_avg_caption_tokens={cumulative_avg_caption_tokens:.2f} "
+                f"grpo_rollout_ious={grpo_rollout_ious_text} "
+                f"grpo_rollout_rewards={grpo_rollout_rewards_text}"
             )
         metrics = {
             "loss_opsd_total": avg_total_loss,

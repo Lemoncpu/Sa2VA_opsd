@@ -35,8 +35,8 @@ student_question = DEFAULT_MASK_TO_CAPTION_QUESTION
 
 device = _getenv("SA2VA_REFCOCO_DEVICE", "cuda:0")
 limit = int(_getenv("SA2VA_REFCOCO_LIMIT", "100"))
-iou_low_threshold = float(_getenv("SA2VA_REFCOCO_IOU_LOW_THRESHOLD", "0.3"))
-iou_high_threshold = float(_getenv("SA2VA_REFCOCO_IOU_HIGH_THRESHOLD", "0.8"))
+iou_low_threshold = float(_getenv("SA2VA_REFCOCO_IOU_LOW_THRESHOLD", "0.5"))
+iou_high_threshold = float(_getenv("SA2VA_REFCOCO_IOU_HIGH_THRESHOLD", "0.9"))
 low_iou_regen_max_new_tokens = int(_getenv("SA2VA_REFCOCO_LOW_IOU_REGEN_MAX_NEW_TOKENS", "48"))
 output_dir = _getenv(
     "SA2VA_REFCOCO_TEACHER_2B_OUTPUT_DIR",
