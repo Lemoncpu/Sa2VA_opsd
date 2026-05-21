@@ -14,6 +14,8 @@ def sa2va_opsd_collect_fn_v2(
             "prompt_masks": [instance["prompt_masks"] for instance in instances],
             "student_questions": [instance["student_question"] for instance in instances],
             "gt_masks": [instance["gt_mask"] for instance in instances],
+            "confuser_candidate_masks": [instance.get("confuser_candidate_masks") for instance in instances],
+            "confuser_candidate_ref_ids": [instance.get("confuser_candidate_ref_ids") for instance in instances],
             "sample_keys": [instance.get("sample_key", instance.get("npz_path")) for instance in instances],
             "routes": [instance.get("route") for instance in instances],
             "route_ious": [instance.get("route_iou") for instance in instances],

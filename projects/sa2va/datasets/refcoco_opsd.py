@@ -1,6 +1,7 @@
 import json
 import os
 import random
+from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -104,20 +105,19 @@ def build_refcoco_opsd_records(
         image_path = os.path.join(resolved_image_root, image_info["file_name"])
         if skip_missing_images and not os.path.exists(image_path):
             continue
-        records.append(
-            {
-                "sample_key": f"{dataset_name}:{split}:ref_id={ref['ref_id']}",
+        record = {
+            "sample_key": f"{dataset_name}:{split}:ref_id={ref['ref_id']}",
+            "image_path": image_path,
+            "gt_mask": gt_mask,
+            "meta": {
+                "ref_id": ref["ref_id"],
+                "ann_id": ref["ann_id"],
+                "image_id": ref["image_id"],
                 "image_path": image_path,
-                "gt_mask": gt_mask,
-                "meta": {
-                    "ref_id": ref["ref_id"],
-                    "ann_id": ref["ann_id"],
-                    "image_id": ref["image_id"],
-                    "image_path": image_path,
-                    "ref_sentences": [sent["sent"] for sent in ref.get("sentences", [])],
-                },
-            }
-        )
+                "ref_sentences": [sent["sent"] for sent in ref.get("sentences", [])],
+            },
+        }
+        records.append(record)
     return records, resolved_image_root
 
 
@@ -180,6 +180,9 @@ class Sa2VAOpsdRefCocoDataset(Dataset):
             )
         if shuffle:
             random.shuffle(self._base_records)
+        self._records_by_image_id = defaultdict(list)
+        for record in self._base_records:
+            self._records_by_image_id[record["meta"]["image_id"]].append(record)
         self.records = list(self._base_records)
         self.load_route_manifest(required=self.route_manifest_required)
         self._apply_route_manifest_filter()
@@ -300,11 +303,20 @@ class Sa2VAOpsdRefCocoDataset(Dataset):
         gt_mask = torch.from_numpy(np.asarray(record["gt_mask"]).astype(np.uint8))
         if self.skip_empty_masks and int(gt_mask.sum().item()) == 0:
             raise ValueError(f"Empty ground-truth mask in {record['sample_key']}")
+        confuser_candidate_masks = []
+        confuser_candidate_ref_ids = []
+        for peer_record in self._records_by_image_id.get(record["meta"]["image_id"], []):
+            if peer_record["sample_key"] == record["sample_key"]:
+                continue
+            confuser_candidate_masks.append(np.asarray(peer_record["gt_mask"]).astype(np.uint8))
+            confuser_candidate_ref_ids.append(peer_record["meta"]["ref_id"])
         return {
             "image": image,
             "prompt_masks": self._to_prompt_masks(gt_mask),
             "student_question": self.student_question,
             "gt_mask": gt_mask,
+            "confuser_candidate_masks": confuser_candidate_masks,
+            "confuser_candidate_ref_ids": confuser_candidate_ref_ids,
             "sample_key": record["sample_key"],
             "route": route_info.get("route"),
             "route_iou": route_info.get("iou"),

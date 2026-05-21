@@ -120,6 +120,8 @@ class Sa2VAOpsdNPZDatasetV2(Dataset):
             "prompt_masks": prompt_masks,
             "student_question": self.student_question,
             "gt_mask": gt_mask,
+            "confuser_candidate_masks": [],
+            "confuser_candidate_ref_ids": [],
             "frame1": frame1,
             "mask1": mask1,
             "frame2": frame2,

@@ -1,5 +1,6 @@
 import copy
 import inspect
+import random
 import re
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -57,6 +58,16 @@ class ReconstructionResult:
     status: str
 
 
+@dataclass
+class ConfuserSelectionResult:
+    option_probs: torch.Tensor
+    predicted_option_idx: int
+    correct_option_idx: int
+    reward: float
+    selected_correct: bool
+    correct_option_prob: float
+
+
 class Sa2VAOPSDModelV2(BaseModel):
     """Standalone OPSD implementation aligned to official sample.py usage."""
 
@@ -80,6 +91,16 @@ class Sa2VAOPSDModelV2(BaseModel):
         grpo_advantage_eps=1e-6,
         grpo_sample_temperature=1.0,
         grpo_sample_top_p=1.0,
+        grpo_confuser_num_options=4,
+        grpo_confuser_num_negatives=3,
+        grpo_confuser_min_candidates=3,
+        grpo_confuser_duplicate_iou_threshold=0.95,
+        grpo_confuser_min_area_ratio=0.001,
+        grpo_confuser_max_area_ratio=0.95,
+        grpo_confuser_nearby_center_weight=0.25,
+        grpo_confuser_overlap_weight=1.0,
+        grpo_confuser_answer_max_new_tokens=1,
+        grpo_confuser_zero_reward_on_wrong=True,
         description_max_new_tokens=96,
         description_repetition_penalty=1.1,
         description_no_repeat_ngram_size=4,
@@ -146,11 +167,26 @@ class Sa2VAOPSDModelV2(BaseModel):
         self.grpo_advantage_eps = float(grpo_advantage_eps)
         self.grpo_sample_temperature = float(grpo_sample_temperature)
         self.grpo_sample_top_p = float(grpo_sample_top_p)
+        self.grpo_confuser_num_options = max(int(grpo_confuser_num_options), 2)
+        self.grpo_confuser_num_negatives = max(int(grpo_confuser_num_negatives), 1)
+        self.grpo_confuser_min_candidates = max(int(grpo_confuser_min_candidates), self.grpo_confuser_num_negatives)
+        self.grpo_confuser_duplicate_iou_threshold = float(grpo_confuser_duplicate_iou_threshold)
+        self.grpo_confuser_min_area_ratio = float(grpo_confuser_min_area_ratio)
+        self.grpo_confuser_max_area_ratio = float(grpo_confuser_max_area_ratio)
+        self.grpo_confuser_nearby_center_weight = float(grpo_confuser_nearby_center_weight)
+        self.grpo_confuser_overlap_weight = float(grpo_confuser_overlap_weight)
+        self.grpo_confuser_answer_max_new_tokens = max(int(grpo_confuser_answer_max_new_tokens), 1)
+        self.grpo_confuser_zero_reward_on_wrong = bool(grpo_confuser_zero_reward_on_wrong)
         self.description_max_new_tokens = max(int(description_max_new_tokens), 1)
         self.description_repetition_penalty = float(description_repetition_penalty)
         self.description_no_repeat_ngram_size = max(int(description_no_repeat_ngram_size), 0)
         self.grpo_sample_max_new_tokens = max(int(grpo_sample_max_new_tokens), 1)
         self.low_iou_regen_max_new_tokens = max(int(low_iou_regen_max_new_tokens), 1)
+        if self.grpo_confuser_num_options != self.grpo_confuser_num_negatives + 1:
+            raise ValueError(
+                "grpo_confuser_num_options must equal grpo_confuser_num_negatives + 1, got "
+                f"{self.grpo_confuser_num_options} and {self.grpo_confuser_num_negatives}."
+            )
         if self.iou_low_threshold > self.iou_high_threshold:
             raise ValueError(
                 f"iou_low_threshold must be <= iou_high_threshold, got "
@@ -213,6 +249,9 @@ class Sa2VAOPSDModelV2(BaseModel):
         self._cumulative_grpo_sum = 0.0
         self._cumulative_grpo_reward_sum = 0.0
         self._cumulative_grpo_reward_count = 0
+        self._cumulative_grpo_mcq_correct_count = 0
+        self._cumulative_grpo_mcq_count = 0
+        self._cumulative_grpo_mcq_correct_conf_sum = 0.0
         self._cumulative_recovery_caption_count = 0
         self._cumulative_invalid_caption_penalty_count = 0
         self._cumulative_hard_reconstruct_failure_count = 0
@@ -269,6 +308,8 @@ class Sa2VAOPSDModelV2(BaseModel):
             padding_side="right",
             use_fast=False,
         )
+        self._grpo_option_letters = tuple(chr(ord("A") + idx) for idx in range(self.grpo_confuser_num_options))
+        self._grpo_option_token_ids = self._resolve_grpo_option_token_ids()
         try:
             self.processor = AutoProcessor.from_pretrained(
                 self.model_path,
@@ -1103,6 +1144,18 @@ class Sa2VAOPSDModelV2(BaseModel):
         if len(xs) == 0 or len(ys) == 0:
             return None
         return (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+
+    def _resolve_grpo_option_token_ids(self):
+        option_token_ids = []
+        for option_text in self._grpo_option_letters:
+            tokenized = self.tokenizer(option_text, add_special_tokens=False).input_ids
+            if len(tokenized) != 1:
+                spaced_option = f" {option_text}"
+                tokenized = self.tokenizer(spaced_option, add_special_tokens=False).input_ids
+            if len(tokenized) != 1:
+                raise ValueError(f"Unable to resolve single-token answer id for option {option_text!r}.")
+            option_token_ids.append(int(tokenized[0]))
+        return tuple(option_token_ids)
 
     def _should_debug_print(self):
         if not self.enable_debug_sample_logging:
@@ -2415,6 +2468,141 @@ class Sa2VAOPSDModelV2(BaseModel):
             )
         return descriptions
 
+    @staticmethod
+    def _mask_area_ratio(mask):
+        mask = np.asarray(mask)
+        if mask.ndim != 2:
+            return 0.0
+        return float((mask > 0).sum()) / float(max(mask.shape[0] * mask.shape[1], 1))
+
+    @staticmethod
+    def _mask_center(mask):
+        mask = np.asarray(mask)
+        ys, xs = np.where(mask > 0)
+        if len(xs) == 0 or len(ys) == 0:
+            return None
+        h, w = mask.shape
+        return (float(xs.mean()) / max(w, 1), float(ys.mean()) / max(h, 1))
+
+    @staticmethod
+    def _mask_center_distance(mask_a, mask_b):
+        center_a = Sa2VAOPSDModelV2._mask_center(mask_a)
+        center_b = Sa2VAOPSDModelV2._mask_center(mask_b)
+        if center_a is None or center_b is None:
+            return 1.0
+        return float(((center_a[0] - center_b[0]) ** 2 + (center_a[1] - center_b[1]) ** 2) ** 0.5)
+
+    def _prepare_mask_like_gt(self, gt_mask, candidate_mask):
+        gt_mask = self._to_numpy_mask(gt_mask)
+        candidate_mask = self._to_numpy_mask(candidate_mask)
+        if gt_mask.shape != candidate_mask.shape:
+            candidate_mask_t = torch.from_numpy(candidate_mask[None, None].astype(np.float32))
+            candidate_mask_t = F.interpolate(candidate_mask_t, size=gt_mask.shape, mode="nearest")[0, 0]
+            candidate_mask = (candidate_mask_t.numpy() > 0).astype(np.uint8)
+        return candidate_mask
+
+    def _score_confuser_candidate(self, gt_mask, candidate_mask):
+        overlap_iou = float(self._compute_iou(gt_mask, candidate_mask))
+        center_distance = self._mask_center_distance(gt_mask, candidate_mask)
+        return (
+            self.grpo_confuser_overlap_weight * overlap_iou
+            - self.grpo_confuser_nearby_center_weight * center_distance
+        )
+
+    def _select_confuser_masks(self, *, gt_mask, candidate_masks):
+        if candidate_masks is None:
+            candidate_masks = []
+        gt_mask = self._to_numpy_mask(gt_mask)
+        scored_candidates = []
+        for candidate_mask in candidate_masks:
+            prepared_mask = self._prepare_mask_like_gt(gt_mask, candidate_mask)
+            if int(prepared_mask.sum()) == 0:
+                continue
+            area_ratio = self._mask_area_ratio(prepared_mask)
+            if area_ratio < self.grpo_confuser_min_area_ratio or area_ratio > self.grpo_confuser_max_area_ratio:
+                continue
+            overlap_iou = float(self._compute_iou(gt_mask, prepared_mask))
+            if overlap_iou >= self.grpo_confuser_duplicate_iou_threshold:
+                continue
+            scored_candidates.append(
+                (self._score_confuser_candidate(gt_mask, prepared_mask), prepared_mask)
+            )
+        if len(scored_candidates) < self.grpo_confuser_min_candidates:
+            return None
+        scored_candidates.sort(key=lambda item: item[0], reverse=True)
+        selected_masks = []
+        for _, prepared_mask in scored_candidates:
+            is_duplicate = any(
+                float(self._compute_iou(existing_mask, prepared_mask)) >= self.grpo_confuser_duplicate_iou_threshold
+                for existing_mask in selected_masks
+            )
+            if is_duplicate:
+                continue
+            selected_masks.append(prepared_mask)
+            if len(selected_masks) >= self.grpo_confuser_num_negatives:
+                break
+        if len(selected_masks) < self.grpo_confuser_num_negatives:
+            return None
+        return selected_masks
+
+    def _build_confuser_mcq_prompt(self, caption):
+        option_text = ", ".join(self._grpo_option_letters)
+        return (
+            "<image>\n"
+            f"There are {self.grpo_confuser_num_options} candidate regions in the picture, corresponding to options {option_text}.\n"
+            "Read the caption and choose the single region option that best matches it.\n"
+            f"Caption: {caption}\n"
+            f"Answer with one uppercase letter only: {option_text}."
+        )
+
+    def _score_caption_against_mask_options(
+        self,
+        *,
+        image,
+        option_masks,
+        caption,
+        correct_option_idx,
+    ):
+        mcq_prompt = self._build_confuser_mcq_prompt(caption)
+        answer_completion_ids = [
+            self._encode_completion_from_caption(option_text)
+            for option_text in self._grpo_option_letters
+        ]
+        samples = [
+            {
+                "image": image,
+                "prompt_masks": option_masks,
+                "prompt_text": mcq_prompt,
+                "completion_ids": completion_ids,
+                "apply_mask_focus": False,
+            }
+            for completion_ids in answer_completion_ids
+        ]
+        with self._temporary_eval_model(self.student_model):
+            with torch.inference_mode():
+                answer_logits = self._forward_sequence_multi_sample_with_model(
+                    self.student_model,
+                    samples,
+                )["logits"]
+        first_step_logits = answer_logits[:, 0, :]
+        answer_token_ids = torch.tensor(self._grpo_option_token_ids, device=first_step_logits.device, dtype=torch.long)
+        answer_scores = first_step_logits.gather(dim=-1, index=answer_token_ids.unsqueeze(-1)).squeeze(-1)
+        option_probs = torch.softmax(answer_scores, dim=0)
+        predicted_option_idx = int(option_probs.argmax().item())
+        correct_option_prob = float(option_probs[correct_option_idx].item())
+        selected_correct = predicted_option_idx == int(correct_option_idx)
+        reward = correct_option_prob if selected_correct else 0.0
+        if not selected_correct and not self.grpo_confuser_zero_reward_on_wrong:
+            reward = correct_option_prob
+        return ConfuserSelectionResult(
+            option_probs=option_probs.detach(),
+            predicted_option_idx=predicted_option_idx,
+            correct_option_idx=int(correct_option_idx),
+            reward=float(reward),
+            selected_correct=selected_correct,
+            correct_option_prob=correct_option_prob,
+        )
+
     def compute_grpo_loss(
         self,
         *,
@@ -2422,10 +2610,27 @@ class Sa2VAOPSDModelV2(BaseModel):
         prompt_masks,
         student_question,
         gt_mask,
+        confuser_candidate_masks=None,
     ):
         rollout_entries = []
-        rollout_ious = []
+        rollout_mcq_confidences = []
         rollout_rewards = []
+        rollout_mcq_correct = []
+        confuser_masks = self._select_confuser_masks(
+            gt_mask=gt_mask,
+            candidate_masks=confuser_candidate_masks,
+        )
+        if confuser_masks is None:
+            return None, {
+                "reward_sum": 0.0,
+                "reward_count": 0,
+                "rollout_mcq_confidences": [],
+                "rollout_rewards": [],
+                "rollout_mcq_correct": [],
+                "mcq_correct_count": 0,
+                "mcq_total_count": 0,
+                "mcq_correct_conf_sum": 0.0,
+            }
         descriptions = self._sample_grpo_descriptions(
             image=image,
             prompt_masks=prompt_masks,
@@ -2435,21 +2640,19 @@ class Sa2VAOPSDModelV2(BaseModel):
             completion_ids = description.completion_ids
             if completion_ids.shape[1] == 0:
                 continue
-            reconstruction = self.reconstruct_mask(
+            option_masks = [self._to_numpy_mask(gt_mask), *[self._to_numpy_mask(mask) for mask in confuser_masks]]
+            random.shuffle(option_masks)
+            correct_option_idx = next(
+                idx for idx, candidate_mask in enumerate(option_masks)
+                if float(self._compute_iou(gt_mask, candidate_mask)) >= self.grpo_confuser_duplicate_iou_threshold
+            )
+            selection = self._score_caption_against_mask_options(
                 image=image,
+                option_masks=np.stack(option_masks, axis=0).astype(np.float32),
                 caption=description.clean_caption,
-                description_status=description.status,
-                spatial_hint=self._coarse_spatial_hint(gt_mask),
-                gt_mask=gt_mask,
+                correct_option_idx=correct_option_idx,
             )
-            pred_mask = None if reconstruction is None else reconstruction.pred_mask
-            recon_iou = 0.0
-            if pred_mask is not None:
-                recon_iou = float(self._compute_iou(gt_mask, pred_mask))
-            reward_value = self._grpo_reward_from_iou(
-                iou=recon_iou,
-                pred_mask_missing=pred_mask is None,
-            )
+            reward_value = selection.reward
             with self._temporary_eval_model(self.student_model):
                 with torch.inference_mode():
                     old_policy_logits = self._forward_sequence_with_model(
@@ -2465,14 +2668,16 @@ class Sa2VAOPSDModelV2(BaseModel):
                         completion_ids,
                     )
             old_token_log_probs = self._materialize_autograd_input(old_token_log_probs.detach())
-            rollout_ious.append(recon_iou)
+            rollout_mcq_confidences.append(selection.correct_option_prob)
             rollout_rewards.append(reward_value)
+            rollout_mcq_correct.append(int(selection.selected_correct))
             rollout_entries.append(
                 {
                     "completion_ids": completion_ids,
                     "old_token_log_probs": old_token_log_probs,
                     "reward_value": reward_value,
-                    "recon_iou": recon_iou,
+                    "correct_option_prob": selection.correct_option_prob,
+                    "selected_correct": bool(selection.selected_correct),
                 }
             )
 
@@ -2480,8 +2685,12 @@ class Sa2VAOPSDModelV2(BaseModel):
             return None, {
                 "reward_sum": 0.0,
                 "reward_count": 0,
-                "rollout_ious": [],
+                "rollout_mcq_confidences": [],
                 "rollout_rewards": [],
+                "rollout_mcq_correct": [],
+                "mcq_correct_count": 0,
+                "mcq_total_count": 0,
+                "mcq_correct_conf_sum": 0.0,
             }
 
         reward_tensor = torch.tensor(
@@ -2531,48 +2740,77 @@ class Sa2VAOPSDModelV2(BaseModel):
         return sample_losses.mean(), {
             "reward_sum": float(reward_tensor.sum().item()),
             "reward_count": len(rollout_entries),
-            "rollout_ious": rollout_ious,
+            "rollout_mcq_confidences": rollout_mcq_confidences,
             "rollout_rewards": rollout_rewards,
+            "rollout_mcq_correct": rollout_mcq_correct,
+            "mcq_correct_count": int(sum(rollout_mcq_correct)),
+            "mcq_total_count": int(len(rollout_mcq_correct)),
+            "mcq_correct_conf_sum": float(
+                sum(
+                    entry["correct_option_prob"]
+                    for entry in rollout_entries
+                    if entry["selected_correct"]
+                )
+            ),
         }
 
     def compute_grpo_losses_batch(self, batch_items):
         sample_losses = []
         reward_sum = 0.0
         reward_count = 0
-        rollout_ious = []
+        rollout_mcq_confidences = []
         rollout_rewards = []
+        rollout_mcq_correct = []
+        mcq_correct_count = 0
+        mcq_total_count = 0
+        mcq_correct_conf_sum = 0.0
         for item in batch_items:
             sample_loss, grpo_meta = self.compute_grpo_loss(
                 image=item["image"],
                 prompt_masks=item["prompt_masks"],
                 student_question=item["student_question"],
                 gt_mask=item["gt_mask"],
+                confuser_candidate_masks=item.get("confuser_candidate_masks"),
             )
             reward_sum += grpo_meta["reward_sum"]
             reward_count += grpo_meta["reward_count"]
-            rollout_ious.extend(grpo_meta.get("rollout_ious", []))
+            rollout_mcq_confidences.extend(grpo_meta.get("rollout_mcq_confidences", []))
             rollout_rewards.extend(grpo_meta.get("rollout_rewards", []))
+            rollout_mcq_correct.extend(grpo_meta.get("rollout_mcq_correct", []))
+            mcq_correct_count += int(grpo_meta.get("mcq_correct_count", 0))
+            mcq_total_count += int(grpo_meta.get("mcq_total_count", 0))
+            mcq_correct_conf_sum += float(grpo_meta.get("mcq_correct_conf_sum", 0.0))
             if sample_loss is not None:
                 sample_losses.append(sample_loss)
         if not sample_losses:
             return self._empty_loss_vector(), {
                 "reward_sum": reward_sum,
                 "reward_count": reward_count,
-                "rollout_ious": rollout_ious,
+                "rollout_mcq_confidences": rollout_mcq_confidences,
                 "rollout_rewards": rollout_rewards,
+                "rollout_mcq_correct": rollout_mcq_correct,
+                "mcq_correct_count": mcq_correct_count,
+                "mcq_total_count": mcq_total_count,
+                "mcq_correct_conf_sum": mcq_correct_conf_sum,
             }
         return torch.stack(sample_losses), {
             "reward_sum": reward_sum,
             "reward_count": reward_count,
-            "rollout_ious": rollout_ious,
+            "rollout_mcq_confidences": rollout_mcq_confidences,
             "rollout_rewards": rollout_rewards,
+            "rollout_mcq_correct": rollout_mcq_correct,
+            "mcq_correct_count": mcq_correct_count,
+            "mcq_total_count": mcq_total_count,
+            "mcq_correct_conf_sum": mcq_correct_conf_sum,
         }
+
     def forward(self, data, data_samples=None, mode="loss"):
         del data_samples, mode
         images = data["images"]
         prompt_masks_batch = data["prompt_masks"]
         student_questions = data["student_questions"]
         gt_masks = data["gt_masks"]
+        confuser_candidate_masks_batch = data.get("confuser_candidate_masks") or [None] * len(images)
         sample_keys = data.get("sample_keys") or data.get("npz_paths") or [None] * len(images)
         routes = data.get("routes") or [None] * len(images)
         batch_route = self._resolve_batch_route(routes)
@@ -2605,8 +2843,12 @@ class Sa2VAOPSDModelV2(BaseModel):
         total_grpo = None
         grpo_reward_sum = 0.0
         grpo_reward_count = 0
-        grpo_rollout_ious = []
+        grpo_rollout_mcq_confidences = []
         grpo_rollout_rewards = []
+        grpo_rollout_mcq_correct = []
+        grpo_mcq_correct_count = 0
+        grpo_mcq_total_count = 0
+        grpo_mcq_correct_conf_sum = 0.0
         recovery_caption_count = 0
         invalid_caption_penalty_count = 0
         hard_reconstruct_failure_count = 0
@@ -2633,8 +2875,8 @@ class Sa2VAOPSDModelV2(BaseModel):
         onpolicy_entries = []
         grpo_entries = []
 
-        for image, prompt_masks, student_question, gt_mask, sample_key, route_from_manifest in zip(
-            images, prompt_masks_batch, student_questions, gt_masks, sample_keys, routes
+        for image, prompt_masks, student_question, gt_mask, confuser_candidate_masks, sample_key, route_from_manifest in zip(
+            images, prompt_masks_batch, student_questions, gt_masks, confuser_candidate_masks_batch, sample_keys, routes
         ):
             gt_mask_np = self._to_numpy_mask(gt_mask)
             empty_gt_mask = int(gt_mask_np.sum()) == 0
@@ -2937,6 +3179,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                         "prompt_masks": prompt_masks,
                         "student_question": student_question,
                         "gt_mask": gt_mask_np,
+                        "confuser_candidate_masks": confuser_candidate_masks,
                     }
                 )
                 teacher_prompt = self._route_prompt_tag(route)
@@ -2969,8 +3212,12 @@ class Sa2VAOPSDModelV2(BaseModel):
             grpo_losses, grpo_meta = self.compute_grpo_losses_batch(grpo_entries)
             grpo_reward_sum += grpo_meta["reward_sum"]
             grpo_reward_count += grpo_meta["reward_count"]
-            grpo_rollout_ious.extend(grpo_meta.get("rollout_ious", []))
+            grpo_rollout_mcq_confidences.extend(grpo_meta.get("rollout_mcq_confidences", []))
             grpo_rollout_rewards.extend(grpo_meta.get("rollout_rewards", []))
+            grpo_rollout_mcq_correct.extend(grpo_meta.get("rollout_mcq_correct", []))
+            grpo_mcq_correct_count += int(grpo_meta.get("mcq_correct_count", 0))
+            grpo_mcq_total_count += int(grpo_meta.get("mcq_total_count", 0))
+            grpo_mcq_correct_conf_sum += float(grpo_meta.get("mcq_correct_conf_sum", 0.0))
             if grpo_losses.numel() > 0:
                 grpo_loss_count += int(grpo_losses.shape[0])
                 grpo_loss_sum = grpo_losses.sum()
@@ -3003,6 +3250,9 @@ class Sa2VAOPSDModelV2(BaseModel):
         self._cumulative_iou_sum += total_iou
         self._cumulative_grpo_reward_sum += grpo_reward_sum
         self._cumulative_grpo_reward_count += grpo_reward_count
+        self._cumulative_grpo_mcq_correct_count += grpo_mcq_correct_count
+        self._cumulative_grpo_mcq_count += grpo_mcq_total_count
+        self._cumulative_grpo_mcq_correct_conf_sum += grpo_mcq_correct_conf_sum
         self._cumulative_recovery_caption_count += recovery_caption_count
         self._cumulative_invalid_caption_penalty_count += invalid_caption_penalty_count
         self._cumulative_hard_reconstruct_failure_count += hard_reconstruct_failure_count
@@ -3060,6 +3310,12 @@ class Sa2VAOPSDModelV2(BaseModel):
         cumulative_onpolicy_jsd = self._cumulative_onpolicy_jsd_sum / max(self._cumulative_onpolicy_loss_count, 1)
         cumulative_grpo = self._cumulative_grpo_sum / max(self._cumulative_grpo_loss_count, 1)
         cumulative_grpo_reward_mean = self._cumulative_grpo_reward_sum / max(self._cumulative_grpo_reward_count, 1)
+        cumulative_grpo_mcq_acc = (
+            self._cumulative_grpo_mcq_correct_count / max(self._cumulative_grpo_mcq_count, 1)
+        )
+        cumulative_grpo_mcq_correct_conf_mean = (
+            self._cumulative_grpo_mcq_correct_conf_sum / max(self._cumulative_grpo_mcq_correct_count, 1)
+        )
         cumulative_recovery_caption_rate = self._cumulative_recovery_caption_count / cumulative_nonempty_gt_count
         cumulative_invalid_caption_penalty_rate = self._cumulative_invalid_caption_penalty_count / cumulative_nonempty_gt_count
         cumulative_caption_empty_rate = self._cumulative_description_empty_count / cumulative_nonempty_gt_count
@@ -3096,6 +3352,8 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "opsd_onpolicy_jsd": zero,
                 "opsd_grpo": zero,
                 "grpo_reward_mean": zero,
+                "grpo_mcq_acc": zero,
+                "grpo_mcq_correct_conf_mean": zero,
                 "grpo_group_size": self._metric_tensor(float(self.grpo_group_size), zero.dtype),
                 "verifier_iou": self._metric_tensor(cumulative_verifier_iou, zero.dtype),
                 "seg_correct_rate": self._metric_tensor(cumulative_seg_correct_rate, zero.dtype),
@@ -3149,7 +3407,9 @@ class Sa2VAOPSDModelV2(BaseModel):
         batch_teacher_regenerate_verified_iou_mean = (
             teacher_regenerate_verified_iou_sum / max(teacher_regenerate_verified_count, 1)
         )
-        grpo_rollout_ious_text = self._format_float_list(grpo_rollout_ious)
+        batch_grpo_mcq_acc = grpo_mcq_correct_count / max(grpo_mcq_total_count, 1)
+        batch_grpo_mcq_correct_conf_mean = grpo_mcq_correct_conf_sum / max(grpo_mcq_correct_count, 1)
+        grpo_rollout_conf_text = self._format_float_list(grpo_rollout_mcq_confidences)
         grpo_rollout_rewards_text = self._format_float_list(grpo_rollout_rewards)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             if torch.distributed.get_rank() == 0:
@@ -3167,7 +3427,9 @@ class Sa2VAOPSDModelV2(BaseModel):
                     f"teacher_regenerate_ce_applied={teacher_regenerate_ce_applied_count} "
                     f"teacher_regenerate_suppressed={teacher_regenerate_suppressed_count} "
                     f"cum_avg_caption_tokens={cumulative_avg_caption_tokens:.2f} "
-                    f"grpo_rollout_ious={grpo_rollout_ious_text} "
+                    f"grpo_mcq_acc={batch_grpo_mcq_acc:.4f} "
+                    f"grpo_mcq_correct_conf_mean={batch_grpo_mcq_correct_conf_mean:.4f} "
+                    f"grpo_rollout_confidences={grpo_rollout_conf_text} "
                     f"grpo_rollout_rewards={grpo_rollout_rewards_text}"
                 )
         else:
@@ -3185,7 +3447,9 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"teacher_regenerate_ce_applied={teacher_regenerate_ce_applied_count} "
                 f"teacher_regenerate_suppressed={teacher_regenerate_suppressed_count} "
                 f"cum_avg_caption_tokens={cumulative_avg_caption_tokens:.2f} "
-                f"grpo_rollout_ious={grpo_rollout_ious_text} "
+                f"grpo_mcq_acc={batch_grpo_mcq_acc:.4f} "
+                f"grpo_mcq_correct_conf_mean={batch_grpo_mcq_correct_conf_mean:.4f} "
+                f"grpo_rollout_confidences={grpo_rollout_conf_text} "
                 f"grpo_rollout_rewards={grpo_rollout_rewards_text}"
             )
         metrics = {
@@ -3194,6 +3458,10 @@ class Sa2VAOPSDModelV2(BaseModel):
             "opsd_onpolicy_jsd": avg_onpolicy_jsd.detach(),
             "opsd_grpo": avg_grpo.detach(),
             "grpo_reward_mean": self._metric_tensor(batch_grpo_reward_mean, avg_total_loss.dtype),
+            "grpo_mcq_acc": self._metric_tensor(cumulative_grpo_mcq_acc, avg_total_loss.dtype),
+            "grpo_mcq_correct_conf_mean": self._metric_tensor(
+                cumulative_grpo_mcq_correct_conf_mean, avg_total_loss.dtype
+            ),
             "grpo_group_size": self._metric_tensor(float(self.grpo_group_size), avg_total_loss.dtype),
             "verifier_iou": self._metric_tensor(cumulative_verifier_iou, avg_total_loss.dtype),
             "seg_correct_rate": self._metric_tensor(cumulative_seg_correct_rate, avg_total_loss.dtype),
