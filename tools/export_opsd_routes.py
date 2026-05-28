@@ -25,6 +25,7 @@ def parse_args():
     parser.add_argument("config", help="Training config path.")
     parser.add_argument("--checkpoint", default=None, help="Checkpoint to load before route export.")
     parser.add_argument("--out", required=True, help="Output JSONL path.")
+    parser.add_argument("--batch-size", type=int, default=1, help="Per-rank route export batch size.")
     parser.add_argument("--limit", type=int, default=None, help="Optional sample cap.")
     parser.add_argument(
         "--route-model",
@@ -290,6 +291,13 @@ def build_rank_shard_path(out_path: Path, rank: int, world_size: int) -> Path:
     return out_path.parent / f"{out_path.stem}.rank{rank:05d}-of-{world_size:05d}{out_path.suffix}"
 
 
+def iter_batches(items: Sequence[Dict], batch_size: int):
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}.")
+    for start in range(0, len(items), batch_size):
+        yield items[start : start + batch_size]
+
+
 def export_routes_shard(
     *,
     model,
@@ -298,6 +306,7 @@ def export_routes_shard(
     global_step: int = 0,
     route_model: str = "teacher",
     timestamp: str,
+    batch_size: int = 1,
 ):
     shard_out_path.parent.mkdir(parents=True, exist_ok=True)
     description_model = model.student_model
@@ -313,40 +322,41 @@ def export_routes_shard(
     record_count = 0
     with open(shard_out_path, "w", encoding="utf-8") as f:
         with torch.no_grad():
-            for item in samples:
-                image = Image.open(item["image_path"]).convert("RGB")
-                gt_mask = model._to_numpy_mask(item["gt_mask"])
-                prompt_masks = gt_mask.astype("float32")[None, ...]
-                route_info = model.estimate_opsd_route_for_sample_with_model(
-                    description_model=description_model,
-                    reconstruct_model=reconstruct_model,
-                    image=image,
-                    prompt_masks=prompt_masks,
-                    student_question=item["student_question"],
-                    gt_mask=gt_mask,
-                    sample_key=item["sample_key"],
-                    debug=False,
-                )
-                manifest_record = build_manifest_record(
-                    route_info,
-                    sample_key=item["sample_key"],
-                    global_step=global_step,
-                    timestamp=timestamp,
-                )
-                route = manifest_record["route"]
-                route_counts[route] = route_counts.get(route, 0) + 1
-                description_status = manifest_record.get("description_status")
-                if description_status:
-                    description_status_counts[str(description_status)] = (
-                        description_status_counts.get(str(description_status), 0) + 1
+            for batch in iter_batches(samples, batch_size):
+                for item in batch:
+                    image = Image.open(item["image_path"]).convert("RGB")
+                    gt_mask = model._to_numpy_mask(item["gt_mask"])
+                    prompt_masks = gt_mask.astype("float32")[None, ...]
+                    route_info = model.estimate_opsd_route_for_sample_with_model(
+                        description_model=description_model,
+                        reconstruct_model=reconstruct_model,
+                        image=image,
+                        prompt_masks=prompt_masks,
+                        student_question=item["student_question"],
+                        gt_mask=gt_mask,
+                        sample_key=item["sample_key"],
+                        debug=False,
                     )
-                reconstruct_status = manifest_record.get("reconstruct_status")
-                if reconstruct_status:
-                    reconstruct_status_counts[str(reconstruct_status)] = (
-                        reconstruct_status_counts.get(str(reconstruct_status), 0) + 1
+                    manifest_record = build_manifest_record(
+                        route_info,
+                        sample_key=item["sample_key"],
+                        global_step=global_step,
+                        timestamp=timestamp,
                     )
-                f.write(json.dumps(manifest_record, ensure_ascii=False) + "\n")
-                record_count += 1
+                    route = manifest_record["route"]
+                    route_counts[route] = route_counts.get(route, 0) + 1
+                    description_status = manifest_record.get("description_status")
+                    if description_status:
+                        description_status_counts[str(description_status)] = (
+                            description_status_counts.get(str(description_status), 0) + 1
+                        )
+                    reconstruct_status = manifest_record.get("reconstruct_status")
+                    if reconstruct_status:
+                        reconstruct_status_counts[str(reconstruct_status)] = (
+                            reconstruct_status_counts.get(str(reconstruct_status), 0) + 1
+                        )
+                    f.write(json.dumps(manifest_record, ensure_ascii=False) + "\n")
+                    record_count += 1
     return route_counts, description_status_counts, reconstruct_status_counts, record_count
 
 
@@ -435,6 +445,7 @@ def export_routes(
     out_path: str,
     global_step: int = 0,
     route_model: str = "teacher",
+    batch_size: int = 1,
     update_latest: bool = False,
     limit: Optional[int] = None,
     consumed_sample_keys: Optional[Sequence[str]] = None,
@@ -523,6 +534,7 @@ def export_routes(
             global_step=global_step,
             route_model=route_model,
             timestamp=timestamp,
+            batch_size=batch_size,
         )
     except Exception as exc:
         shard_ok = False
@@ -690,6 +702,7 @@ def export_routes_from_runner(
     out_path: str,
     global_step: int,
     route_model: str = "teacher",
+    batch_size: int = 1,
     limit: int = None,
     consumed_sample_keys: Optional[Sequence[str]] = None,
     only_missing_from_manifest: bool = False,
@@ -709,6 +722,7 @@ def export_routes_from_runner(
         out_path=out_path,
         global_step=global_step,
         route_model=route_model,
+        batch_size=batch_size,
         update_latest=True,
         limit=limit,
         consumed_sample_keys=consumed_sample_keys,
@@ -760,6 +774,7 @@ def main():
             out_path=args.out,
             global_step=args.global_step,
             route_model=args.route_model,
+            batch_size=args.batch_size,
             update_latest=args.update_latest,
             limit=args.limit,
             existing_manifest_path=args.out if args.only_missing_from_manifest else None,
@@ -776,6 +791,7 @@ def main():
                     "out": args.out,
                     "global_step": args.global_step,
                     "route_model": args.route_model,
+                    "batch_size": args.batch_size,
                     "world_size": export_summary["world_size"],
                     "record_count": export_summary["record_count"],
                     "route_counts": export_summary["route_counts"],

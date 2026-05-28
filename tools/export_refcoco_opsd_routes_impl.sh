@@ -32,6 +32,7 @@ GLOBAL_STEP="${GLOBAL_STEP:-0}"
 LIMIT="${LIMIT:-}"
 ONLY_MISSING_FROM_MANIFEST="${ONLY_MISSING_FROM_MANIFEST:-0}"
 DEEPSPEED="${DEEPSPEED:-deepspeed_zero2}"
+BATCH_SIZE_OVERRIDE="${BATCH_SIZE_OVERRIDE:-}"
 DEFAULT_GPUS=8
 
 count_csv_items() {
@@ -136,6 +137,7 @@ usage() {
   echo "  --cuda-devices IDS      Comma-separated CUDA ids, e.g. 0,1,3. If omitted, uses 0..N-1."
   echo "  --port N                torchrun master port. Default: random port in [29500, 30499]"
   echo "  --deepspeed NAME        Compatibility arg forwarded through tools/dist.sh. Default: deepspeed_zero2"
+  echo "  --batch-size N          Override per-device route export batch size."
   echo "  --route-model NAME      teacher | student. Default: student"
   echo "  --global-step N         Recorded global step. Default: 0"
   echo "  --limit N               Optional sample cap."
@@ -197,6 +199,10 @@ while [[ $# -gt 0 ]]; do
       DEEPSPEED="$2"
       shift 2
       ;;
+    --batch-size)
+      BATCH_SIZE_OVERRIDE="$2"
+      shift 2
+      ;;
     --route-model)
       ROUTE_MODEL="$2"
       shift 2
@@ -234,6 +240,9 @@ EXTRA_ARGS=("$@")
 
 if [[ -n "${LIMIT}" ]]; then
   validate_positive_int "--limit" "${LIMIT}"
+fi
+if [[ -n "${BATCH_SIZE_OVERRIDE}" ]]; then
+  validate_positive_int "--batch-size" "${BATCH_SIZE_OVERRIDE}"
 fi
 
 if [[ -n "${CUDA_DEVICE_IDS}" ]]; then
@@ -310,11 +319,14 @@ if [[ "${ROUTE_MODEL}" != "teacher" && "${ROUTE_MODEL}" != "student" ]]; then
   exit 1
 fi
 
+EFFECTIVE_BATCH_SIZE="${BATCH_SIZE_OVERRIDE:-1}"
+
 mkdir -p "${WORK_DIR}/route_cache"
 OUT_PATH="${WORK_DIR}/route_cache/routes_step_$(printf '%07d' "${GLOBAL_STEP}").jsonl"
 
 EXPORT_ARGS=(
   --out "${OUT_PATH}"
+  --batch-size "${EFFECTIVE_BATCH_SIZE}"
   --route-model "${ROUTE_MODEL}"
   --global-step "${GLOBAL_STEP}"
   --image-root "${IMAGE_ROOT}"
@@ -362,6 +374,8 @@ echo "  CHECKPOINT_PATH=${CHECKPOINT_PATH}"
 echo "  ROUTE_MODEL=${ROUTE_MODEL}"
 echo "  GLOBAL_STEP=${GLOBAL_STEP}"
 echo "  LIMIT=${LIMIT}"
+echo "  BATCH_SIZE_OVERRIDE=${BATCH_SIZE_OVERRIDE}"
+echo "  EFFECTIVE_BATCH_SIZE=${EFFECTIVE_BATCH_SIZE}"
 echo "  ONLY_MISSING_FROM_MANIFEST=${ONLY_MISSING_FROM_MANIFEST}"
 echo "  GPUS=${GPUS}"
 echo "  CUDA_VISIBLE_DEVICES=${CUDA_DEVICE_IDS}"
