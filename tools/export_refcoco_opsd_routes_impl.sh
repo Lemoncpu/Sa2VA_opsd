@@ -13,7 +13,7 @@ MODEL_FLAVOR="${SA2VA_REFCOCO_OPSD_MODEL_FLAVOR:-custom}"
 ENTRY_NAME="${SA2VA_REFCOCO_OPSD_ENTRY_NAME:-$(basename "$0")}"
 
 CONFIG="${CONFIG:-${DEFAULT_CONFIG}}"
-ACTIVATE_SCRIPT="${ACTIVATE_SCRIPT:-.venv/bin/activate}"
+ACTIVATE_SCRIPT="${ACTIVATE_SCRIPT:-}"
 GPUS="${GPUS:-}"
 PORT="${PORT:-$((29500 + RANDOM % 1000))}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
@@ -142,9 +142,13 @@ realign_venv_from_activate() {
 resolve_python_bin() {
   local candidate
   local candidates=()
+  local context_message="${1:-}"
 
   if [[ -n "${VIRTUAL_ENV:-}" ]]; then
     candidates+=("${VIRTUAL_ENV}/bin/python" "${VIRTUAL_ENV}/bin/python3")
+  fi
+  if [[ -n "${SA2VA_PYTHON:-}" ]]; then
+    candidates=("${SA2VA_PYTHON}" "${candidates[@]}")
   fi
   candidates+=("$(command -v python 2>/dev/null || true)")
   candidates+=("$(command -v python3 2>/dev/null || true)")
@@ -157,9 +161,11 @@ resolve_python_bin() {
     fi
   done
 
-  echo "No usable python interpreter found after activating ${ACTIVATE_SCRIPT}." >&2
-  echo "This usually means the mounted .venv was created on another machine/path and is no longer relocatable." >&2
-  echo "Rebuild the virtual environment inside the target image, or pass --activate-script for a venv created on that machine." >&2
+  if [[ -n "${context_message}" ]]; then
+    echo "${context_message}" >&2
+  fi
+  echo "No usable python interpreter found." >&2
+  echo "Provide SA2VA_PYTHON, pass --activate-script for a valid environment, or ensure python/python3 is available in the image PATH." >&2
   exit 127
 }
 
@@ -203,7 +209,7 @@ usage() {
   echo "  --model-path PATH       Base model path. Default: ${DEFAULT_MODEL_PATH}"
   echo "  --tokenizer-path PATH   Tokenizer path. Default: ${DEFAULT_TOKENIZER_PATH}"
   echo "  --checkpoint PATH       Optional checkpoint used to estimate initial routes."
-  echo "  --activate-script PATH  Activation script. Default: .venv/bin/activate"
+  echo "  --activate-script PATH  Optional activation script. Default: empty (use image PATH python)."
   echo "  --data-root PATH        RefCOCO annotation root or its parent directory. Default: /data/xiaoyicheng/refcoco"
   echo "  --image-root PATH       train2014 image directory. Default: /data/xiaoyicheng/refcoco/train2014"
   echo "  --dataset NAME          refcoco | refcoco_plus | refcoco+ | refcocog. Default: refcoco"
@@ -349,15 +355,19 @@ if [[ "${GPUS}" -ne "${CUDA_DEVICE_COUNT}" ]]; then
   exit 1
 fi
 
-if [[ ! -f "${ACTIVATE_SCRIPT}" ]]; then
-  echo "Activate script does not exist: ${ACTIVATE_SCRIPT}" >&2
-  exit 1
-fi
+if [[ -n "${ACTIVATE_SCRIPT}" ]]; then
+  if [[ ! -f "${ACTIVATE_SCRIPT}" ]]; then
+    echo "Activate script does not exist: ${ACTIVATE_SCRIPT}" >&2
+    exit 1
+  fi
 
-# shellcheck disable=SC1090
-source "${ACTIVATE_SCRIPT}"
-realign_venv_from_activate "${ACTIVATE_SCRIPT}"
-resolve_python_bin
+  # shellcheck disable=SC1090
+  source "${ACTIVATE_SCRIPT}"
+  realign_venv_from_activate "${ACTIVATE_SCRIPT}"
+  resolve_python_bin "No usable python interpreter found after activating ${ACTIVATE_SCRIPT}. This usually means the mounted .venv was created on another machine/path and is no longer relocatable."
+else
+  resolve_python_bin
+fi
 validate_export_environment
 
 REFCOCO_ROOT="${DATA_ROOT}"
