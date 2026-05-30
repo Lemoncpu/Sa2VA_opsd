@@ -163,6 +163,38 @@ resolve_python_bin() {
   exit 127
 }
 
+validate_export_environment() {
+  "${PYTHON_BIN}" - <<'PY'
+import sys
+
+errors = []
+
+try:
+    import torch  # noqa: F401
+except Exception as exc:
+    errors.append(f"torch import failed: {exc}")
+
+try:
+    from mmengine.config import DictAction  # noqa: F401
+except Exception as exc:
+    errors.append(f"mmengine import failed: {exc}")
+
+try:
+    from PIL import Image  # noqa: F401
+except Exception as exc:
+    errors.append(f"Pillow import failed: {exc}")
+
+if errors:
+    raise SystemExit(
+        "Active environment is missing OPSD export dependencies. "
+        f"python={sys.executable}. "
+        + " ".join(errors)
+    )
+
+print(f"export env OK: {sys.executable}")
+PY
+}
+
 usage() {
   echo "Usage:"
   echo "  bash tools/${ENTRY_NAME} [options] [-- extra export args]"
@@ -326,6 +358,7 @@ fi
 source "${ACTIVATE_SCRIPT}"
 realign_venv_from_activate "${ACTIVATE_SCRIPT}"
 resolve_python_bin
+validate_export_environment
 
 REFCOCO_ROOT="${DATA_ROOT}"
 if [[ "$(basename "${DATA_ROOT}")" == "refcoco" ]]; then
