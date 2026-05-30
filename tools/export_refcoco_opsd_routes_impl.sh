@@ -34,6 +34,7 @@ ONLY_MISSING_FROM_MANIFEST="${ONLY_MISSING_FROM_MANIFEST:-0}"
 DEEPSPEED="${DEEPSPEED:-deepspeed_zero2}"
 BATCH_SIZE_OVERRIDE="${BATCH_SIZE_OVERRIDE:-}"
 DEFAULT_GPUS=8
+PYTHON_BIN=""
 
 count_csv_items() {
   local csv="${1// /}"
@@ -116,6 +117,50 @@ validate_cuda_device_ids() {
     fi
     seen["${item}"]=1
   done
+}
+
+realign_venv_from_activate() {
+  local activate_path="$1"
+  local activate_dir
+  local expected_venv
+
+  activate_dir="$(cd "$(dirname "${activate_path}")" && pwd)"
+  expected_venv="$(cd "${activate_dir}/.." && pwd)"
+
+  export VIRTUAL_ENV="${expected_venv}"
+  case ":${PATH}:" in
+    *":${expected_venv}/bin:"*) ;;
+    *)
+      PATH="${expected_venv}/bin:${PATH}"
+      export PATH
+      ;;
+  esac
+
+  hash -r 2>/dev/null || true
+}
+
+resolve_python_bin() {
+  local candidate
+  local candidates=()
+
+  if [[ -n "${VIRTUAL_ENV:-}" ]]; then
+    candidates+=("${VIRTUAL_ENV}/bin/python" "${VIRTUAL_ENV}/bin/python3")
+  fi
+  candidates+=("$(command -v python 2>/dev/null || true)")
+  candidates+=("$(command -v python3 2>/dev/null || true)")
+
+  for candidate in "${candidates[@]}"; do
+    if [[ -n "${candidate}" && -x "${candidate}" ]]; then
+      PYTHON_BIN="${candidate}"
+      export SA2VA_PYTHON="${PYTHON_BIN}"
+      return 0
+    fi
+  done
+
+  echo "No usable python interpreter found after activating ${ACTIVATE_SCRIPT}." >&2
+  echo "This usually means the mounted .venv was created on another machine/path and is no longer relocatable." >&2
+  echo "Rebuild the virtual environment inside the target image, or pass --activate-script for a venv created on that machine." >&2
+  exit 127
 }
 
 usage() {
@@ -279,6 +324,8 @@ fi
 
 # shellcheck disable=SC1090
 source "${ACTIVATE_SCRIPT}"
+realign_venv_from_activate "${ACTIVATE_SCRIPT}"
+resolve_python_bin
 
 REFCOCO_ROOT="${DATA_ROOT}"
 if [[ "$(basename "${DATA_ROOT}")" == "refcoco" ]]; then
@@ -360,7 +407,8 @@ export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}"
 echo "Exporting RefCOCO OPSD routes with:"
 echo "  MODEL_FLAVOR=${MODEL_FLAVOR}"
 echo "  ACTIVATE_SCRIPT=${ACTIVATE_SCRIPT}"
-echo "  PYTHON=$(command -v python)"
+echo "  VIRTUAL_ENV=${VIRTUAL_ENV:-}"
+echo "  PYTHON=${PYTHON_BIN}"
 echo "  CONFIG=${CONFIG}"
 echo "  MODEL_PATH=${MODEL_PATH}"
 echo "  TOKENIZER_PATH=${TOKENIZER_PATH}"
@@ -386,12 +434,13 @@ echo "  OUT_PATH=${OUT_PATH}"
 if [[ "${GPUS}" -eq 1 ]]; then
   PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}" \
   CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_IDS}" \
-  python tools/export_opsd_routes.py "${CONFIG}" "${EXPORT_ARGS[@]}"
+  "${PYTHON_BIN}" tools/export_opsd_routes.py "${CONFIG}" "${EXPORT_ARGS[@]}"
 else
   PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}" \
   CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_IDS}" \
   PORT="${PORT}" \
   MASTER_ADDR="${MASTER_ADDR}" \
   DEEPSPEED="${DEEPSPEED}" \
+  SA2VA_PYTHON="${PYTHON_BIN}" \
   bash tools/dist.sh export_opsd_routes "${CONFIG}" "${GPUS}" "${EXPORT_ARGS[@]}"
 fi

@@ -35,6 +35,7 @@ RESUME_PATH=""
 LOAD_FROM_PATH=""
 ROUTE_MODE="${ROUTE_MODE:-manifest}"
 DEFAULT_GPUS=8
+PYTHON_BIN=""
 
 count_csv_items() {
   local csv="${1// /}"
@@ -119,8 +120,52 @@ validate_cuda_device_ids() {
   done
 }
 
+realign_venv_from_activate() {
+  local activate_path="$1"
+  local activate_dir
+  local expected_venv
+
+  activate_dir="$(cd "$(dirname "${activate_path}")" && pwd)"
+  expected_venv="$(cd "${activate_dir}/.." && pwd)"
+
+  export VIRTUAL_ENV="${expected_venv}"
+  case ":${PATH}:" in
+    *":${expected_venv}/bin:"*) ;;
+    *)
+      PATH="${expected_venv}/bin:${PATH}"
+      export PATH
+      ;;
+  esac
+
+  hash -r 2>/dev/null || true
+}
+
+resolve_python_bin() {
+  local candidate
+  local candidates=()
+
+  if [[ -n "${VIRTUAL_ENV:-}" ]]; then
+    candidates+=("${VIRTUAL_ENV}/bin/python" "${VIRTUAL_ENV}/bin/python3")
+  fi
+  candidates+=("$(command -v python 2>/dev/null || true)")
+  candidates+=("$(command -v python3 2>/dev/null || true)")
+
+  for candidate in "${candidates[@]}"; do
+    if [[ -n "${candidate}" && -x "${candidate}" ]]; then
+      PYTHON_BIN="${candidate}"
+      export SA2VA_PYTHON="${PYTHON_BIN}"
+      return 0
+    fi
+  done
+
+  echo "No usable python interpreter found after activating ${ACTIVATE_SCRIPT}." >&2
+  echo "This usually means the mounted .venv was created on another machine/path and is no longer relocatable." >&2
+  echo "Rebuild the virtual environment inside the target image, or pass --activate-script for a venv created on that machine." >&2
+  exit 127
+}
+
 validate_flash_attn_installation() {
-  python - <<'PY'
+  "${PYTHON_BIN}" - <<'PY'
 import sys
 
 import torch
@@ -304,6 +349,8 @@ fi
 
 # shellcheck disable=SC1090
 source "${ACTIVATE_SCRIPT}"
+realign_venv_from_activate "${ACTIVATE_SCRIPT}"
+resolve_python_bin
 
 validate_flash_attn_installation
 
@@ -450,7 +497,8 @@ fi
 echo "Launching RefCOCO OPSD training with:"
 echo "  MODEL_FLAVOR=${MODEL_FLAVOR}"
 echo "  ACTIVATE_SCRIPT=${ACTIVATE_SCRIPT}"
-echo "  PYTHON=$(command -v python)"
+echo "  VIRTUAL_ENV=${VIRTUAL_ENV:-}"
+echo "  PYTHON=${PYTHON_BIN}"
 echo "  CONFIG=${CONFIG}"
 echo "  MODEL_PATH=${MODEL_PATH}"
 echo "  TOKENIZER_PATH=${TOKENIZER_PATH}"
@@ -476,5 +524,6 @@ CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_IDS}" \
 PORT="${PORT}" \
 MASTER_ADDR="${MASTER_ADDR}" \
 DEEPSPEED="${DEEPSPEED}" \
+SA2VA_PYTHON="${PYTHON_BIN}" \
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF_VALUE}" \
 bash tools/dist.sh train "${CONFIG}" "${GPUS}" "${TRAIN_ARGS[@]}"
