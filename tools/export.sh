@@ -6,6 +6,12 @@ JOB_CPU="${JOB_CPU:-80}"
 JOB_GPU="${JOB_GPU:-4}"
 JOB_MEMORY="${JOB_MEMORY:-409600}"
 CUDA_DEVICES="${CUDA_DEVICES:-0,1,2,3}"
+PROJECT_ROOT="${PROJECT_ROOT:-/mnt/shared-storage-user/dnacoding/wuyucheng/workspace/Nemotrontiaozheng/Sa2VA_opsd}"
+DATA_ROOT="${DATA_ROOT:-/mnt/shared-storage-user/dnacoding/wuyucheng/dataset/refcoco}"
+IMAGE_ROOT="${IMAGE_ROOT:-${DATA_ROOT}/train2014}"
+MODEL_PATH="${MODEL_PATH:-/mnt/shared-storage-user/dnacoding/wuyucheng/workspace/Nemotrontiaozheng/Sa2VA-4B}"
+TOKENIZER_PATH="${TOKENIZER_PATH:-${MODEL_PATH}}"
+WORK_DIR="${WORK_DIR:-${PROJECT_ROOT}/work_dirs/sa2va_opsd_refcoco_internvl3_4b_v3_manifest}"
 
 rjob submit \
   --cpu="${JOB_CPU}" \
@@ -18,15 +24,24 @@ rjob submit \
   --image registry.h.pjlab.org.cn/ailab-dnacoding/wuyucheng:test1 \
   --custom-resources brainpp.cn/fuse=1 \
   --enable-sshd \
--- bash -lc '
+-- env \
+  JOB_GPU="${JOB_GPU}" \
+  CUDA_DEVICES="${CUDA_DEVICES}" \
+  PROJECT_ROOT="${PROJECT_ROOT}" \
+  DATA_ROOT="${DATA_ROOT}" \
+  IMAGE_ROOT="${IMAGE_ROOT}" \
+  MODEL_PATH="${MODEL_PATH}" \
+  TOKENIZER_PATH="${TOKENIZER_PATH}" \
+  WORK_DIR="${WORK_DIR}" \
+  bash -lc '
 set -euo pipefail
 
-PROJECT_ROOT="${PROJECT_ROOT:-/mnt/shared-storage-user/dnacoding/wuyucheng/workspace/Nemotrontiaozheng/Sa2VA_opsd}"
-DATA_ROOT="${DATA_ROOT:-/mnt/shared-storage-user/dnacoding/wuyucheng/dataset/refcoco}"
-IMAGE_ROOT="${IMAGE_ROOT:-${DATA_ROOT}/train2014}"
-MODEL_PATH="${MODEL_PATH:-/mnt/shared-storage-user/dnacoding/wuyucheng/workspace/Nemotrontiaozheng/Sa2VA-4B}"
-TOKENIZER_PATH="${TOKENIZER_PATH:-${MODEL_PATH}}"
-WORK_DIR="${WORK_DIR:-${PROJECT_ROOT}/work_dirs/sa2va_opsd_refcoco_internvl3_4b_v3_manifest}"
+PROJECT_ROOT="${PROJECT_ROOT:?}"
+DATA_ROOT="${DATA_ROOT:?}"
+IMAGE_ROOT="${IMAGE_ROOT:?}"
+MODEL_PATH="${MODEL_PATH:?}"
+TOKENIZER_PATH="${TOKENIZER_PATH:?}"
+WORK_DIR="${WORK_DIR:?}"
 
 cd /opt
 tar -xzf vlm_env.tar.gz -C /opt/vlm
