@@ -21,7 +21,7 @@ tar -xzf vlm_env.tar.gz -C /opt/vlm
 rm vlm_env.tar.gz
 /opt/vlm/bin/python /opt/vlm/bin/conda-unpack
 
-cat > /etc/apt/sources.list <<'"'"'"'"'"'"'"'"'EOF'"'"'"'"'"'"'"'"'
+cat > /etc/apt/sources.list <<EOF
 deb http://mirrors.h.pjlab.org.cn/ubuntu/ jammy main restricted universe multiverse
 deb http://mirrors.h.pjlab.org.cn/ubuntu/ jammy-security main restricted universe multiverse
 deb http://mirrors.h.pjlab.org.cn/ubuntu/ jammy-updates main restricted universe multiverse
