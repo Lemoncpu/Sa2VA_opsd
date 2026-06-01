@@ -12,6 +12,7 @@ IMAGE_ROOT="${IMAGE_ROOT:-${DATA_ROOT}/train2014}"
 MODEL_PATH="${MODEL_PATH:-/mnt/shared-storage-user/dnacoding/wuyucheng/workspace/Nemotrontiaozheng/Sa2VA-4B}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-${MODEL_PATH}}"
 WORK_DIR="${WORK_DIR:-${PROJECT_ROOT}/work_dirs/sa2va_opsd_refcoco_internvl3_4b_v3_manifest}"
+SAM_CONFUSER_POOL_DIR="${SAM_CONFUSER_POOL_DIR:-${WORK_DIR}/sam_confuser_pool}"
 RESUME_PATH="${RESUME_PATH:-}"
 
 if [[ -z "${RESUME_PATH}" ]]; then
@@ -39,6 +40,7 @@ rjob submit \
   MODEL_PATH="${MODEL_PATH}" \
   TOKENIZER_PATH="${TOKENIZER_PATH}" \
   WORK_DIR="${WORK_DIR}" \
+  SAM_CONFUSER_POOL_DIR="${SAM_CONFUSER_POOL_DIR}" \
   RESUME_PATH="${RESUME_PATH}" \
   bash -lc '
 set -euo pipefail
@@ -50,11 +52,8 @@ IMAGE_ROOT="${IMAGE_ROOT:?}"
 MODEL_PATH="${MODEL_PATH:?}"
 TOKENIZER_PATH="${TOKENIZER_PATH:?}"
 WORK_DIR="${WORK_DIR:?}"
+SAM_CONFUSER_POOL_DIR="${SAM_CONFUSER_POOL_DIR:?}"
 RESUME_PATH="${RESUME_PATH:?}"
-LOG_FILE="${WORK_DIR}/train_resume_${JOB_GPU}gpu.log"
-
-mkdir -p "${WORK_DIR}"
-exec >"${LOG_FILE}" 2>&1 < /dev/null
 
 cd /opt
 tar -xzf vlm_env.tar.gz -C /opt/vlm
@@ -81,6 +80,7 @@ TRAIN_CMD=(
   --model-path "${MODEL_PATH}"
   --tokenizer-path "${TOKENIZER_PATH}"
   --work-dir "${WORK_DIR}"
+  --sam-confuser-pool-dir "${SAM_CONFUSER_POOL_DIR}"
   --route-mode manifest
   --resume "${RESUME_PATH}"
 )
