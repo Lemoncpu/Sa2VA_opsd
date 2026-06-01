@@ -38,6 +38,7 @@ route_refresh_interval = 50
 route_cache_dir = "./work_dirs/sa2va_opsd_refcoco_internvl3_4b_v3/route_cache"
 route_manifest_path = f"{route_cache_dir}/routes_step_0000000.jsonl"
 route_manifest_latest_path = f"{route_cache_dir}/routes_latest.jsonl"
+sam_confuser_pool_dir = "./work_dirs/refcoco_sam_confuser_pool"
 route_mode = "manifest"
 
 if route_mode not in {"manifest", "online"}:
@@ -117,6 +118,8 @@ train_dataset = dict(
     route_manifest_latest_path=route_manifest_latest_path if use_manifest_routes else None,
     route_manifest_required=use_manifest_routes,
     skip_route_manifest_skip_samples=use_manifest_routes,
+    sam_confuser_pool_dir=sam_confuser_pool_dir,
+    min_confuser_candidate_count=3,
 )
 
 train_sampler = (

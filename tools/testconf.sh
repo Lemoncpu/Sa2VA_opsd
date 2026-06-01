@@ -9,16 +9,14 @@ CUDA_DEVICES="${CUDA_DEVICES:-0,1,2,3}"
 PROJECT_ROOT="${PROJECT_ROOT:-/mnt/shared-storage-user/dnacoding/wuyucheng/workspace/Nemotrontiaozheng/Sa2VA_opsd}"
 DATA_ROOT="${DATA_ROOT:-/mnt/shared-storage-user/dnacoding/wuyucheng/dataset/refcoco}"
 IMAGE_ROOT="${IMAGE_ROOT:-${DATA_ROOT}/train2014}"
-MODEL_PATH="${MODEL_PATH:-/mnt/shared-storage-user/dnacoding/wuyucheng/workspace/Nemotrontiaozheng/Sa2VA-4B}"
-TOKENIZER_PATH="${TOKENIZER_PATH:-${MODEL_PATH}}"
 WORK_DIR="${WORK_DIR:-${PROJECT_ROOT}/work_dirs/sa2va_opsd_refcoco_internvl3_4b_v3_manifest}"
 SAM_CONFUSER_POOL_DIR="${SAM_CONFUSER_POOL_DIR:-${WORK_DIR}/sam_confuser_pool}"
-RESUME_PATH="${RESUME_PATH:-}"
-
-if [[ -z "${RESUME_PATH}" ]]; then
-  echo "RESUME_PATH is required for tools/train_resume.sh" >&2
-  exit 1
-fi
+SAM2_CONFIG="${SAM2_CONFIG:-configs/sam2/sam2_hiera_l.yaml}"
+SAM2_CHECKPOINT="${SAM2_CHECKPOINT:-${PROJECT_ROOT}/pretrained/sam2/sam21L/sam2.1_hiera_large.pt}"
+DATASET="${DATASET:-refcoco}"
+SPLIT="${SPLIT:-train}"
+LIMIT="${LIMIT:-}"
+OVERWRITE="${OVERWRITE:-0}"
 
 rjob submit \
   --cpu="${JOB_CPU}" \
@@ -37,27 +35,30 @@ rjob submit \
   PROJECT_ROOT="${PROJECT_ROOT}" \
   DATA_ROOT="${DATA_ROOT}" \
   IMAGE_ROOT="${IMAGE_ROOT}" \
-  MODEL_PATH="${MODEL_PATH}" \
-  TOKENIZER_PATH="${TOKENIZER_PATH}" \
   WORK_DIR="${WORK_DIR}" \
   SAM_CONFUSER_POOL_DIR="${SAM_CONFUSER_POOL_DIR}" \
-  RESUME_PATH="${RESUME_PATH}" \
+  SAM2_CONFIG="${SAM2_CONFIG}" \
+  SAM2_CHECKPOINT="${SAM2_CHECKPOINT}" \
+  DATASET="${DATASET}" \
+  SPLIT="${SPLIT}" \
+  LIMIT="${LIMIT}" \
+  OVERWRITE="${OVERWRITE}" \
   bash -lc '
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:?}"
 JOB_GPU="${JOB_GPU:?}"
+CUDA_DEVICES="${CUDA_DEVICES:?}"
 DATA_ROOT="${DATA_ROOT:?}"
 IMAGE_ROOT="${IMAGE_ROOT:?}"
-MODEL_PATH="${MODEL_PATH:?}"
-TOKENIZER_PATH="${TOKENIZER_PATH:?}"
 WORK_DIR="${WORK_DIR:?}"
 SAM_CONFUSER_POOL_DIR="${SAM_CONFUSER_POOL_DIR:?}"
-RESUME_PATH="${RESUME_PATH:?}"
-LOG_FILE="${WORK_DIR}/train_resume_${JOB_GPU}gpu.log"
+SAM2_CONFIG="${SAM2_CONFIG:?}"
+SAM2_CHECKPOINT="${SAM2_CHECKPOINT:?}"
+DATASET="${DATASET:?}"
+SPLIT="${SPLIT:?}"
 
 mkdir -p "${WORK_DIR}"
-exec >"${LOG_FILE}" 2>&1 < /dev/null
 
 cd /opt
 tar -xzf vlm_env.tar.gz -C /opt/vlm
@@ -75,19 +76,50 @@ apt update
 apt install -y libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
 /opt/vlm/bin/python -c "import torch, transformers; print(\"ok\")"
 
-TRAIN_CMD=(
-  bash "${PROJECT_ROOT}/tools/train_refcoco_opsd_4b.sh"
-  --gpus "${JOB_GPU}"
-  --cuda-devices "${CUDA_DEVICES}"
-  --data-root "${DATA_ROOT}"
-  --image-root "${IMAGE_ROOT}"
-  --model-path "${MODEL_PATH}"
-  --tokenizer-path "${TOKENIZER_PATH}"
-  --work-dir "${WORK_DIR}"
-  --sam-confuser-pool-dir "${SAM_CONFUSER_POOL_DIR}"
-  --route-mode manifest
-  --resume "${RESUME_PATH}"
-)
+IFS="," read -r -a CUDA_DEVICE_ARRAY <<< "${CUDA_DEVICES}"
+if [[ "${#CUDA_DEVICE_ARRAY[@]}" -ne "${JOB_GPU}" ]]; then
+  echo "JOB_GPU (${JOB_GPU}) does not match CUDA_DEVICES count (${#CUDA_DEVICE_ARRAY[@]})." >&2
+  exit 1
+fi
 
-"${TRAIN_CMD[@]}"
+mkdir -p "${SAM_CONFUSER_POOL_DIR}"
+
+PIDS=()
+for ((idx = 0; idx < JOB_GPU; idx++)); do
+  physical_device="${CUDA_DEVICE_ARRAY[$idx]}"
+  shard_log="${WORK_DIR}/conf_shard${idx}_of_${JOB_GPU}.log"
+  cmd=(
+    bash "${PROJECT_ROOT}/tools/conf.sh"
+    --data-root "${DATA_ROOT}"
+    --image-root "${IMAGE_ROOT}"
+    --dataset "${DATASET}"
+    --split "${SPLIT}"
+    --out-dir "${SAM_CONFUSER_POOL_DIR}"
+    --sam2-config "${SAM2_CONFIG}"
+    --sam2-checkpoint "${SAM2_CHECKPOINT}"
+    --device cuda:0
+    --shard-index "${idx}"
+    --num-shards "${JOB_GPU}"
+  )
+  if [[ -n "${LIMIT:-}" ]]; then
+    cmd+=(--limit "${LIMIT}")
+  fi
+  if [[ "${OVERWRITE:-0}" == "1" ]]; then
+    cmd+=(--overwrite)
+  fi
+  (
+    export CUDA_VISIBLE_DEVICES="${physical_device}"
+    "${cmd[@]}"
+  ) >"${shard_log}" 2>&1 &
+  PIDS+=("$!")
+done
+
+status=0
+for pid in "${PIDS[@]}"; do
+  if ! wait "${pid}"; then
+    status=1
+  fi
+done
+
+exit "${status}"
 '

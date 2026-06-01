@@ -34,6 +34,7 @@ PYTORCH_CUDA_ALLOC_CONF_VALUE="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Tr
 RESUME_PATH=""
 LOAD_FROM_PATH=""
 ROUTE_MODE="${ROUTE_MODE:-manifest}"
+SAM_CONFUSER_POOL_DIR="${SAM_CONFUSER_POOL_DIR:-}"
 DEFAULT_GPUS=8
 PYTHON_BIN=""
 
@@ -213,6 +214,7 @@ usage() {
   echo "  --batch-size N          Override per-device training batch size in config."
   echo "  --accumulative-counts N Override gradient accumulation steps in config."
   echo "  --route-mode MODE       manifest | online. Default: manifest"
+  echo "  --sam-confuser-pool-dir PATH  Optional root dir of per-image SAM confuser pools."
   echo "  --resume PATH           Resume from a checkpoint path."
   echo "  --load-from PATH        Load model weights from a checkpoint without restoring training state."
   echo "  -h, --help              Show this help."
@@ -285,6 +287,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --route-mode)
       ROUTE_MODE="$2"
+      shift 2
+      ;;
+    --sam-confuser-pool-dir)
+      SAM_CONFUSER_POOL_DIR="$2"
       shift 2
       ;;
     --resume)
@@ -383,6 +389,11 @@ if [[ ! -d "${IMAGE_ROOT}" ]]; then
   exit 1
 fi
 
+if [[ -n "${SAM_CONFUSER_POOL_DIR}" && ! -d "${SAM_CONFUSER_POOL_DIR}" ]]; then
+  echo "SAM confuser pool dir does not exist: ${SAM_CONFUSER_POOL_DIR}" >&2
+  exit 1
+fi
+
 if [[ ! -d "${MODEL_PATH}" ]]; then
   echo "Model path does not exist: ${MODEL_PATH}" >&2
   exit 1
@@ -471,6 +482,12 @@ TRAIN_ARGS+=(
   "train_dataloader.dataset.image_root=${IMAGE_ROOT}"
   "train_dataloader.dataset.route_mode=${ROUTE_MODE}"
 )
+if [[ -n "${SAM_CONFUSER_POOL_DIR}" ]]; then
+  TRAIN_ARGS+=(
+    "train_dataset.sam_confuser_pool_dir=${SAM_CONFUSER_POOL_DIR}"
+    "train_dataloader.dataset.sam_confuser_pool_dir=${SAM_CONFUSER_POOL_DIR}"
+  )
+fi
 if [[ "${ROUTE_MODE}" == "manifest" ]]; then
   TRAIN_ARGS+=(
     "train_dataset.route_manifest_path=${ROUTE_MANIFEST_PATH}"
@@ -525,6 +542,7 @@ echo "  DEEPSPEED=${DEEPSPEED}"
 echo "  BATCH_SIZE_OVERRIDE=${BATCH_SIZE_OVERRIDE}"
 echo "  ACCUMULATIVE_COUNTS_OVERRIDE=${ACCUMULATIVE_COUNTS_OVERRIDE}"
 echo "  ROUTE_MODE=${ROUTE_MODE}"
+echo "  SAM_CONFUSER_POOL_DIR=${SAM_CONFUSER_POOL_DIR}"
 echo "  LOAD_FROM_PATH=${LOAD_FROM_PATH}"
 echo "  RESUME_PATH=${RESUME_PATH}"
 echo "  PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF_VALUE}"
