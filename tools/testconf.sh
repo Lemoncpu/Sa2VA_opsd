@@ -74,7 +74,44 @@ EOF
 
 apt update
 apt install -y libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
-/opt/vlm/bin/python -c "import torch, transformers; print(\"ok\")"
+/opt/vlm/bin/python - <<'PY'
+import importlib
+
+for module_name in ("torch", "transformers", "PIL", "pycocotools", "hydra"):
+    importlib.import_module(module_name)
+
+print("python env ok")
+PY
+
+if [[ ! -d "${PROJECT_ROOT}" ]]; then
+  echo "PROJECT_ROOT does not exist: ${PROJECT_ROOT}" >&2
+  exit 1
+fi
+
+if [[ ! -f "${PROJECT_ROOT}/tools/conf.sh" ]]; then
+  echo "conf.sh does not exist under PROJECT_ROOT: ${PROJECT_ROOT}/tools/conf.sh" >&2
+  exit 1
+fi
+
+REFCOCO_ROOT="${DATA_ROOT}"
+if [[ "$(basename "${DATA_ROOT}")" != "refcoco" ]]; then
+  REFCOCO_ROOT="${DATA_ROOT}/refcoco"
+fi
+
+if [[ ! -d "${REFCOCO_ROOT}" ]]; then
+  echo "Expected RefCOCO annotations under: ${REFCOCO_ROOT}" >&2
+  exit 1
+fi
+
+if [[ ! -d "${IMAGE_ROOT}" ]]; then
+  echo "Image root does not exist: ${IMAGE_ROOT}" >&2
+  exit 1
+fi
+
+if [[ ! -e "${SAM2_CHECKPOINT}" ]]; then
+  echo "SAM2 checkpoint does not exist: ${SAM2_CHECKPOINT}" >&2
+  exit 1
+fi
 
 IFS="," read -r -a CUDA_DEVICE_ARRAY <<< "${CUDA_DEVICES}"
 if [[ "${#CUDA_DEVICE_ARRAY[@]}" -ne "${JOB_GPU}" ]]; then
@@ -85,6 +122,8 @@ fi
 mkdir -p "${SAM_CONFUSER_POOL_DIR}"
 
 PIDS=()
+SHARD_LOGS=()
+SHARD_DEVICE_IDS=()
 for ((idx = 0; idx < JOB_GPU; idx++)); do
   physical_device="${CUDA_DEVICE_ARRAY[$idx]}"
   shard_log="${WORK_DIR}/conf_shard${idx}_of_${JOB_GPU}.log"
@@ -112,14 +151,34 @@ for ((idx = 0; idx < JOB_GPU; idx++)); do
     "${cmd[@]}"
   ) >"${shard_log}" 2>&1 &
   PIDS+=("$!")
+  SHARD_LOGS+=("${shard_log}")
+  SHARD_DEVICE_IDS+=("${physical_device}")
 done
 
 status=0
-for pid in "${PIDS[@]}"; do
+FAILED_SHARDS=()
+for idx in "${!PIDS[@]}"; do
+  pid="${PIDS[$idx]}"
   if ! wait "${pid}"; then
     status=1
+    FAILED_SHARDS+=("${idx}")
   fi
 done
+
+if (( status != 0 )); then
+  for idx in "${FAILED_SHARDS[@]}"; do
+    shard_log="${SHARD_LOGS[$idx]}"
+    physical_device="${SHARD_DEVICE_IDS[$idx]}"
+    echo "Shard ${idx}/${JOB_GPU} failed on CUDA_VISIBLE_DEVICES=${physical_device}. Log: ${shard_log}" >&2
+    if [[ -f "${shard_log}" ]]; then
+      echo "----- tail ${shard_log} -----" >&2
+      tail -n 200 "${shard_log}" >&2 || true
+      echo "----- end tail ${shard_log} -----" >&2
+    else
+      echo "Shard log not found: ${shard_log}" >&2
+    fi
+  done
+fi
 
 exit "${status}"
 '
