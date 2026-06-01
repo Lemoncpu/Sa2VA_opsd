@@ -44,12 +44,17 @@ rjob submit \
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:?}"
+JOB_GPU="${JOB_GPU:?}"
 DATA_ROOT="${DATA_ROOT:?}"
 IMAGE_ROOT="${IMAGE_ROOT:?}"
 MODEL_PATH="${MODEL_PATH:?}"
 TOKENIZER_PATH="${TOKENIZER_PATH:?}"
 WORK_DIR="${WORK_DIR:?}"
 RESUME_PATH="${RESUME_PATH:?}"
+LOG_FILE="${WORK_DIR}/train_resume_${JOB_GPU}gpu.log"
+
+mkdir -p "${WORK_DIR}"
+exec >"${LOG_FILE}" 2>&1 < /dev/null
 
 cd /opt
 tar -xzf vlm_env.tar.gz -C /opt/vlm
