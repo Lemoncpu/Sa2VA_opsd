@@ -1187,30 +1187,16 @@ class Sa2VAOPSDModelV2(BaseModel):
             tuple(record.get("manifest_route") for record in item.get("records", []))
             for item in gathered_payloads
         }
-        final_route_signatures = {
-            tuple(record.get("final_route") for record in item.get("records", []))
+        loss_family_signatures = {
+            str(item.get("loss_family"))
             for item in gathered_payloads
         }
-        loss_presence_signatures = {
+        entry_count_signatures = {
             (
-                int(item.get("regen_entry_count", 0) > 0),
-                int(item.get("onpolicy_entry_count", 0) > 0),
-                int(item.get("grpo_entry_count", 0) > 0),
-                int(item.get("optimized_count", 0) > 0),
-            )
-            for item in gathered_payloads
-        }
-        teacher_gate_signatures = {
-            tuple(
-                (
-                    record.get("final_route"),
-                    bool(record.get("allow_teacher_ce", False)),
-                    bool(record.get("teacher_reconstruct_ok", False)),
-                    bool(record.get("teacher_gate_passed", False)),
-                    bool(record.get("entry_added", False)),
-                )
-                for record in item.get("records", [])
-                if record.get("final_route") == TEACHER_REGENERATE_ROUTE
+                int(item.get("entry_count", 0)),
+                int(item.get("real_entry_count", 0)),
+                int(item.get("dummy_entry_count", 0)),
+                int(item.get("optimized_count", 0)),
             )
             for item in gathered_payloads
         }
@@ -1218,12 +1204,10 @@ class Sa2VAOPSDModelV2(BaseModel):
         suspicious_reasons = []
         if len(manifest_route_signatures) > 1:
             suspicious_reasons.append("manifest-route-mismatch")
-        if len(final_route_signatures) > 1:
-            suspicious_reasons.append("final-route-mismatch")
-        if len(loss_presence_signatures) > 1:
-            suspicious_reasons.append("loss-entry-mismatch")
-        if len(teacher_gate_signatures) > 1:
-            suspicious_reasons.append("teacher-regen-gate-mismatch")
+        if len(loss_family_signatures) > 1:
+            suspicious_reasons.append("loss-family-mismatch")
+        if len(entry_count_signatures) > 1:
+            suspicious_reasons.append("entry-count-mismatch")
         if not suspicious_reasons:
             suspicious_reasons.append("no-obvious-mismatch-detected")
 
@@ -1240,14 +1224,15 @@ class Sa2VAOPSDModelV2(BaseModel):
                 iou_value = record.get("iou")
                 iou_text = "None" if iou_value is None else f"{float(iou_value):.4f}"
                 records_text.append(
-                    "sample_key={sample_key} manifest_route={manifest_route} final_route={final_route} "
+                    "sample_key={sample_key} manifest_route={manifest_route} loss_family={loss_family} "
                     "online_route={online_route} reconstruct_status={reconstruct_status} iou={iou} "
                     "allow_teacher_ce={allow_teacher_ce} teacher_reconstruct_ok={teacher_reconstruct_ok} "
                     "teacher_gate_passed={teacher_gate_passed} teacher_iou_plain={teacher_iou_plain} "
-                    "teacher_completion_len={teacher_completion_len} entry_added={entry_added} loss_branch={loss_branch}".format(
+                    "teacher_completion_len={teacher_completion_len} is_dummy={is_dummy} dummy_reason={dummy_reason} "
+                    "entry_added={entry_added} loss_branch={loss_branch}".format(
                         sample_key=record.get("sample_key"),
                         manifest_route=record.get("manifest_route"),
-                        final_route=record.get("final_route"),
+                        loss_family=record.get("loss_family"),
                         online_route=record.get("online_route"),
                         reconstruct_status=record.get("reconstruct_status"),
                         iou=iou_text,
@@ -1256,6 +1241,8 @@ class Sa2VAOPSDModelV2(BaseModel):
                         teacher_gate_passed=record.get("teacher_gate_passed"),
                         teacher_iou_plain=teacher_iou_text,
                         teacher_completion_len=record.get("teacher_completion_len"),
+                        is_dummy=record.get("is_dummy"),
+                        dummy_reason=record.get("dummy_reason"),
                         entry_added=record.get("entry_added"),
                         loss_branch=record.get("loss_branch"),
                     )
@@ -1263,6 +1250,11 @@ class Sa2VAOPSDModelV2(BaseModel):
             print(
                 "[Sa2VA_OPSD_V2_DDP_DEBUG] "
                 f"rank={item.get('rank')} batch_route={item.get('batch_route')} "
+                f"loss_family={item.get('loss_family')} "
+                f"entry_count={item.get('entry_count')} "
+                f"real_entry_count={item.get('real_entry_count')} "
+                f"dummy_entry_count={item.get('dummy_entry_count')} "
+                f"dummy_reasons={item.get('dummy_reasons')} "
                 f"regen_entries={item.get('regen_entry_count')} "
                 f"onpolicy_entries={item.get('onpolicy_entry_count')} "
                 f"grpo_entries={item.get('grpo_entry_count')} "
@@ -2450,6 +2442,118 @@ class Sa2VAOPSDModelV2(BaseModel):
             raise RuntimeError(f"Mixed OPSD routes in one batch: {unique_routes}")
         return unique_routes[0]
 
+    def _resolve_loss_family(self, batch_route, route_from_manifest=None, online_route=None):
+        if batch_route not in {None, "", "skip"}:
+            return str(batch_route)
+        if route_from_manifest not in {None, "", "skip"}:
+            return str(route_from_manifest)
+        if online_route not in {None, "", "skip"}:
+            return str(online_route)
+        return TEACHER_REGENERATE_ROUTE
+
+    def _build_dummy_completion_ids(self):
+        completion_ids = self._encode_completion_from_caption("the object")
+        if completion_ids.shape[1] > 0:
+            return completion_ids
+        fallback_token_id = self.tokenizer.eos_token_id
+        if fallback_token_id is None:
+            fallback_token_id = self.tokenizer.pad_token_id
+        if fallback_token_id is None:
+            fallback_token_id = 0
+        return torch.tensor([[int(fallback_token_id)]], dtype=torch.long, device=self.device)
+
+    def _build_teacher_prompt_masks(self, gt_mask_np, ref_mask_np):
+        return np.stack(
+            [
+                self._to_numpy_mask(gt_mask_np).astype(np.float32),
+                self._to_numpy_mask(ref_mask_np).astype(np.float32),
+            ],
+            axis=0,
+        )
+
+    @staticmethod
+    def _zero_ref_mask_like(mask):
+        return np.zeros_like(mask, dtype=np.uint8)
+
+    @staticmethod
+    def _merge_dummy_reasons(records):
+        reasons = []
+        for record in records:
+            reason = record.get("dummy_reason")
+            if reason:
+                reasons.append(str(reason))
+        return sorted(set(reasons))
+
+    def _attempt_teacher_regenerate_analysis(
+        self,
+        *,
+        image,
+        gt_mask_np,
+        ref_mask_np,
+        student_question,
+        description,
+        reconstruction,
+        iou,
+        allow_teacher_ce,
+    ):
+        result = {
+            "teacher_regenerate": None,
+            "teacher_reconstruct_ok": None,
+            "teacher_gate_passed": None,
+            "teacher_iou_plain": None,
+            "teacher_completion_len": None,
+        }
+        if not allow_teacher_ce:
+            return result
+
+        teacher_fields = self._build_training_teacher_fields(
+            route=TEACHER_REGENERATE_ROUTE,
+            iou=iou,
+        )
+        teacher_regenerate = self.generate_teacher_caption_with_privileged_prompt(
+            image=image,
+            gt_mask=gt_mask_np,
+            ref_mask=ref_mask_np,
+            student_question=student_question,
+            student_caption=description.clean_caption,
+            description_status=description.status,
+            reconstruction=reconstruction,
+            iou=iou,
+            teacher_fields=teacher_fields,
+        )
+        result["teacher_regenerate"] = teacher_regenerate
+        result["teacher_completion_len"] = int(teacher_regenerate.completion_ids.shape[1])
+        if teacher_regenerate.completion_ids.shape[1] == 0:
+            result["teacher_reconstruct_ok"] = False
+            result["teacher_gate_passed"] = False
+            result["teacher_iou_plain"] = 0.0
+            return result
+
+        teacher_reconstruction = self.reconstruct_mask(
+            image=image,
+            caption=teacher_regenerate.clean_caption,
+            description_status=teacher_regenerate.status,
+            gt_mask=gt_mask_np,
+        )
+        teacher_pred_mask = None if teacher_reconstruction is None else teacher_reconstruction.pred_mask
+        teacher_iou_plain = (
+            self._compute_iou(gt_mask_np, teacher_pred_mask) if teacher_pred_mask is not None else 0.0
+        )
+        teacher_reconstruct_ok = (
+            teacher_reconstruction is not None
+            and teacher_reconstruction.status == "ok"
+            and teacher_pred_mask is not None
+        )
+        teacher_gate_passed = (
+            self._teacher_regenerate_gate_passed(iou, teacher_iou_plain)
+            if teacher_reconstruct_ok
+            else False
+        )
+        result["teacher_reconstruct_ok"] = bool(teacher_reconstruct_ok)
+        result["teacher_gate_passed"] = bool(teacher_gate_passed)
+        result["teacher_iou_plain"] = float(teacher_iou_plain)
+        return result
+
     def _empty_loss_vector(self):
         return torch.empty(0, device=self.device, dtype=next(self.student_model.parameters()).dtype)
 
@@ -2471,6 +2575,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         prompt_masks,
         student_question,
         completion_ids,
+        loss_weight=1.0,
     ):
         if completion_ids.shape[1] == 0:
             return None
@@ -2482,28 +2587,32 @@ class Sa2VAOPSDModelV2(BaseModel):
             completion_ids,
             apply_mask_focus=True,
         )
-        return self._sequence_cross_entropy_from_logits(student_logits, completion_ids)
+        sample_loss = self._sequence_cross_entropy_from_logits(student_logits, completion_ids)
+        return sample_loss * float(loss_weight)
 
     def compute_regenerate_alignment_losses_batch(self, batch_items):
         sample_losses = []
-        empty_completion_count = 0
+        dummy_reasons = []
         for item in batch_items:
-            completion_ids = item["completion_ids"]
-            if completion_ids.shape[1] == 0:
-                empty_completion_count += 1
-                continue
+            completion_ids = item.get("completion_ids")
+            if completion_ids is None or completion_ids.shape[1] == 0:
+                completion_ids = self._build_dummy_completion_ids()
+            loss_weight = float(item.get("loss_weight", 1.0))
+            if loss_weight == 0.0 and item.get("dummy_reason"):
+                dummy_reasons.append(str(item["dummy_reason"]))
             sample_loss = self.compute_regenerate_alignment_loss(
                 image=item["image"],
                 prompt_masks=item["prompt_masks"],
                 student_question=item["student_question"],
                 completion_ids=completion_ids,
+                loss_weight=loss_weight,
             )
             if sample_loss is not None:
                 sample_losses.append(sample_loss)
         if not sample_losses:
             return self._placeholder_loss_vector(
                 len(batch_items),
-                reason=f"regen-empty-sample-losses empty_completion_count={empty_completion_count}",
+                reason=f"regen-empty-sample-losses dummy_reasons={','.join(dummy_reasons) or 'unknown'}",
             )
         return torch.stack(sample_losses)
 
@@ -2516,6 +2625,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         completion_ids,
         teacher_prompt_masks=None,
         iou=0.0,
+        loss_weight=1.0,
     ):
         if completion_ids.shape[1] == 0:
             return None
@@ -2546,16 +2656,18 @@ class Sa2VAOPSDModelV2(BaseModel):
         token_weights = torch.exp(-self.entropy_weight_beta * teacher_entropy)
         token_weights = token_weights / token_weights.mean(dim=-1, keepdim=True).clamp_min(1e-6)
         sample_weight = self.mid_iou_alpha * max(1.0 - float(iou), 0.0)
-        return (jsd_tokens * token_weights).mean() * sample_weight
+        return (jsd_tokens * token_weights).mean() * sample_weight * float(loss_weight)
 
     def compute_onpolicy_distill_losses_batch(self, batch_items):
         sample_losses = []
-        empty_completion_count = 0
+        dummy_reasons = []
         for item in batch_items:
-            completion_ids = item["completion_ids"]
-            if completion_ids.shape[1] == 0:
-                empty_completion_count += 1
-                continue
+            completion_ids = item.get("completion_ids")
+            if completion_ids is None or completion_ids.shape[1] == 0:
+                completion_ids = self._build_dummy_completion_ids()
+            loss_weight = float(item.get("loss_weight", 1.0))
+            if loss_weight == 0.0 and item.get("dummy_reason"):
+                dummy_reasons.append(str(item["dummy_reason"]))
             sample_loss = self.compute_onpolicy_distill_loss(
                 image=item["image"],
                 prompt_masks=item["prompt_masks"],
@@ -2564,13 +2676,14 @@ class Sa2VAOPSDModelV2(BaseModel):
                 completion_ids=completion_ids,
                 teacher_prompt_masks=item.get("teacher_prompt_masks", item["prompt_masks"]),
                 iou=float(item.get("iou", 0.0)),
+                loss_weight=loss_weight,
             )
             if sample_loss is not None:
                 sample_losses.append(sample_loss)
         if not sample_losses:
             return self._placeholder_loss_vector(
                 len(batch_items),
-                reason=f"onpolicy-empty-sample-losses empty_completion_count={empty_completion_count}",
+                reason=f"onpolicy-empty-sample-losses dummy_reasons={','.join(dummy_reasons) or 'unknown'}",
             )
         return torch.stack(sample_losses)
 
@@ -2742,11 +2855,57 @@ class Sa2VAOPSDModelV2(BaseModel):
         student_question,
         gt_mask,
         confuser_candidate_masks=None,
+        force_dummy=False,
+        dummy_reason=None,
+        dummy_completion_ids=None,
     ):
         rollout_entries = []
         rollout_mcq_confidences = []
         rollout_rewards = []
         rollout_mcq_correct = []
+        if force_dummy:
+            completion_ids = dummy_completion_ids if dummy_completion_ids is not None else self._build_dummy_completion_ids()
+            with self._temporary_eval_model(self.student_model):
+                with torch.inference_mode():
+                    old_policy_logits = self._forward_sequence_with_model(
+                        self.student_model,
+                        image,
+                        prompt_masks,
+                        student_question,
+                        completion_ids,
+                        apply_mask_focus=True,
+                    )
+                    old_token_log_probs = self._token_log_probs_from_logits(
+                        old_policy_logits,
+                        completion_ids,
+                    )
+            old_token_log_probs = self._materialize_autograd_input(old_token_log_probs.detach())
+            student_logits = self._forward_sequence_batch_with_model(
+                self.student_model,
+                image,
+                prompt_masks,
+                student_question,
+                completion_ids,
+                apply_mask_focus=True,
+            )
+            current_token_log_probs = self._token_log_probs_from_logits(
+                student_logits,
+                completion_ids,
+            )
+            ratio = torch.exp(current_token_log_probs - old_token_log_probs)
+            token_weights = torch.ones_like(ratio, dtype=ratio.dtype)
+            sample_losses = -(ratio * 0.0 * token_weights).sum(dim=-1) / token_weights.sum(dim=-1).clamp_min(1.0)
+            return sample_losses.mean(), {
+                "reward_sum": 0.0,
+                "reward_count": 0,
+                "rollout_mcq_confidences": [],
+                "rollout_rewards": [],
+                "rollout_mcq_correct": [],
+                "mcq_correct_count": 0,
+                "mcq_total_count": 0,
+                "mcq_correct_conf_sum": 0.0,
+                "skip_reason": str(dummy_reason or "forced_dummy"),
+            }
         confuser_masks = self._select_confuser_masks(
             gt_mask=gt_mask,
             candidate_masks=confuser_candidate_masks,
@@ -2905,6 +3064,9 @@ class Sa2VAOPSDModelV2(BaseModel):
                 student_question=item["student_question"],
                 gt_mask=item["gt_mask"],
                 confuser_candidate_masks=item.get("confuser_candidate_masks"),
+                force_dummy=bool(item.get("is_dummy", False)),
+                dummy_reason=item.get("dummy_reason"),
+                dummy_completion_ids=item.get("completion_ids"),
             )
             reward_sum += grpo_meta["reward_sum"]
             reward_count += grpo_meta["reward_count"]
@@ -2915,7 +3077,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             mcq_total_count += int(grpo_meta.get("mcq_total_count", 0))
             mcq_correct_conf_sum += float(grpo_meta.get("mcq_correct_conf_sum", 0.0))
             if sample_loss is not None:
-                sample_losses.append(sample_loss)
+                sample_losses.append(sample_loss * float(item.get("loss_weight", 1.0)))
             else:
                 skip_reason = grpo_meta.get("skip_reason")
                 if skip_reason:
@@ -3012,7 +3174,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         last_sample_key = None
         last_caption = ""
         last_teacher_prompt = ""
-        last_route = ""
+        last_route = batch_route or ""
         rank_debug_records = []
 
         regen_entries = []
@@ -3097,95 +3259,25 @@ class Sa2VAOPSDModelV2(BaseModel):
                 elif reconstruct_status == "empty_prediction_masks":
                     reconstruct_empty_prediction_masks_count += 1
                 reconstruct_skip_count += 1
-                last_sample_key = sample_key
-                last_route = TEACHER_REGENERATE_ROUTE
-                teacher_regenerate_count += 1
-                is_recovery_case = description.status != "ok"
-                if is_recovery_case:
-                    recovery_caption_count += 1
-                max_regen_count = max(int(np.ceil(self.max_teacher_regenerate_fraction * max(nonempty_gt_count, 1))), 1)
-                max_recovery_count = max(int(np.ceil(self.max_recovery_fraction * max(nonempty_gt_count, 1))), 1)
-                allow_teacher_ce = teacher_regenerate_ce_applied_count < max_regen_count
-                teacher_reconstruct_ok = None
-                teacher_gate_passed = None
-                teacher_iou_plain = None
-                teacher_completion_len = None
-                regen_entry_added = False
-                if is_recovery_case:
-                    allow_teacher_ce = allow_teacher_ce and (recovery_ce_applied_count < max_recovery_count)
-                if allow_teacher_ce:
-                    zero_ref_mask = np.zeros_like(gt_mask_np, dtype=np.uint8)
-                    teacher_fields = self._build_training_teacher_fields(
-                        route=TEACHER_REGENERATE_ROUTE,
-                        iou=0.0,
-                    )
-                    recovery_reconstruction = reconstruction or self._invalid_reconstruction_placeholder("skipped_invalid_description")
-                    teacher_regenerate = self.generate_teacher_caption_with_privileged_prompt(
-                        image=image,
-                        gt_mask=gt_mask_np,
-                        ref_mask=zero_ref_mask,
-                        student_question=student_question,
-                        student_caption=description.clean_caption,
-                        description_status=description.status,
-                        reconstruction=recovery_reconstruction,
-                        iou=0.0,
-                        teacher_fields=teacher_fields,
-                    )
-                    teacher_completion_len = int(teacher_regenerate.completion_ids.shape[1])
-                    teacher_reconstruction = self.reconstruct_mask(
-                        image=image,
-                        caption=teacher_regenerate.clean_caption,
-                        description_status=teacher_regenerate.status,
-                        gt_mask=gt_mask_np,
-                    )
-                    teacher_pred_mask = None if teacher_reconstruction is None else teacher_reconstruction.pred_mask
-                    teacher_iou_plain = (
-                        self._compute_iou(gt_mask_np, teacher_pred_mask) if teacher_pred_mask is not None else 0.0
-                    )
-                    teacher_reconstruct_ok = (
-                        teacher_reconstruction is not None
-                        and teacher_reconstruction.status == "ok"
-                        and teacher_pred_mask is not None
-                    )
-                    teacher_gate_passed = (
-                        self._teacher_regenerate_gate_passed(0.0, teacher_iou_plain)
-                        if teacher_reconstruct_ok
-                        else False
-                    )
-                    if teacher_reconstruct_ok and teacher_gate_passed:
-                        regen_entries.append(
-                            {
-                                "image": image,
-                                "prompt_masks": prompt_masks,
-                                "student_question": student_question,
-                                "completion_ids": teacher_regenerate.completion_ids,
-                            }
-                        )
-                        regen_entry_added = True
-                        teacher_regenerate_ce_applied_count += 1
-                        teacher_regenerate_verified_count += 1
-                        teacher_regenerate_verified_iou_sum += teacher_iou_plain
-                        if is_recovery_case:
-                            recovery_ce_applied_count += 1
-                        last_caption = teacher_regenerate.clean_caption or description.clean_caption
-                    else:
-                        teacher_regenerate_suppressed_count += 1
-                        teacher_regenerate_rejected_count += 1
-                        hard_reconstruct_failure_count += 1
-                        if is_recovery_case:
-                            recovery_suppressed_count += 1
-                        last_caption = description.clean_caption
-                else:
-                    teacher_regenerate_suppressed_count += 1
-                    hard_reconstruct_failure_count += 1
-                    if is_recovery_case:
-                        recovery_suppressed_count += 1
-                    last_caption = description.clean_caption
-                last_teacher_prompt = self._route_prompt_tag(TEACHER_REGENERATE_ROUTE)
-                self._debug_sample(
-                    sample_key=sample_key,
-                    route=TEACHER_REGENERATE_ROUTE,
-                    student_question=student_question,
+                iou = 0.0
+                ref_mask_np = self._zero_ref_mask_like(gt_mask_np)
+            else:
+                iou = self._compute_iou(gt_mask_np, pred_mask)
+                ref_mask_np = self._to_numpy_mask(pred_mask)
+                routed_count += 1
+                if iou >= 0.5:
+                    seg_correct_count += 1
+            online_route = self._route_from_iou(iou)
+            loss_family = self._resolve_loss_family(batch_route, route_from_manifest=route_from_manifest, online_route=online_route)
+            if reconstruct_status == "ok":
+                reconstruct_ok_count += 1
+            elif reconstruct_status not in {"ok", "skipped_invalid_description"}:
+                reconstruct_failed_count += 1
+
+            self._debug_sample(
+                sample_key=sample_key,
+                route=f"{loss_family} (online={online_route})" if loss_family != online_route else loss_family,
+                student_question=student_question,
                     raw_prediction=description.raw_prediction,
                     caption=description.clean_caption,
                     description_status=description.status,
@@ -3194,186 +3286,158 @@ class Sa2VAOPSDModelV2(BaseModel):
                     reconstruct_status=reconstruct_status,
                     seg_token_count=seg_token_count,
                     prediction_masks_count=prediction_masks_count,
-                    pred_mask=None,
+                    pred_mask=pred_mask,
                     gt_mask=gt_mask_np,
-                    iou=0.0,
+                    iou=iou,
                     empty_gt_mask=False,
                 )
-                rank_debug_records.append(
-                    {
-                        "sample_key": sample_key,
-                        "manifest_route": route_from_manifest,
-                        "final_route": TEACHER_REGENERATE_ROUTE,
-                        "online_route": None,
-                        "reconstruct_status": reconstruct_status,
-                        "iou": 0.0,
-                        "allow_teacher_ce": bool(allow_teacher_ce),
-                        "teacher_reconstruct_ok": teacher_reconstruct_ok,
-                        "teacher_gate_passed": teacher_gate_passed,
-                        "teacher_iou_plain": teacher_iou_plain,
-                        "teacher_completion_len": teacher_completion_len,
-                        "entry_added": regen_entry_added,
-                        "loss_branch": "teacher_regenerate_recovery",
-                    }
-                )
-                continue
 
-            iou = self._compute_iou(gt_mask_np, pred_mask)
-            ref_mask_np = self._to_numpy_mask(pred_mask)
-            online_route = self._route_from_iou(iou)
-            if self.use_online_route_for_loss:
-                route = online_route
-            else:
-                route = batch_route or route_from_manifest or online_route
-            routed_count += 1
-            if iou >= 0.5:
-                seg_correct_count += 1
-            if reconstruct_status == "ok":
-                reconstruct_ok_count += 1
-            elif reconstruct_status not in {"ok", "skipped_invalid_description"}:
-                reconstruct_failed_count += 1
-
-            self._debug_sample(
-                sample_key=sample_key,
-                route=f"{route} (online={online_route})" if route != online_route else route,
+            is_recovery_case = description.status != "ok" or pred_mask is None
+            if is_recovery_case:
+                recovery_caption_count += 1
+            max_regen_count = max(int(np.ceil(self.max_teacher_regenerate_fraction * max(nonempty_gt_count, 1))), 1)
+            max_recovery_count = max(int(np.ceil(self.max_recovery_fraction * max(nonempty_gt_count, 1))), 1)
+            allow_teacher_ce = teacher_regenerate_ce_applied_count < max_regen_count
+            if is_recovery_case:
+                allow_teacher_ce = allow_teacher_ce and (recovery_ce_applied_count < max_recovery_count)
+            effective_reconstruction = reconstruction or self._invalid_reconstruction_placeholder("skipped_invalid_description")
+            teacher_analysis = self._attempt_teacher_regenerate_analysis(
+                image=image,
+                gt_mask_np=gt_mask_np,
+                ref_mask_np=ref_mask_np,
                 student_question=student_question,
-                raw_prediction=description.raw_prediction,
-                caption=description.clean_caption,
-                description_status=description.status,
-                reconstruct_question=reconstruct_question,
-                raw_reconstruct_prediction=raw_reconstruct_prediction,
-                reconstruct_status=reconstruct_status,
-                seg_token_count=seg_token_count,
-                prediction_masks_count=prediction_masks_count,
-                pred_mask=pred_mask,
-                gt_mask=gt_mask_np,
+                description=description,
+                reconstruction=effective_reconstruction,
                 iou=iou,
-                empty_gt_mask=False,
+                allow_teacher_ce=allow_teacher_ce,
             )
+            teacher_reconstruct_ok = teacher_analysis["teacher_reconstruct_ok"]
+            teacher_gate_passed = teacher_analysis["teacher_gate_passed"]
+            teacher_iou_plain = teacher_analysis["teacher_iou_plain"]
+            teacher_completion_len = teacher_analysis["teacher_completion_len"]
+            teacher_regenerate = teacher_analysis["teacher_regenerate"]
+            if allow_teacher_ce:
+                if teacher_reconstruct_ok and teacher_gate_passed:
+                    teacher_regenerate_ce_applied_count += 1
+                    teacher_regenerate_verified_count += 1
+                    teacher_regenerate_verified_iou_sum += float(teacher_iou_plain or 0.0)
+                    if is_recovery_case:
+                        recovery_ce_applied_count += 1
+                else:
+                    teacher_regenerate_suppressed_count += 1
+                    teacher_regenerate_rejected_count += 1
+                    hard_reconstruct_failure_count += 1
+                    if is_recovery_case:
+                        recovery_suppressed_count += 1
+            elif is_recovery_case:
+                teacher_regenerate_suppressed_count += 1
+                hard_reconstruct_failure_count += 1
+                recovery_suppressed_count += 1
 
             teacher_prompt = ""
+            dummy_reason = None
+            is_dummy = False
             sample_debug_record = {
                 "sample_key": sample_key,
                 "manifest_route": route_from_manifest,
-                "final_route": route,
+                "loss_family": loss_family,
                 "online_route": online_route,
                 "reconstruct_status": reconstruct_status,
                 "iou": float(iou),
-                "allow_teacher_ce": None,
-                "teacher_reconstruct_ok": None,
-                "teacher_gate_passed": None,
-                "teacher_iou_plain": None,
-                "teacher_completion_len": None,
+                "allow_teacher_ce": bool(allow_teacher_ce),
+                "teacher_reconstruct_ok": teacher_reconstruct_ok,
+                "teacher_gate_passed": teacher_gate_passed,
+                "teacher_iou_plain": teacher_iou_plain,
+                "teacher_completion_len": teacher_completion_len,
+                "is_dummy": False,
+                "dummy_reason": None,
                 "entry_added": False,
-                "loss_branch": route,
+                "loss_branch": loss_family,
             }
-            if route == TEACHER_REGENERATE_ROUTE:
+            if loss_family == TEACHER_REGENERATE_ROUTE:
                 teacher_regenerate_count += 1
-                teacher_prompt = self._route_prompt_tag(route)
-                max_regen_count = max(int(np.ceil(self.max_teacher_regenerate_fraction * max(nonempty_gt_count, 1))), 1)
-                allow_teacher_ce = teacher_regenerate_ce_applied_count < max_regen_count
-                sample_debug_record["allow_teacher_ce"] = bool(allow_teacher_ce)
-                if allow_teacher_ce:
-                    teacher_fields = self._build_training_teacher_fields(
-                        route=route,
-                        iou=iou,
-                    )
-                    teacher_regenerate = self.generate_teacher_caption_with_privileged_prompt(
-                        image=image,
-                        gt_mask=gt_mask_np,
-                        ref_mask=ref_mask_np,
-                        student_question=student_question,
-                        student_caption=description.clean_caption,
-                        description_status=description.status,
-                        reconstruction=reconstruction,
-                        iou=iou,
-                        teacher_fields=teacher_fields,
-                    )
-                    sample_debug_record["teacher_completion_len"] = int(teacher_regenerate.completion_ids.shape[1])
-                    teacher_reconstruction = self.reconstruct_mask(
-                        image=image,
-                        caption=teacher_regenerate.clean_caption,
-                        description_status=teacher_regenerate.status,
-                        gt_mask=gt_mask_np,
-                    )
-                    teacher_pred_mask = None if teacher_reconstruction is None else teacher_reconstruction.pred_mask
-                    teacher_iou_plain = (
-                        self._compute_iou(gt_mask_np, teacher_pred_mask) if teacher_pred_mask is not None else 0.0
-                    )
-                    teacher_reconstruct_ok = (
-                        teacher_reconstruction is not None
-                        and teacher_reconstruction.status == "ok"
-                        and teacher_pred_mask is not None
-                    )
-                    teacher_gate_passed = (
-                        self._teacher_regenerate_gate_passed(iou, teacher_iou_plain)
-                        if teacher_reconstruct_ok
-                        else False
-                    )
-                    sample_debug_record["teacher_reconstruct_ok"] = bool(teacher_reconstruct_ok)
-                    sample_debug_record["teacher_gate_passed"] = bool(teacher_gate_passed)
-                    sample_debug_record["teacher_iou_plain"] = float(teacher_iou_plain)
-                    if teacher_reconstruct_ok and teacher_gate_passed:
-                        regen_entries.append(
-                            {
-                                "image": image,
-                                "prompt_masks": prompt_masks,
-                                "student_question": student_question,
-                                "completion_ids": teacher_regenerate.completion_ids,
-                            }
-                        )
-                        sample_debug_record["entry_added"] = True
-                        teacher_regenerate_ce_applied_count += 1
-                        teacher_regenerate_verified_count += 1
-                        teacher_regenerate_verified_iou_sum += teacher_iou_plain
-                        last_caption = teacher_regenerate.clean_caption or description.clean_caption
-                    else:
-                        teacher_regenerate_suppressed_count += 1
-                        teacher_regenerate_rejected_count += 1
-                        hard_reconstruct_failure_count += 1
-                        last_caption = description.clean_caption
-                else:
-                    teacher_regenerate_suppressed_count += 1
-                    hard_reconstruct_failure_count += 1
-                    last_caption = description.clean_caption
-            elif route == ON_POLICY_DISTILL_ROUTE:
+                teacher_prompt = self._route_prompt_tag(loss_family)
+                regen_completion = None if teacher_regenerate is None else teacher_regenerate.completion_ids
+                if regen_completion is None or regen_completion.shape[1] == 0:
+                    is_dummy = True
+                    dummy_reason = "teacher_empty_completion" if teacher_regenerate is not None else "teacher_not_available"
+                    regen_completion = self._build_dummy_completion_ids()
+                elif not (teacher_reconstruct_ok and teacher_gate_passed):
+                    is_dummy = True
+                    dummy_reason = "teacher_gate_failed"
+                regen_entries.append(
+                    {
+                        "image": image,
+                        "prompt_masks": prompt_masks,
+                        "student_question": student_question,
+                        "completion_ids": regen_completion,
+                        "is_dummy": is_dummy,
+                        "loss_weight": 0.0 if is_dummy else 1.0,
+                        "dummy_reason": dummy_reason,
+                    }
+                )
+                sample_debug_record["entry_added"] = True
+                sample_debug_record["is_dummy"] = bool(is_dummy)
+                sample_debug_record["dummy_reason"] = dummy_reason
+                last_caption = (
+                    teacher_regenerate.clean_caption
+                    if teacher_regenerate is not None and teacher_regenerate.clean_caption
+                    else description.clean_caption
+                )
+            elif loss_family == ON_POLICY_DISTILL_ROUTE:
                 on_policy_distill_count += 1
                 teacher_fields = self._build_training_teacher_fields(
-                    route=route,
+                    route=loss_family,
                     iou=iou,
                 )
                 teacher_prompt = self.build_teacher_privileged_prompt_v3(
                     student_question=student_question,
                     student_caption=description.clean_caption,
                     description_status=description.status,
-                    reconstruction=reconstruction,
+                    reconstruction=effective_reconstruction,
                     iou=iou,
                     gt_mask=gt_mask_np,
                     ref_mask=ref_mask_np,
                     teacher_fields=teacher_fields,
                 )
-                teacher_prompt_masks = np.stack(
-                    [
-                        gt_mask_np.astype(np.float32),
-                        ref_mask_np.astype(np.float32),
-                    ],
-                    axis=0,
-                )
+                teacher_prompt_masks = self._build_teacher_prompt_masks(gt_mask_np, ref_mask_np)
+                onpolicy_completion = description.completion_ids
+                if onpolicy_completion.shape[1] == 0:
+                    is_dummy = True
+                    dummy_reason = "empty_completion"
+                    onpolicy_completion = self._build_dummy_completion_ids()
+                elif description.status != "ok":
+                    is_dummy = True
+                    dummy_reason = f"invalid_caption:{description.status}"
+                elif pred_mask is None:
+                    is_dummy = True
+                    dummy_reason = f"missing_pred_mask:{reconstruct_status}"
                 onpolicy_entries.append(
                     {
                         "image": image,
                         "prompt_masks": prompt_masks,
                         "student_question": student_question,
                         "teacher_prompt": teacher_prompt,
-                        "completion_ids": description.completion_ids,
+                        "completion_ids": onpolicy_completion,
                         "teacher_prompt_masks": teacher_prompt_masks,
                         "iou": iou,
+                        "is_dummy": is_dummy,
+                        "loss_weight": 0.0 if is_dummy else 1.0,
+                        "dummy_reason": dummy_reason,
                     }
                 )
                 sample_debug_record["entry_added"] = True
+                sample_debug_record["is_dummy"] = bool(is_dummy)
+                sample_debug_record["dummy_reason"] = dummy_reason
                 last_caption = description.clean_caption
             else:
                 grpo_positive_count += 1
+                if description.status != "ok":
+                    is_dummy = True
+                    dummy_reason = f"invalid_caption:{description.status}"
+                elif pred_mask is None:
+                    is_dummy = True
+                    dummy_reason = f"missing_pred_mask:{reconstruct_status}"
                 grpo_entries.append(
                     {
                         "image": image,
@@ -3381,15 +3445,21 @@ class Sa2VAOPSDModelV2(BaseModel):
                         "student_question": student_question,
                         "gt_mask": gt_mask_np,
                         "confuser_candidate_masks": confuser_candidate_masks,
+                        "completion_ids": self._build_dummy_completion_ids() if is_dummy else None,
+                        "is_dummy": is_dummy,
+                        "loss_weight": 0.0 if is_dummy else 1.0,
+                        "dummy_reason": dummy_reason,
                     }
                 )
                 sample_debug_record["entry_added"] = True
-                teacher_prompt = self._route_prompt_tag(route)
+                sample_debug_record["is_dummy"] = bool(is_dummy)
+                sample_debug_record["dummy_reason"] = dummy_reason
+                teacher_prompt = self._route_prompt_tag(loss_family)
                 last_caption = description.clean_caption
 
             rank_debug_records.append(sample_debug_record)
             last_sample_key = sample_key
-            last_route = route
+            last_route = loss_family
             last_teacher_prompt = teacher_prompt
             total_iou += iou
 
@@ -3428,10 +3498,22 @@ class Sa2VAOPSDModelV2(BaseModel):
                 total_loss = grpo_loss_sum if total_loss is None else total_loss + grpo_loss_sum
                 optimized_count += int(grpo_losses.shape[0])
 
+        entry_count = len(regen_entries) + len(onpolicy_entries) + len(grpo_entries)
+        dummy_entry_count = sum(int(item.get("is_dummy", False)) for item in regen_entries)
+        dummy_entry_count += sum(int(item.get("is_dummy", False)) for item in onpolicy_entries)
+        dummy_entry_count += sum(int(item.get("is_dummy", False)) for item in grpo_entries)
+        real_entry_count = entry_count - dummy_entry_count
+        dummy_reasons = self._merge_dummy_reasons(regen_entries + onpolicy_entries + grpo_entries)
+
         self._log_ddp_route_alignment_debug(
             {
                 "rank": self._dist_rank(),
                 "batch_route": batch_route,
+                "loss_family": self._resolve_loss_family(batch_route),
+                "entry_count": entry_count,
+                "real_entry_count": real_entry_count,
+                "dummy_entry_count": dummy_entry_count,
+                "dummy_reasons": dummy_reasons,
                 "regen_entry_count": len(regen_entries),
                 "onpolicy_entry_count": len(onpolicy_entries),
                 "grpo_entry_count": len(grpo_entries),
