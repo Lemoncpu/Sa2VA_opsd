@@ -2453,6 +2453,18 @@ class Sa2VAOPSDModelV2(BaseModel):
     def _empty_loss_vector(self):
         return torch.empty(0, device=self.device, dtype=next(self.student_model.parameters()).dtype)
 
+    def _placeholder_loss_vector(self, count, *, reason):
+        count = int(count)
+        if count <= 0:
+            return self._empty_loss_vector()
+        zero = next(self.student_model.parameters()).sum() * 0.0
+        if self._should_debug_print():
+            print(
+                "[Sa2VA_OPSD_V2_DDP_DEBUG] "
+                f"route_placeholder_loss reason={reason} count={count}"
+            )
+        return zero.expand(count)
+
     def compute_regenerate_alignment_loss(
         self,
         image,
@@ -2474,9 +2486,11 @@ class Sa2VAOPSDModelV2(BaseModel):
 
     def compute_regenerate_alignment_losses_batch(self, batch_items):
         sample_losses = []
+        empty_completion_count = 0
         for item in batch_items:
             completion_ids = item["completion_ids"]
             if completion_ids.shape[1] == 0:
+                empty_completion_count += 1
                 continue
             sample_loss = self.compute_regenerate_alignment_loss(
                 image=item["image"],
@@ -2487,7 +2501,10 @@ class Sa2VAOPSDModelV2(BaseModel):
             if sample_loss is not None:
                 sample_losses.append(sample_loss)
         if not sample_losses:
-            return self._empty_loss_vector()
+            return self._placeholder_loss_vector(
+                len(batch_items),
+                reason=f"regen-empty-sample-losses empty_completion_count={empty_completion_count}",
+            )
         return torch.stack(sample_losses)
 
     def compute_onpolicy_distill_loss(
@@ -2533,9 +2550,11 @@ class Sa2VAOPSDModelV2(BaseModel):
 
     def compute_onpolicy_distill_losses_batch(self, batch_items):
         sample_losses = []
+        empty_completion_count = 0
         for item in batch_items:
             completion_ids = item["completion_ids"]
             if completion_ids.shape[1] == 0:
+                empty_completion_count += 1
                 continue
             sample_loss = self.compute_onpolicy_distill_loss(
                 image=item["image"],
@@ -2549,7 +2568,10 @@ class Sa2VAOPSDModelV2(BaseModel):
             if sample_loss is not None:
                 sample_losses.append(sample_loss)
         if not sample_losses:
-            return self._empty_loss_vector()
+            return self._placeholder_loss_vector(
+                len(batch_items),
+                reason=f"onpolicy-empty-sample-losses empty_completion_count={empty_completion_count}",
+            )
         return torch.stack(sample_losses)
 
     def _sample_grpo_descriptions(self, *, image, prompt_masks, student_question):
@@ -2739,6 +2761,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "mcq_correct_count": 0,
                 "mcq_total_count": 0,
                 "mcq_correct_conf_sum": 0.0,
+                "skip_reason": "missing_confuser_masks",
             }
         descriptions = self._sample_grpo_descriptions(
             image=image,
@@ -2800,6 +2823,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "mcq_correct_count": 0,
                 "mcq_total_count": 0,
                 "mcq_correct_conf_sum": 0.0,
+                "skip_reason": "empty_rollout_entries",
             }
 
         reward_tensor = torch.tensor(
@@ -2873,6 +2897,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         mcq_correct_count = 0
         mcq_total_count = 0
         mcq_correct_conf_sum = 0.0
+        skip_reasons = []
         for item in batch_items:
             sample_loss, grpo_meta = self.compute_grpo_loss(
                 image=item["image"],
@@ -2891,8 +2916,15 @@ class Sa2VAOPSDModelV2(BaseModel):
             mcq_correct_conf_sum += float(grpo_meta.get("mcq_correct_conf_sum", 0.0))
             if sample_loss is not None:
                 sample_losses.append(sample_loss)
+            else:
+                skip_reason = grpo_meta.get("skip_reason")
+                if skip_reason:
+                    skip_reasons.append(str(skip_reason))
         if not sample_losses:
-            return self._empty_loss_vector(), {
+            return self._placeholder_loss_vector(
+                len(batch_items),
+                reason=f"grpo-empty-sample-losses skip_reasons={','.join(skip_reasons) or 'unknown'}",
+            ), {
                 "reward_sum": reward_sum,
                 "reward_count": reward_count,
                 "rollout_mcq_confidences": rollout_mcq_confidences,
@@ -2901,6 +2933,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "mcq_correct_count": mcq_correct_count,
                 "mcq_total_count": mcq_total_count,
                 "mcq_correct_conf_sum": mcq_correct_conf_sum,
+                "skip_reasons": skip_reasons,
             }
         return torch.stack(sample_losses), {
             "reward_sum": reward_sum,
@@ -2911,6 +2944,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             "mcq_correct_count": mcq_correct_count,
             "mcq_total_count": mcq_total_count,
             "mcq_correct_conf_sum": mcq_correct_conf_sum,
+            "skip_reasons": skip_reasons,
         }
 
     def forward(self, data, data_samples=None, mode="loss"):
