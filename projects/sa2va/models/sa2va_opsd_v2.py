@@ -2054,8 +2054,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             "You are given privileged access to the target mask (region1 = gtmask) and the reconstructed mask (region2 = refmask). "
             "Your job is to analyze, at pixel and region level, why the current student caption produces the current reconstructed mask, and then provide the correct supervision for this route.\n"
         )
-        prompt = (
-            prompt_intro
+        prompt = prompt_intro + (
             f"Teacher route: {route}\n"
             f"Student prompt: {clean_question}\n"
             f"Student caption: {student_caption}\n"
@@ -2078,8 +2077,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             "Do not rely on any pre-labeled failure category beyond the route. Base your supervision on the actual visual content of region1 and region2, their pixel-level differences, and the failure mode implied by the student caption."
         )
         if generation_mode == "regenerate_caption":
-            prompt = (
-                prompt_intro
+            prompt = prompt_intro + (
                 f"Student prompt: {clean_question}\n"
                 f"Failed student caption: {student_caption}\n"
                 f"Description status: {description_status}\n"
