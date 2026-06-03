@@ -94,11 +94,13 @@ def format_teacher_structured_output(fields):
 def build_mask_relation_context(*, model, gt_mask, ref_mask):
     gt_mask = np.asarray(gt_mask).astype(np.uint8)
     ref_mask = np.asarray(ref_mask).astype(np.uint8)
+    overlap = np.logical_and(gt_mask > 0, ref_mask > 0).astype(np.uint8)
     gt_only = np.logical_and(gt_mask > 0, ref_mask == 0).astype(np.uint8)
     ref_only = np.logical_and(ref_mask > 0, gt_mask == 0).astype(np.uint8)
     return {
         "gt_summary": model._mask_summary(gt_mask),
         "ref_summary": model._mask_summary(ref_mask),
+        "overlap_summary": "none" if int(overlap.sum()) == 0 else model._mask_summary(overlap),
         "gt_only_summary": "none" if int(gt_only.sum()) == 0 else model._mask_summary(gt_only),
         "ref_only_summary": "none" if int(ref_only.sum()) == 0 else model._mask_summary(ref_only),
     }
