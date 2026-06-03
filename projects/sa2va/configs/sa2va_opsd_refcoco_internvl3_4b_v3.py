@@ -154,7 +154,7 @@ optim_wrapper = dict(
 
 model_wrapper_cfg = dict(
     type="MMDistributedDataParallel",
-    find_unused_parameters=False,
+    find_unused_parameters=True,
     broadcast_buffers=False,
 )
 
