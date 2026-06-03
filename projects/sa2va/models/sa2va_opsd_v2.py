@@ -1052,6 +1052,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             question=None,
             raw_prediction="",
             prediction_masks_count=0,
+            seg_token_count=0,
             status=status,
         )
 
