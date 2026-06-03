@@ -1165,6 +1165,114 @@ class Sa2VAOPSDModelV2(BaseModel):
             return torch.distributed.get_rank() == 0
         return True
 
+    @staticmethod
+    def _dist_is_initialized():
+        return torch.distributed.is_available() and torch.distributed.is_initialized()
+
+    @staticmethod
+    def _dist_rank():
+        if Sa2VAOPSDModelV2._dist_is_initialized():
+            return int(torch.distributed.get_rank())
+        return 0
+
+    def _log_ddp_route_alignment_debug(self, payload):
+        if not self.enable_debug_sample_logging or not self._dist_is_initialized():
+            return
+        gathered_payloads = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(gathered_payloads, payload)
+        if self._dist_rank() != 0:
+            return
+
+        manifest_route_signatures = {
+            tuple(record.get("manifest_route") for record in item.get("records", []))
+            for item in gathered_payloads
+        }
+        final_route_signatures = {
+            tuple(record.get("final_route") for record in item.get("records", []))
+            for item in gathered_payloads
+        }
+        loss_presence_signatures = {
+            (
+                int(item.get("regen_entry_count", 0) > 0),
+                int(item.get("onpolicy_entry_count", 0) > 0),
+                int(item.get("grpo_entry_count", 0) > 0),
+                int(item.get("optimized_count", 0) > 0),
+            )
+            for item in gathered_payloads
+        }
+        teacher_gate_signatures = {
+            tuple(
+                (
+                    record.get("final_route"),
+                    bool(record.get("allow_teacher_ce", False)),
+                    bool(record.get("teacher_reconstruct_ok", False)),
+                    bool(record.get("teacher_gate_passed", False)),
+                    bool(record.get("entry_added", False)),
+                )
+                for record in item.get("records", [])
+                if record.get("final_route") == TEACHER_REGENERATE_ROUTE
+            )
+            for item in gathered_payloads
+        }
+
+        suspicious_reasons = []
+        if len(manifest_route_signatures) > 1:
+            suspicious_reasons.append("manifest-route-mismatch")
+        if len(final_route_signatures) > 1:
+            suspicious_reasons.append("final-route-mismatch")
+        if len(loss_presence_signatures) > 1:
+            suspicious_reasons.append("loss-entry-mismatch")
+        if len(teacher_gate_signatures) > 1:
+            suspicious_reasons.append("teacher-regen-gate-mismatch")
+        if not suspicious_reasons:
+            suspicious_reasons.append("no-obvious-mismatch-detected")
+
+        print(
+            "[Sa2VA_OPSD_V2_DDP_DEBUG] "
+            f"potential_issue={','.join(suspicious_reasons)} "
+            f"world_size={len(gathered_payloads)}"
+        )
+        for item in gathered_payloads:
+            records_text = []
+            for record in item.get("records", []):
+                teacher_iou_plain = record.get("teacher_iou_plain")
+                teacher_iou_text = "None" if teacher_iou_plain is None else f"{float(teacher_iou_plain):.4f}"
+                iou_value = record.get("iou")
+                iou_text = "None" if iou_value is None else f"{float(iou_value):.4f}"
+                records_text.append(
+                    "sample_key={sample_key} manifest_route={manifest_route} final_route={final_route} "
+                    "online_route={online_route} reconstruct_status={reconstruct_status} iou={iou} "
+                    "allow_teacher_ce={allow_teacher_ce} teacher_reconstruct_ok={teacher_reconstruct_ok} "
+                    "teacher_gate_passed={teacher_gate_passed} teacher_iou_plain={teacher_iou_plain} "
+                    "teacher_completion_len={teacher_completion_len} entry_added={entry_added} loss_branch={loss_branch}".format(
+                        sample_key=record.get("sample_key"),
+                        manifest_route=record.get("manifest_route"),
+                        final_route=record.get("final_route"),
+                        online_route=record.get("online_route"),
+                        reconstruct_status=record.get("reconstruct_status"),
+                        iou=iou_text,
+                        allow_teacher_ce=record.get("allow_teacher_ce"),
+                        teacher_reconstruct_ok=record.get("teacher_reconstruct_ok"),
+                        teacher_gate_passed=record.get("teacher_gate_passed"),
+                        teacher_iou_plain=teacher_iou_text,
+                        teacher_completion_len=record.get("teacher_completion_len"),
+                        entry_added=record.get("entry_added"),
+                        loss_branch=record.get("loss_branch"),
+                    )
+                )
+            print(
+                "[Sa2VA_OPSD_V2_DDP_DEBUG] "
+                f"rank={item.get('rank')} batch_route={item.get('batch_route')} "
+                f"regen_entries={item.get('regen_entry_count')} "
+                f"onpolicy_entries={item.get('onpolicy_entry_count')} "
+                f"grpo_entries={item.get('grpo_entry_count')} "
+                f"regen_loss_count={item.get('regen_loss_count')} "
+                f"onpolicy_loss_count={item.get('onpolicy_loss_count')} "
+                f"grpo_loss_count={item.get('grpo_loss_count')} "
+                f"optimized_count={item.get('optimized_count')} "
+                f"records=[{' ; '.join(records_text)}]"
+            )
+
     def _debug_sample(
         self,
         *,
@@ -2871,6 +2979,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         last_caption = ""
         last_teacher_prompt = ""
         last_route = ""
+        rank_debug_records = []
 
         regen_entries = []
         onpolicy_entries = []
@@ -2963,6 +3072,11 @@ class Sa2VAOPSDModelV2(BaseModel):
                 max_regen_count = max(int(np.ceil(self.max_teacher_regenerate_fraction * max(nonempty_gt_count, 1))), 1)
                 max_recovery_count = max(int(np.ceil(self.max_recovery_fraction * max(nonempty_gt_count, 1))), 1)
                 allow_teacher_ce = teacher_regenerate_ce_applied_count < max_regen_count
+                teacher_reconstruct_ok = None
+                teacher_gate_passed = None
+                teacher_iou_plain = None
+                teacher_completion_len = None
+                regen_entry_added = False
                 if is_recovery_case:
                     allow_teacher_ce = allow_teacher_ce and (recovery_ce_applied_count < max_recovery_count)
                 if allow_teacher_ce:
@@ -2983,6 +3097,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                         iou=0.0,
                         teacher_fields=teacher_fields,
                     )
+                    teacher_completion_len = int(teacher_regenerate.completion_ids.shape[1])
                     teacher_reconstruction = self.reconstruct_mask(
                         image=image,
                         caption=teacher_regenerate.clean_caption,
@@ -2998,7 +3113,12 @@ class Sa2VAOPSDModelV2(BaseModel):
                         and teacher_reconstruction.status == "ok"
                         and teacher_pred_mask is not None
                     )
-                    if teacher_reconstruct_ok and self._teacher_regenerate_gate_passed(0.0, teacher_iou_plain):
+                    teacher_gate_passed = (
+                        self._teacher_regenerate_gate_passed(0.0, teacher_iou_plain)
+                        if teacher_reconstruct_ok
+                        else False
+                    )
+                    if teacher_reconstruct_ok and teacher_gate_passed:
                         regen_entries.append(
                             {
                                 "image": image,
@@ -3007,6 +3127,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                                 "completion_ids": teacher_regenerate.completion_ids,
                             }
                         )
+                        regen_entry_added = True
                         teacher_regenerate_ce_applied_count += 1
                         teacher_regenerate_verified_count += 1
                         teacher_regenerate_verified_iou_sum += teacher_iou_plain
@@ -3044,6 +3165,23 @@ class Sa2VAOPSDModelV2(BaseModel):
                     iou=0.0,
                     empty_gt_mask=False,
                 )
+                rank_debug_records.append(
+                    {
+                        "sample_key": sample_key,
+                        "manifest_route": route_from_manifest,
+                        "final_route": TEACHER_REGENERATE_ROUTE,
+                        "online_route": None,
+                        "reconstruct_status": reconstruct_status,
+                        "iou": 0.0,
+                        "allow_teacher_ce": bool(allow_teacher_ce),
+                        "teacher_reconstruct_ok": teacher_reconstruct_ok,
+                        "teacher_gate_passed": teacher_gate_passed,
+                        "teacher_iou_plain": teacher_iou_plain,
+                        "teacher_completion_len": teacher_completion_len,
+                        "entry_added": regen_entry_added,
+                        "loss_branch": "teacher_regenerate_recovery",
+                    }
+                )
                 continue
 
             iou = self._compute_iou(gt_mask_np, pred_mask)
@@ -3080,11 +3218,28 @@ class Sa2VAOPSDModelV2(BaseModel):
             )
 
             teacher_prompt = ""
+            sample_debug_record = {
+                "sample_key": sample_key,
+                "manifest_route": route_from_manifest,
+                "final_route": route,
+                "online_route": online_route,
+                "reconstruct_status": reconstruct_status,
+                "iou": float(iou),
+                "allow_teacher_ce": None,
+                "teacher_reconstruct_ok": None,
+                "teacher_gate_passed": None,
+                "teacher_iou_plain": None,
+                "teacher_completion_len": None,
+                "entry_added": False,
+                "loss_branch": route,
+            }
             if route == TEACHER_REGENERATE_ROUTE:
                 teacher_regenerate_count += 1
                 teacher_prompt = self._route_prompt_tag(route)
                 max_regen_count = max(int(np.ceil(self.max_teacher_regenerate_fraction * max(nonempty_gt_count, 1))), 1)
-                if teacher_regenerate_ce_applied_count < max_regen_count:
+                allow_teacher_ce = teacher_regenerate_ce_applied_count < max_regen_count
+                sample_debug_record["allow_teacher_ce"] = bool(allow_teacher_ce)
+                if allow_teacher_ce:
                     teacher_fields = self._build_training_teacher_fields(
                         route=route,
                         iou=iou,
@@ -3100,6 +3255,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                         iou=iou,
                         teacher_fields=teacher_fields,
                     )
+                    sample_debug_record["teacher_completion_len"] = int(teacher_regenerate.completion_ids.shape[1])
                     teacher_reconstruction = self.reconstruct_mask(
                         image=image,
                         caption=teacher_regenerate.clean_caption,
@@ -3115,7 +3271,15 @@ class Sa2VAOPSDModelV2(BaseModel):
                         and teacher_reconstruction.status == "ok"
                         and teacher_pred_mask is not None
                     )
-                    if teacher_reconstruct_ok and self._teacher_regenerate_gate_passed(iou, teacher_iou_plain):
+                    teacher_gate_passed = (
+                        self._teacher_regenerate_gate_passed(iou, teacher_iou_plain)
+                        if teacher_reconstruct_ok
+                        else False
+                    )
+                    sample_debug_record["teacher_reconstruct_ok"] = bool(teacher_reconstruct_ok)
+                    sample_debug_record["teacher_gate_passed"] = bool(teacher_gate_passed)
+                    sample_debug_record["teacher_iou_plain"] = float(teacher_iou_plain)
+                    if teacher_reconstruct_ok and teacher_gate_passed:
                         regen_entries.append(
                             {
                                 "image": image,
@@ -3124,6 +3288,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                                 "completion_ids": teacher_regenerate.completion_ids,
                             }
                         )
+                        sample_debug_record["entry_added"] = True
                         teacher_regenerate_ce_applied_count += 1
                         teacher_regenerate_verified_count += 1
                         teacher_regenerate_verified_iou_sum += teacher_iou_plain
@@ -3171,6 +3336,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                         "iou": iou,
                     }
                 )
+                sample_debug_record["entry_added"] = True
                 last_caption = description.clean_caption
             else:
                 grpo_positive_count += 1
@@ -3183,9 +3349,11 @@ class Sa2VAOPSDModelV2(BaseModel):
                         "confuser_candidate_masks": confuser_candidate_masks,
                     }
                 )
+                sample_debug_record["entry_added"] = True
                 teacher_prompt = self._route_prompt_tag(route)
                 last_caption = description.clean_caption
 
+            rank_debug_records.append(sample_debug_record)
             last_sample_key = sample_key
             last_route = route
             last_teacher_prompt = teacher_prompt
@@ -3225,6 +3393,21 @@ class Sa2VAOPSDModelV2(BaseModel):
                 total_grpo = grpo_loss_sum if total_grpo is None else total_grpo + grpo_loss_sum
                 total_loss = grpo_loss_sum if total_loss is None else total_loss + grpo_loss_sum
                 optimized_count += int(grpo_losses.shape[0])
+
+        self._log_ddp_route_alignment_debug(
+            {
+                "rank": self._dist_rank(),
+                "batch_route": batch_route,
+                "regen_entry_count": len(regen_entries),
+                "onpolicy_entry_count": len(onpolicy_entries),
+                "grpo_entry_count": len(grpo_entries),
+                "regen_loss_count": regen_loss_count,
+                "onpolicy_loss_count": onpolicy_loss_count,
+                "grpo_loss_count": grpo_loss_count,
+                "optimized_count": optimized_count,
+                "records": rank_debug_records,
+            }
+        )
 
         self._cumulative_valid_count += routed_count
         self._cumulative_loss_count += optimized_count
