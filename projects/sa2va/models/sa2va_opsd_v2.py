@@ -2047,11 +2047,15 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"The current IoU is at least {self.iou_high_threshold:.2f}, so the reconstruction already matches the gtmask well. "
                 "Large corrections are likely harmful; keep any remaining guidance minimal."
             )
-        prompt = (
+        prompt_intro = (
             "<image>\n"
-            "You are a teacher supervising a caption-to-mask model. The student first writes a caption for the target, and that caption is then used to reconstruct a segmentation mask. "
+            "You are a teacher supervising a mask-to-caption task. The goal is to optimize a model that takes a target mask as input and generates a caption as output. "
+            "The evaluation criterion is whether the generated caption is precise and clear enough to reconstruct the original ground-truth mask. "
             "You are given privileged access to the target mask (region1 = gtmask) and the reconstructed mask (region2 = refmask). "
             "Your job is to analyze, at pixel and region level, why the current student caption produces the current reconstructed mask, and then provide the correct supervision for this route.\n"
+        )
+        prompt = (
+            prompt_intro
             f"Teacher route: {route}\n"
             f"Student prompt: {clean_question}\n"
             f"Student caption: {student_caption}\n"
@@ -2075,9 +2079,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         )
         if generation_mode == "regenerate_caption":
             prompt = (
-                "<image>\n"
-                "You are a teacher supervising a failed caption-to-mask reconstruction.\n"
-                "Region1 is the gtmask and region2 is the mask reconstructed from the student's caption.\n"
+                prompt_intro
                 f"Student prompt: {clean_question}\n"
                 f"Failed student caption: {student_caption}\n"
                 f"Description status: {description_status}\n"
