@@ -1,4 +1,3 @@
-import copy
 import inspect
 import random
 import re
@@ -11,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from mmengine.model import BaseModel
 from PIL import Image
-from transformers import AutoModel, AutoProcessor, AutoTokenizer, GenerationConfig
+from transformers import AutoModel, AutoProcessor, AutoTokenizer
 from transformers.modeling_outputs import BaseModelOutput
 from transformers.modeling_utils import PreTrainedModel
 
@@ -1336,78 +1335,6 @@ class Sa2VAOPSDModelV2(BaseModel):
                     kwargs["processor"] = self.processor
                 return model.predict_forward(**kwargs)
 
-    def _clone_generation_config(self, model, overrides=None):
-        base_config = getattr(model, "gen_config", None)
-        if base_config is None:
-            base_config = getattr(getattr(model, "language_model", None), "generation_config", None)
-        generation_config = copy.deepcopy(base_config) if base_config is not None else GenerationConfig()
-        tokenizer = self.tokenizer
-        if getattr(generation_config, "bos_token_id", None) is None and tokenizer is not None:
-            generation_config.bos_token_id = tokenizer.bos_token_id
-        if getattr(generation_config, "eos_token_id", None) is None and tokenizer is not None:
-            generation_config.eos_token_id = tokenizer.eos_token_id
-        if getattr(generation_config, "pad_token_id", None) is None and tokenizer is not None:
-            generation_config.pad_token_id = (
-                tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-            )
-        for key, value in (overrides or {}).items():
-            setattr(generation_config, key, value)
-        return generation_config
-
-    @staticmethod
-    def _extract_completion_ids(sequences, prompt_ids):
-        if sequences.ndim != 2 or prompt_ids.ndim != 2:
-            return sequences
-        prompt_len = prompt_ids.shape[1]
-        if sequences.shape[1] > prompt_len and torch.equal(
-            sequences[:, :prompt_len].to(prompt_ids.device),
-            prompt_ids,
-        ):
-            return sequences[:, prompt_len:]
-        return sequences
-
-    def _generate_caption_with_model(
-        self,
-        model,
-        *,
-        image,
-        prompt_masks,
-        prompt_text,
-        apply_mask_focus=True,
-        generation_overrides=None,
-    ):
-        self._ensure_generation_ready(model)
-        with self._temporary_eval_model(model):
-            with torch.inference_mode():
-                formatted_prompt_masks = self._to_teacher_prompt_masks(prompt_masks)
-                prompt_image = self._build_mask_focused_image(image, prompt_masks) if apply_mask_focus and prompt_masks is not None else image
-                mm_inputs = self._build_forward_inputs(model, prompt_image, formatted_prompt_masks, prompt_text)
-                inputs_embeds = self._compose_inputs_embeds(model, mm_inputs)
-                generation_config = self._clone_generation_config(model, generation_overrides)
-                outputs = model.language_model.generate(
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=mm_inputs["attention_mask"],
-                    generation_config=generation_config,
-                    bos_token_id=self.tokenizer.bos_token_id,
-                    stopping_criteria=getattr(model, "stop_criteria", None),
-                    output_hidden_states=False,
-                    return_dict_in_generate=True,
-                    use_cache=True,
-                )
-        generated_ids = self._extract_completion_ids(outputs.sequences, mm_inputs["input_ids"])
-        raw_prediction = self.tokenizer.decode(generated_ids[0], skip_special_tokens=False).strip()
-        clean_caption = self._clean_caption_text(raw_prediction)
-        status = self._infer_description_status(clean_caption)
-        if status == "ok" and not self._is_caption_content_sufficient(clean_caption):
-            status = "truncated_caption"
-        completion_ids = self._encode_completion_from_caption(clean_caption, model=model)
-        return DescriptionResult(
-            raw_prediction=raw_prediction,
-            clean_caption=clean_caption,
-            completion_ids=completion_ids,
-            status=status,
-        )
-
     def predict_text_with_masks(
         self,
         model,
@@ -1416,32 +1343,21 @@ class Sa2VAOPSDModelV2(BaseModel):
         text,
         mask_prompts=None,
         apply_mask_focus=False,
-        generation_overrides=None,
     ):
         self._ensure_generation_ready(model)
-        prompt_image = image
-        prompt_masks_for_forward = None
+        formatted_mask_prompts = None
         if mask_prompts is not None:
-            prompt_masks_for_forward = self._to_teacher_prompt_masks(mask_prompts)
-            if apply_mask_focus:
-                prompt_image = self._build_mask_focused_image(image, mask_prompts)
-        with self._temporary_eval_model(model):
-            with torch.inference_mode():
-                mm_inputs = self._build_forward_inputs(model, prompt_image, prompt_masks_for_forward, text)
-                inputs_embeds = self._compose_inputs_embeds(model, mm_inputs)
-                generation_config = self._clone_generation_config(model, generation_overrides)
-                outputs = model.language_model.generate(
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=mm_inputs["attention_mask"],
-                    generation_config=generation_config,
-                    bos_token_id=self.tokenizer.bos_token_id,
-                    stopping_criteria=getattr(model, "stop_criteria", None),
-                    output_hidden_states=False,
-                    return_dict_in_generate=True,
-                    use_cache=True,
-                )
-        prediction = self.tokenizer.decode(outputs.sequences[0], skip_special_tokens=False).strip()
-        return {"prediction": prediction}
+            formatted_mask_prompts = self._format_mask_prompts_for_predict_forward(mask_prompts)
+        prompt_image = self._build_mask_focused_image(image, mask_prompts) if (apply_mask_focus and mask_prompts is not None) else image
+        predict_dict = self._predict_forward_eval(
+            model,
+            image=prompt_image,
+            text=text,
+            past_text="",
+            mask_prompts=formatted_mask_prompts,
+            tokenizer=self.tokenizer,
+        )
+        return {"prediction": predict_dict.get("prediction", "")}
 
     @staticmethod
     def _format_mask_prompts_for_predict_forward(mask_prompts):
@@ -1928,17 +1844,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         mask_prompts,
         student_question,
         apply_mask_focus=True,
-        generation_overrides=None,
     ):
-        if generation_overrides is not None:
-            return self._generate_caption_with_model(
-                model,
-                image=image,
-                prompt_masks=mask_prompts,
-                prompt_text=student_question,
-                apply_mask_focus=apply_mask_focus,
-                generation_overrides=generation_overrides,
-            )
         formatted_mask_prompts = self._format_mask_prompts_for_predict_forward(mask_prompts)
         prompt_image = self._build_mask_focused_image(image, mask_prompts) if apply_mask_focus else image
         predict_dict = self._predict_forward_eval(
@@ -2009,13 +1915,6 @@ class Sa2VAOPSDModelV2(BaseModel):
             mask_prompts=teacher_prompt_masks,
             student_question=teacher_prompt,
             apply_mask_focus=True,
-            generation_overrides={
-                "max_new_tokens": self.low_iou_regen_max_new_tokens,
-                "do_sample": False,
-                "num_beams": 1,
-                "repetition_penalty": 1.1,
-                "no_repeat_ngram_size": 4,
-            },
         )
 
     def reconstruct_mask(self, image, caption, description_status, spatial_hint="", gt_mask=None):
@@ -2445,10 +2344,25 @@ class Sa2VAOPSDModelV2(BaseModel):
     def _resolve_loss_family(self, batch_route, route_from_manifest=None, online_route=None):
         if batch_route not in {None, "", "skip"}:
             return str(batch_route)
-        if route_from_manifest not in {None, "", "skip"}:
-            return str(route_from_manifest)
-        if online_route not in {None, "", "skip"}:
-            return str(online_route)
+        manifest_route = None if route_from_manifest in {None, "", "skip"} else str(route_from_manifest)
+        online_route = None if online_route in {None, "", "skip"} else str(online_route)
+        if self.use_online_route_for_loss:
+            route_priority = {
+                TEACHER_REGENERATE_ROUTE: 0,
+                ON_POLICY_DISTILL_ROUTE: 1,
+                GRPO_POSITIVE_ROUTE: 2,
+            }
+            if manifest_route is None:
+                return online_route or TEACHER_REGENERATE_ROUTE
+            if online_route is None:
+                return manifest_route
+            manifest_priority = route_priority.get(manifest_route, 99)
+            online_priority = route_priority.get(online_route, 99)
+            return online_route if online_priority < manifest_priority else manifest_route
+        if manifest_route is not None:
+            return manifest_route
+        if online_route is not None:
+            return online_route
         return TEACHER_REGENERATE_ROUTE
 
     def _build_dummy_completion_ids(self):
@@ -2691,13 +2605,6 @@ class Sa2VAOPSDModelV2(BaseModel):
         target_rollout_count = int(self.grpo_group_size)
         if target_rollout_count <= 0:
             return []
-        generation_overrides = {
-            "max_new_tokens": self.grpo_sample_max_new_tokens,
-            "do_sample": True,
-            "num_beams": 1,
-            "temperature": self.grpo_sample_temperature,
-            "top_p": self.grpo_sample_top_p,
-        }
         descriptions = []
         for _ in range(target_rollout_count):
             descriptions.append(
@@ -2707,7 +2614,6 @@ class Sa2VAOPSDModelV2(BaseModel):
                     mask_prompts=prompt_masks,
                     student_question=student_question,
                     apply_mask_focus=True,
-                    generation_overrides=generation_overrides,
                 )
             )
         return descriptions
@@ -2990,6 +2896,26 @@ class Sa2VAOPSDModelV2(BaseModel):
             device=self.device,
             dtype=rollout_entries[0]["old_token_log_probs"].dtype,
         )
+        reward_span = float((reward_tensor.max() - reward_tensor.min()).item())
+        if reward_span < self.grpo_advantage_eps:
+            zero_loss = next(self.student_model.parameters()).sum() * 0.0
+            return zero_loss, {
+                "reward_sum": float(reward_tensor.sum().item()),
+                "reward_count": len(rollout_entries),
+                "rollout_mcq_confidences": rollout_mcq_confidences,
+                "rollout_rewards": rollout_rewards,
+                "rollout_mcq_correct": rollout_mcq_correct,
+                "mcq_correct_count": int(sum(rollout_mcq_correct)),
+                "mcq_total_count": int(len(rollout_mcq_correct)),
+                "mcq_correct_conf_sum": float(
+                    sum(
+                        entry["correct_option_prob"]
+                        for entry in rollout_entries
+                        if entry["selected_correct"]
+                    )
+                ),
+                "skip_reason": "zero_reward_variance",
+            }
         reward_std = reward_tensor.std(unbiased=False).clamp_min(self.grpo_advantage_eps)
         advantages = (reward_tensor - reward_tensor.mean()) / reward_std
 
@@ -3022,12 +2948,41 @@ class Sa2VAOPSDModelV2(BaseModel):
             student_logits,
             completion_batch,
         )
-        ratio = torch.exp(current_token_log_probs - old_token_log_probs_batch)
+        log_ratio = (current_token_log_probs - old_token_log_probs_batch).clamp(min=-20.0, max=20.0)
+        ratio = torch.exp(log_ratio)
         clipped_ratio = ratio.clamp(1.0 - self.grpo_clip_eps, 1.0 + self.grpo_clip_eps)
         advantage_batch = advantages.unsqueeze(1)
         surrogate = torch.min(ratio * advantage_batch, clipped_ratio * advantage_batch)
         token_weights = completion_mask.to(dtype=surrogate.dtype)
         sample_losses = -(surrogate * token_weights).sum(dim=-1) / token_weights.sum(dim=-1).clamp_min(1.0)
+        if not torch.isfinite(sample_losses).all():
+            finite_mask = torch.isfinite(sample_losses)
+            if self._should_debug_print():
+                bad_count = int((~finite_mask).sum().item())
+                total_count = int(sample_losses.numel())
+                print(
+                    "[Sa2VA_OPSD_V2_WARN] "
+                    f"Dropping non-finite grpo sample losses: {bad_count}/{total_count} invalid."
+                )
+            sample_losses = sample_losses[finite_mask]
+        if sample_losses.numel() == 0:
+            return None, {
+                "reward_sum": float(reward_tensor.sum().item()),
+                "reward_count": len(rollout_entries),
+                "rollout_mcq_confidences": rollout_mcq_confidences,
+                "rollout_rewards": rollout_rewards,
+                "rollout_mcq_correct": rollout_mcq_correct,
+                "mcq_correct_count": int(sum(rollout_mcq_correct)),
+                "mcq_total_count": int(len(rollout_mcq_correct)),
+                "mcq_correct_conf_sum": float(
+                    sum(
+                        entry["correct_option_prob"]
+                        for entry in rollout_entries
+                        if entry["selected_correct"]
+                    )
+                ),
+                "skip_reason": "non_finite_grpo_losses",
+            }
 
         return sample_losses.mean(), {
             "reward_sum": float(reward_tensor.sum().item()),

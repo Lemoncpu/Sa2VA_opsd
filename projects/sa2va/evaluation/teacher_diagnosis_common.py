@@ -523,14 +523,6 @@ def _build_teacher_diagnosis_fields_staged(
     best_output = ""
     best_parsed = {}
     best_score = None
-    generation_overrides = {
-        "max_new_tokens": 128,
-        "do_sample": False,
-        "num_beams": 1,
-        "repetition_penalty": 1.1,
-        "no_repeat_ngram_size": 5,
-    }
-
     for teacher_prompt in build_compare_prompt_variants(
         sample=sample_with_model,
         reconstruction=reconstruction,
@@ -547,7 +539,6 @@ def _build_teacher_diagnosis_fields_staged(
             text=teacher_prompt,
             mask_prompts=teacher_mask_prompts,
             apply_mask_focus=True,
-            generation_overrides=generation_overrides,
         )
         teacher_output = normalize_teacher_output(teacher_predict.get("prediction", ""))
         parsed = parse_labeled_sections(teacher_output, THREE_LABELS)
