@@ -1175,8 +1175,37 @@ class Sa2VAOPSDModelV2(BaseModel):
         return 0
 
     def _log_ddp_route_alignment_debug(self, payload):
-        if not self.enable_debug_sample_logging or not self._dist_is_initialized():
+        if not self.enable_debug_sample_logging:
             return
+        if not self._dist_is_initialized():
+            print(
+                "[Sa2VA_OPSD_V2_DDP_LOCAL_DEBUG] "
+                f"rank={payload.get('rank')} batch_route={payload.get('batch_route')} "
+                f"loss_family={payload.get('loss_family')} "
+                f"entry_count={payload.get('entry_count')} "
+                f"regen_entries={payload.get('regen_entry_count')} "
+                f"onpolicy_entries={payload.get('onpolicy_entry_count')} "
+                f"grpo_entries={payload.get('grpo_entry_count')} "
+                f"optimized_count={payload.get('optimized_count')}",
+                flush=True,
+            )
+            return
+        print(
+            "[Sa2VA_OPSD_V2_DDP_LOCAL_DEBUG] "
+            f"rank={payload.get('rank')} batch_route={payload.get('batch_route')} "
+            f"loss_family={payload.get('loss_family')} "
+            f"entry_count={payload.get('entry_count')} "
+            f"real_entry_count={payload.get('real_entry_count')} "
+            f"dummy_entry_count={payload.get('dummy_entry_count')} "
+            f"regen_entries={payload.get('regen_entry_count')} "
+            f"onpolicy_entries={payload.get('onpolicy_entry_count')} "
+            f"grpo_entries={payload.get('grpo_entry_count')} "
+            f"regen_loss_count={payload.get('regen_loss_count')} "
+            f"onpolicy_loss_count={payload.get('onpolicy_loss_count')} "
+            f"grpo_loss_count={payload.get('grpo_loss_count')} "
+            f"optimized_count={payload.get('optimized_count')}",
+            flush=True,
+        )
         gathered_payloads = [None] * torch.distributed.get_world_size()
         torch.distributed.all_gather_object(gathered_payloads, payload)
         if self._dist_rank() != 0:
@@ -1213,7 +1242,8 @@ class Sa2VAOPSDModelV2(BaseModel):
         print(
             "[Sa2VA_OPSD_V2_DDP_DEBUG] "
             f"potential_issue={','.join(suspicious_reasons)} "
-            f"world_size={len(gathered_payloads)}"
+            f"world_size={len(gathered_payloads)}",
+            flush=True,
         )
         for item in gathered_payloads:
             records_text = []
@@ -1261,8 +1291,39 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"onpolicy_loss_count={item.get('onpolicy_loss_count')} "
                 f"grpo_loss_count={item.get('grpo_loss_count')} "
                 f"optimized_count={item.get('optimized_count')} "
-                f"records=[{' ; '.join(records_text)}]"
+                f"records=[{' ; '.join(records_text)}]",
+                flush=True,
             )
+
+    def _log_pre_return_debug(
+        self,
+        *,
+        batch_route,
+        last_route,
+        optimized_count,
+        regen_loss_count,
+        onpolicy_loss_count,
+        grpo_loss_count,
+        total_loss,
+        total_regen_ce,
+        total_onpolicy_jsd,
+        total_grpo,
+    ):
+        if not self.enable_debug_sample_logging:
+            return
+        total_loss_value = None if total_loss is None else float(total_loss.detach().item())
+        total_regen_value = None if total_regen_ce is None else float(total_regen_ce.detach().item())
+        total_onpolicy_value = None if total_onpolicy_jsd is None else float(total_onpolicy_jsd.detach().item())
+        total_grpo_value = None if total_grpo is None else float(total_grpo.detach().item())
+        print(
+            "[Sa2VA_OPSD_V2_PRE_RETURN_DEBUG] "
+            f"rank={self._dist_rank()} batch_route={batch_route} last_route={last_route} "
+            f"optimized_count={optimized_count} regen_loss_count={regen_loss_count} "
+            f"onpolicy_loss_count={onpolicy_loss_count} grpo_loss_count={grpo_loss_count} "
+            f"total_loss={total_loss_value} total_regen_ce={total_regen_value} "
+            f"total_onpolicy_jsd={total_onpolicy_value} total_grpo={total_grpo_value}",
+            flush=True,
+        )
 
     def _debug_sample(
         self,
@@ -3609,6 +3670,18 @@ class Sa2VAOPSDModelV2(BaseModel):
         )
 
         if optimized_count == 0:
+            self._log_pre_return_debug(
+                batch_route=batch_route,
+                last_route=last_route,
+                optimized_count=optimized_count,
+                regen_loss_count=regen_loss_count,
+                onpolicy_loss_count=onpolicy_loss_count,
+                grpo_loss_count=grpo_loss_count,
+                total_loss=total_loss,
+                total_regen_ce=total_regen_ce,
+                total_onpolicy_jsd=total_onpolicy_jsd,
+                total_grpo=total_grpo,
+            )
             metrics = {
                 "loss_opsd_total": self._zero_scalar(requires_grad=True, dtype=zero.dtype),
                 "opsd_regen_ce": zero,
@@ -3715,6 +3788,18 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"grpo_rollout_confidences={grpo_rollout_conf_text} "
                 f"grpo_rollout_rewards={grpo_rollout_rewards_text}"
             )
+        self._log_pre_return_debug(
+            batch_route=batch_route,
+            last_route=last_route,
+            optimized_count=optimized_count,
+            regen_loss_count=regen_loss_count,
+            onpolicy_loss_count=onpolicy_loss_count,
+            grpo_loss_count=grpo_loss_count,
+            total_loss=total_loss,
+            total_regen_ce=total_regen_ce,
+            total_onpolicy_jsd=total_onpolicy_jsd,
+            total_grpo=total_grpo,
+        )
         metrics = {
             "loss_opsd_total": avg_total_loss,
             "opsd_regen_ce": avg_regen_ce.detach(),

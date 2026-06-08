@@ -84,6 +84,7 @@ model = dict(
     grpo_sample_max_new_tokens=64,
     low_iou_regen_max_new_tokens=64,
     min_caption_tokens=4,
+    disable_gradient_checkpointing_for_ddp=True,
     enable_ddp_route_safety_loss=True,
     use_online_route_for_loss=not use_manifest_routes,
     max_teacher_regenerate_fraction=0.2,
@@ -152,7 +153,7 @@ optim_wrapper = dict(
 
 model_wrapper_cfg = dict(
     type="MMDistributedDataParallel",
-    find_unused_parameters=True,
+    find_unused_parameters=False,
     broadcast_buffers=False,
 )
 
