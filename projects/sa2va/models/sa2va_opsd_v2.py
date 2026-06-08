@@ -1258,7 +1258,10 @@ class Sa2VAOPSDModelV2(BaseModel):
                     "allow_teacher_ce={allow_teacher_ce} teacher_reconstruct_ok={teacher_reconstruct_ok} "
                     "teacher_gate_passed={teacher_gate_passed} teacher_iou_plain={teacher_iou_plain} "
                     "teacher_completion_len={teacher_completion_len} is_dummy={is_dummy} dummy_reason={dummy_reason} "
-                    "entry_added={entry_added} loss_branch={loss_branch}".format(
+                    "entry_added={entry_added} loss_branch={loss_branch} grpo_skip_reason={grpo_skip_reason} "
+                    "confuser_candidate_count={confuser_candidate_count} "
+                    "selected_confuser_count={selected_confuser_count} "
+                    "scored_confuser_count={scored_confuser_count}".format(
                         sample_key=record.get("sample_key"),
                         manifest_route=record.get("manifest_route"),
                         loss_family=record.get("loss_family"),
@@ -1274,6 +1277,10 @@ class Sa2VAOPSDModelV2(BaseModel):
                         dummy_reason=record.get("dummy_reason"),
                         entry_added=record.get("entry_added"),
                         loss_branch=record.get("loss_branch"),
+                        grpo_skip_reason=record.get("grpo_skip_reason"),
+                        confuser_candidate_count=record.get("confuser_candidate_count"),
+                        selected_confuser_count=record.get("selected_confuser_count"),
+                        scored_confuser_count=record.get("scored_confuser_count"),
                     )
                 )
             print(
@@ -2728,6 +2735,7 @@ class Sa2VAOPSDModelV2(BaseModel):
     def _select_confuser_masks(self, *, gt_mask, candidate_masks):
         if candidate_masks is None:
             candidate_masks = []
+        candidate_count = len(candidate_masks)
         gt_mask = self._to_numpy_mask(gt_mask)
         scored_candidates = []
         for candidate_mask in candidate_masks:
@@ -2744,7 +2752,12 @@ class Sa2VAOPSDModelV2(BaseModel):
                 (self._score_confuser_candidate(gt_mask, prepared_mask), prepared_mask)
             )
         if len(scored_candidates) < self.grpo_confuser_min_candidates:
-            return None
+            return None, {
+                "confuser_candidate_count": int(candidate_count),
+                "selected_confuser_count": 0,
+                "scored_confuser_count": int(len(scored_candidates)),
+                "grpo_skip_reason": "missing_confuser_masks",
+            }
         scored_candidates.sort(key=lambda item: item[0], reverse=True)
         selected_masks = []
         for _, prepared_mask in scored_candidates:
@@ -2758,8 +2771,18 @@ class Sa2VAOPSDModelV2(BaseModel):
             if len(selected_masks) >= self.grpo_confuser_num_negatives:
                 break
         if len(selected_masks) < self.grpo_confuser_num_negatives:
-            return None
-        return selected_masks
+            return None, {
+                "confuser_candidate_count": int(candidate_count),
+                "selected_confuser_count": int(len(selected_masks)),
+                "scored_confuser_count": int(len(scored_candidates)),
+                "grpo_skip_reason": "missing_confuser_masks",
+            }
+        return selected_masks, {
+            "confuser_candidate_count": int(candidate_count),
+            "selected_confuser_count": int(len(selected_masks)),
+            "scored_confuser_count": int(len(scored_candidates)),
+            "grpo_skip_reason": None,
+        }
 
     def _build_confuser_mcq_prompt(self, caption):
         option_text = ", ".join(self._grpo_option_letters)
@@ -2831,11 +2854,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         dummy_reason=None,
         dummy_completion_ids=None,
     ):
-        rollout_entries = []
-        rollout_mcq_confidences = []
-        rollout_rewards = []
-        rollout_mcq_correct = []
-        if force_dummy:
+        def _dummy_grpo_result(skip_reason):
             completion_ids = dummy_completion_ids if dummy_completion_ids is not None else self._build_dummy_completion_ids()
             with self._temporary_eval_model(self.student_model):
                 with torch.inference_mode():
@@ -2876,24 +2895,26 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "mcq_correct_count": 0,
                 "mcq_total_count": 0,
                 "mcq_correct_conf_sum": 0.0,
-                "skip_reason": str(dummy_reason or "forced_dummy"),
+                "skip_reason": str(skip_reason),
+                "confuser_candidate_count": 0,
+                "selected_confuser_count": 0,
+                "scored_confuser_count": 0,
             }
-        confuser_masks = self._select_confuser_masks(
+
+        rollout_entries = []
+        rollout_mcq_confidences = []
+        rollout_rewards = []
+        rollout_mcq_correct = []
+        if force_dummy:
+            return _dummy_grpo_result(dummy_reason or "forced_dummy")
+        confuser_masks, confuser_meta = self._select_confuser_masks(
             gt_mask=gt_mask,
             candidate_masks=confuser_candidate_masks,
         )
         if confuser_masks is None:
-            return None, {
-                "reward_sum": 0.0,
-                "reward_count": 0,
-                "rollout_mcq_confidences": [],
-                "rollout_rewards": [],
-                "rollout_mcq_correct": [],
-                "mcq_correct_count": 0,
-                "mcq_total_count": 0,
-                "mcq_correct_conf_sum": 0.0,
-                "skip_reason": "missing_confuser_masks",
-            }
+            sample_loss, grpo_meta = _dummy_grpo_result("missing_confuser_masks")
+            grpo_meta.update(confuser_meta)
+            return sample_loss, grpo_meta
         descriptions = self._sample_grpo_descriptions(
             image=image,
             prompt_masks=prompt_masks,
@@ -2945,17 +2966,10 @@ class Sa2VAOPSDModelV2(BaseModel):
             )
 
         if not rollout_entries:
-            return None, {
-                "reward_sum": 0.0,
-                "reward_count": 0,
-                "rollout_mcq_confidences": [],
-                "rollout_rewards": [],
-                "rollout_mcq_correct": [],
-                "mcq_correct_count": 0,
-                "mcq_total_count": 0,
-                "mcq_correct_conf_sum": 0.0,
-                "skip_reason": "empty_rollout_entries",
-            }
+            sample_loss, grpo_meta = _dummy_grpo_result("empty_rollout_entries")
+            grpo_meta.update(confuser_meta)
+            grpo_meta["grpo_skip_reason"] = "empty_rollout_entries"
+            return sample_loss, grpo_meta
 
         reward_tensor = torch.tensor(
             [entry["reward_value"] for entry in rollout_entries],
@@ -2984,6 +2998,10 @@ class Sa2VAOPSDModelV2(BaseModel):
                     )
                 ),
                 "skip_reason": "zero_reward_variance",
+                "confuser_candidate_count": int(confuser_meta.get("confuser_candidate_count", 0)),
+                "selected_confuser_count": int(confuser_meta.get("selected_confuser_count", 0)),
+                "scored_confuser_count": int(confuser_meta.get("scored_confuser_count", 0)),
+                "grpo_skip_reason": "zero_reward_variance",
             }
         reward_std = reward_tensor.std(unbiased=False).clamp_min(self.grpo_advantage_eps)
         advantages = (reward_tensor - reward_tensor.mean()) / reward_std
@@ -3035,23 +3053,10 @@ class Sa2VAOPSDModelV2(BaseModel):
                 )
             sample_losses = sample_losses[finite_mask]
         if sample_losses.numel() == 0:
-            return None, {
-                "reward_sum": float(reward_tensor.sum().item()),
-                "reward_count": len(rollout_entries),
-                "rollout_mcq_confidences": rollout_mcq_confidences,
-                "rollout_rewards": rollout_rewards,
-                "rollout_mcq_correct": rollout_mcq_correct,
-                "mcq_correct_count": int(sum(rollout_mcq_correct)),
-                "mcq_total_count": int(len(rollout_mcq_correct)),
-                "mcq_correct_conf_sum": float(
-                    sum(
-                        entry["correct_option_prob"]
-                        for entry in rollout_entries
-                        if entry["selected_correct"]
-                    )
-                ),
-                "skip_reason": "non_finite_grpo_losses",
-            }
+            sample_loss, grpo_meta = _dummy_grpo_result("non_finite_grpo_losses")
+            grpo_meta.update(confuser_meta)
+            grpo_meta["grpo_skip_reason"] = "non_finite_grpo_losses"
+            return sample_loss, grpo_meta
 
         return sample_losses.mean(), {
             "reward_sum": float(reward_tensor.sum().item()),
@@ -3068,6 +3073,10 @@ class Sa2VAOPSDModelV2(BaseModel):
                     if entry["selected_correct"]
                 )
             ),
+            "confuser_candidate_count": int(confuser_meta.get("confuser_candidate_count", 0)),
+            "selected_confuser_count": int(confuser_meta.get("selected_confuser_count", 0)),
+            "scored_confuser_count": int(confuser_meta.get("scored_confuser_count", 0)),
+            "grpo_skip_reason": None,
         }
 
     def compute_grpo_losses_batch(self, batch_items):
@@ -3092,6 +3101,12 @@ class Sa2VAOPSDModelV2(BaseModel):
                 dummy_reason=item.get("dummy_reason"),
                 dummy_completion_ids=item.get("completion_ids"),
             )
+            debug_record = item.get("debug_record")
+            if isinstance(debug_record, dict):
+                debug_record["grpo_skip_reason"] = grpo_meta.get("grpo_skip_reason", grpo_meta.get("skip_reason"))
+                debug_record["confuser_candidate_count"] = grpo_meta.get("confuser_candidate_count")
+                debug_record["selected_confuser_count"] = grpo_meta.get("selected_confuser_count")
+                debug_record["scored_confuser_count"] = grpo_meta.get("scored_confuser_count")
             reward_sum += grpo_meta["reward_sum"]
             reward_count += grpo_meta["reward_count"]
             rollout_mcq_confidences.extend(grpo_meta.get("rollout_mcq_confidences", []))
@@ -3377,6 +3392,10 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "dummy_reason": None,
                 "entry_added": False,
                 "loss_branch": loss_family,
+                "grpo_skip_reason": None,
+                "confuser_candidate_count": None,
+                "selected_confuser_count": None,
+                "scored_confuser_count": None,
             }
             if loss_family == TEACHER_REGENERATE_ROUTE:
                 teacher_regenerate_count += 1
@@ -3473,6 +3492,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                         "is_dummy": is_dummy,
                         "loss_weight": 0.0 if is_dummy else 1.0,
                         "dummy_reason": dummy_reason,
+                        "debug_record": sample_debug_record,
                     }
                 )
                 sample_debug_record["entry_added"] = True
