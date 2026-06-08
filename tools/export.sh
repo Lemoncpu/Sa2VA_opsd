@@ -12,6 +12,7 @@ IMAGE_ROOT="${IMAGE_ROOT:-${DATA_ROOT}/train2014}"
 MODEL_PATH="${MODEL_PATH:-/mnt/shared-storage-user/dnacoding/wuyucheng/workspace/Nemotrontiaozheng/Sa2VA-4B}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-${MODEL_PATH}}"
 WORK_DIR="${WORK_DIR:-${PROJECT_ROOT}/work_dirs/sa2va_opsd_refcoco_internvl3_4b_v3_manifest}"
+SAM_CONFUSER_POOL_DIR="${SAM_CONFUSER_POOL_DIR:-${WORK_DIR}/sam_confuser_pool}"
 
 rjob submit \
   --cpu="${JOB_CPU}" \
@@ -33,6 +34,7 @@ rjob submit \
   MODEL_PATH="${MODEL_PATH}" \
   TOKENIZER_PATH="${TOKENIZER_PATH}" \
   WORK_DIR="${WORK_DIR}" \
+  SAM_CONFUSER_POOL_DIR="${SAM_CONFUSER_POOL_DIR}" \
   bash -lc '
 set -euo pipefail
 
@@ -42,6 +44,7 @@ IMAGE_ROOT="${IMAGE_ROOT:?}"
 MODEL_PATH="${MODEL_PATH:?}"
 TOKENIZER_PATH="${TOKENIZER_PATH:?}"
 WORK_DIR="${WORK_DIR:?}"
+SAM_CONFUSER_POOL_DIR="${SAM_CONFUSER_POOL_DIR:?}"
 
 cd /opt
 tar -xzf vlm_env.tar.gz -C /opt/vlm
@@ -67,6 +70,7 @@ bash "${PROJECT_ROOT}/tools/export_refcoco_opsd_routes_4b.sh" \
   --model-path "${MODEL_PATH}" \
   --tokenizer-path "${TOKENIZER_PATH}" \
   --work-dir "${WORK_DIR}" \
+  --sam-confuser-pool-dir "${SAM_CONFUSER_POOL_DIR}" \
   --global-step 0 \
   --route-model teacher \
   --batch-size 2 \

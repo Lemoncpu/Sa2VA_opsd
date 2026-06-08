@@ -17,7 +17,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from projects.sa2va.datasets.refcoco_opsd import SKIP_OPSD_ROUTE, build_refcoco_opsd_records
+from projects.sa2va.datasets.refcoco_opsd import (
+    SKIP_OPSD_ROUTE,
+    Sa2VAOpsdRefCocoDataset,
+    build_refcoco_opsd_records,
+)
 
 
 def parse_args():
@@ -242,6 +246,21 @@ def collect_refcoco_samples_from_cfg(cfg: dict, *, image_root: str = None, limit
     ]
 
 
+def build_confuser_dataset_from_cfg(cfg: dict, *, image_root: str = None, limit: int = None):
+    dataset_cfg = dict(cfg["train_dataset"])
+    dataset_cfg["image_root"] = image_root or dataset_cfg.get("image_root")
+    dataset_cfg["max_records"] = limit
+    dataset_cfg["route_manifest_path"] = None
+    dataset_cfg["route_manifest_required"] = False
+    dataset_cfg["skip_route_manifest_skip_samples"] = False
+    dataset = Sa2VAOpsdRefCocoDataset(**dataset_cfg)
+    sample_key_to_index = {
+        str(record["sample_key"]): index
+        for index, record in enumerate(dataset.records)
+    }
+    return dataset, sample_key_to_index
+
+
 def filter_samples_by_sample_keys(
     samples: Sequence[Dict],
     *,
@@ -297,6 +316,8 @@ def export_routes_shard(
     *,
     model,
     samples: Sequence[Dict],
+    confuser_dataset,
+    sample_key_to_index: Dict[str, int],
     shard_out_path: Path,
     global_step: int = 0,
     route_model: str = "teacher",
@@ -332,6 +353,21 @@ def export_routes_shard(
                         sample_key=item["sample_key"],
                         debug=False,
                     )
+                    if (
+                        route_info.get("route") == "grpo_positive"
+                        and float(route_info.get("iou", 0.0)) >= float(model.iou_high_threshold)
+                    ):
+                        sample_index = sample_key_to_index.get(str(item["sample_key"]))
+                        if sample_index is None:
+                            raise KeyError(f"Missing sample_key in confuser dataset index: {item['sample_key']}")
+                        prepared_item = confuser_dataset.prepare_data(sample_index)
+                        selected_confusers, _ = model._select_confuser_masks(
+                            gt_mask=gt_mask,
+                            candidate_masks=prepared_item.get("confuser_candidate_masks"),
+                        )
+                        if selected_confusers is None or len(selected_confusers) < int(model.grpo_confuser_num_negatives):
+                            route_info = dict(route_info)
+                            route_info["route"] = "on_policy_distill"
                     manifest_record = build_manifest_record(
                         route_info,
                         sample_key=item["sample_key"],
@@ -428,6 +464,8 @@ def export_routes(
     *,
     model,
     samples: Sequence[Dict],
+    confuser_dataset,
+    sample_key_to_index: Dict[str, int],
     out_path: str,
     global_step: int = 0,
     route_model: str = "teacher",
@@ -515,6 +553,8 @@ def export_routes(
         ) = export_routes_shard(
             model=model,
             samples=shard_samples_local,
+            confuser_dataset=confuser_dataset,
+            sample_key_to_index=sample_key_to_index,
             shard_out_path=shard_out_path,
             global_step=global_step,
             route_model=route_model,
@@ -680,6 +720,7 @@ def export_routes_from_runner(
     model = runner.model.module if hasattr(runner.model, "module") else runner.model
     cfg = runner.cfg
     samples = collect_refcoco_samples_from_cfg(cfg)
+    confuser_dataset, sample_key_to_index = build_confuser_dataset_from_cfg(cfg)
     dataset = getattr(getattr(getattr(runner, "train_loop", None), "dataloader", None), "dataset", None)
     existing_manifest_path = None
     if dataset is not None and hasattr(dataset, "resolve_active_route_manifest_path"):
@@ -687,6 +728,8 @@ def export_routes_from_runner(
     export_summary = export_routes(
         model=model,
         samples=samples,
+        confuser_dataset=confuser_dataset,
+        sample_key_to_index=sample_key_to_index,
         out_path=out_path,
         global_step=global_step,
         route_model=route_model,
@@ -735,14 +778,20 @@ def main():
             image_root=args.image_root,
             limit=args.limit,
         )
+        confuser_dataset, sample_key_to_index = build_confuser_dataset_from_cfg(
+            cfg,
+            image_root=args.image_root,
+            limit=args.limit,
+        )
         export_summary = export_routes(
             model=model,
             samples=samples,
+            confuser_dataset=confuser_dataset,
+            sample_key_to_index=sample_key_to_index,
             out_path=args.out,
             global_step=args.global_step,
             route_model=args.route_model,
             batch_size=args.batch_size,
-            update_latest=args.update_latest,
             limit=args.limit,
             existing_manifest_path=args.out if args.only_missing_from_manifest else None,
             only_missing_from_manifest=args.only_missing_from_manifest,

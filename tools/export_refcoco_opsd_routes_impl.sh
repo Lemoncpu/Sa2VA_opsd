@@ -31,6 +31,7 @@ ROUTE_MODEL="${ROUTE_MODEL:-student}"
 GLOBAL_STEP="${GLOBAL_STEP:-0}"
 LIMIT="${LIMIT:-}"
 ONLY_MISSING_FROM_MANIFEST="${ONLY_MISSING_FROM_MANIFEST:-0}"
+SAM_CONFUSER_POOL_DIR="${SAM_CONFUSER_POOL_DIR:-}"
 DEEPSPEED="${DEEPSPEED:-deepspeed_zero2}"
 BATCH_SIZE_OVERRIDE="${BATCH_SIZE_OVERRIDE:-}"
 DEFAULT_GPUS=8
@@ -224,6 +225,7 @@ usage() {
   echo "  --route-model NAME      teacher | student. Default: student"
   echo "  --global-step N         Recorded global step. Default: 0"
   echo "  --limit N               Optional sample cap."
+  echo "  --sam-confuser-pool-dir PATH  Optional root dir of per-image SAM confuser pools."
   echo "  --only-missing          Only export sample_keys missing from the existing manifest, then merge them back."
   echo "  -h, --help              Show this help."
 }
@@ -296,6 +298,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --limit)
       LIMIT="$2"
+      shift 2
+      ;;
+    --sam-confuser-pool-dir)
+      SAM_CONFUSER_POOL_DIR="$2"
       shift 2
       ;;
     --only-missing|--only-missing-from-manifest)
@@ -404,6 +410,11 @@ if [[ -n "${CHECKPOINT_PATH}" && ! -e "${CHECKPOINT_PATH}" ]]; then
   exit 1
 fi
 
+if [[ -n "${SAM_CONFUSER_POOL_DIR}" && ! -d "${SAM_CONFUSER_POOL_DIR}" ]]; then
+  echo "SAM confuser pool dir does not exist: ${SAM_CONFUSER_POOL_DIR}" >&2
+  exit 1
+fi
+
 if [[ "${ROUTE_MODEL}" != "teacher" && "${ROUTE_MODEL}" != "student" ]]; then
   echo "--route-model must be teacher or student, got: ${ROUTE_MODEL}" >&2
   exit 1
@@ -430,6 +441,10 @@ EXPORT_ARGS=(
   "train_dataset.split=${SPLIT}"
   "train_dataset.image_root=${IMAGE_ROOT}"
 )
+
+if [[ -n "${SAM_CONFUSER_POOL_DIR}" ]]; then
+  EXPORT_ARGS+=("train_dataset.sam_confuser_pool_dir=${SAM_CONFUSER_POOL_DIR}")
+fi
 
 if [[ -n "${CHECKPOINT_PATH}" ]]; then
   EXPORT_ARGS+=(--checkpoint "${CHECKPOINT_PATH}")
@@ -464,6 +479,7 @@ echo "  CHECKPOINT_PATH=${CHECKPOINT_PATH}"
 echo "  ROUTE_MODEL=${ROUTE_MODEL}"
 echo "  GLOBAL_STEP=${GLOBAL_STEP}"
 echo "  LIMIT=${LIMIT}"
+echo "  SAM_CONFUSER_POOL_DIR=${SAM_CONFUSER_POOL_DIR}"
 echo "  BATCH_SIZE_OVERRIDE=${BATCH_SIZE_OVERRIDE}"
 echo "  EFFECTIVE_BATCH_SIZE=${EFFECTIVE_BATCH_SIZE}"
 echo "  ONLY_MISSING_FROM_MANIFEST=${ONLY_MISSING_FROM_MANIFEST}"
