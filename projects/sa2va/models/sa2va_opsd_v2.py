@@ -1315,6 +1315,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         total_regen_ce,
         total_onpolicy_jsd,
         total_grpo,
+        rank_debug_records,
     ):
         if not self.enable_debug_sample_logging:
             return
@@ -1322,13 +1323,34 @@ class Sa2VAOPSDModelV2(BaseModel):
         total_regen_value = None if total_regen_ce is None else float(total_regen_ce.detach().item())
         total_onpolicy_value = None if total_onpolicy_jsd is None else float(total_onpolicy_jsd.detach().item())
         total_grpo_value = None if total_grpo is None else float(total_grpo.detach().item())
+        records_text = []
+        for record in rank_debug_records:
+            records_text.append(
+                "sample_key={sample_key} loss_branch={loss_branch} online_route={online_route} "
+                "iou={iou:.4f} is_dummy={is_dummy} dummy_reason={dummy_reason} "
+                "grpo_skip_reason={grpo_skip_reason} confuser_candidate_count={confuser_candidate_count} "
+                "selected_confuser_count={selected_confuser_count} "
+                "scored_confuser_count={scored_confuser_count}".format(
+                    sample_key=record.get("sample_key"),
+                    loss_branch=record.get("loss_branch"),
+                    online_route=record.get("online_route"),
+                    iou=float(record.get("iou", 0.0)),
+                    is_dummy=record.get("is_dummy"),
+                    dummy_reason=record.get("dummy_reason"),
+                    grpo_skip_reason=record.get("grpo_skip_reason"),
+                    confuser_candidate_count=record.get("confuser_candidate_count"),
+                    selected_confuser_count=record.get("selected_confuser_count"),
+                    scored_confuser_count=record.get("scored_confuser_count"),
+                )
+            )
         print(
             "[Sa2VA_OPSD_V2_PRE_RETURN_DEBUG] "
             f"rank={self._dist_rank()} batch_route={batch_route} last_route={last_route} "
             f"optimized_count={optimized_count} regen_loss_count={regen_loss_count} "
             f"onpolicy_loss_count={onpolicy_loss_count} grpo_loss_count={grpo_loss_count} "
             f"total_loss={total_loss_value} total_regen_ce={total_regen_value} "
-            f"total_onpolicy_jsd={total_onpolicy_value} total_grpo={total_grpo_value}",
+            f"total_onpolicy_jsd={total_onpolicy_value} total_grpo={total_grpo_value} "
+            f"records=[{' ; '.join(records_text)}]",
             flush=True,
         )
 
@@ -3701,6 +3723,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                 total_regen_ce=total_regen_ce,
                 total_onpolicy_jsd=total_onpolicy_jsd,
                 total_grpo=total_grpo,
+                rank_debug_records=rank_debug_records,
             )
             metrics = {
                 "loss_opsd_total": self._zero_scalar(requires_grad=True, dtype=zero.dtype),
@@ -3819,6 +3842,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             total_regen_ce=total_regen_ce,
             total_onpolicy_jsd=total_onpolicy_jsd,
             total_grpo=total_grpo,
+            rank_debug_records=rank_debug_records,
         )
         metrics = {
             "loss_opsd_total": avg_total_loss,
