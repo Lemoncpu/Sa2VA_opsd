@@ -12,20 +12,6 @@ class OpsdRouteRefreshHook(Hook):
 
     priority = "LOW"
 
-    class _SkipAdvanceIterator:
-        def __init__(self, iterator, skip_budget: int):
-            self._iterator = iterator
-            self._skip_budget = max(int(skip_budget), 0)
-
-        def __iter__(self):
-            return self
-
-        def __next__(self):
-            if self._skip_budget > 0:
-                self._skip_budget -= 1
-                return None
-            return next(self._iterator)
-
     def __init__(
         self,
         interval: int = 5000,
@@ -34,7 +20,6 @@ class OpsdRouteRefreshHook(Hook):
         export_limit: int = None,
         restrict_manifest_to_active_window: bool = True,
         save_checkpoint_route_snapshot: bool = False,
-        export_resume_route_window: bool = True,
     ):
         if interval <= 0:
             raise ValueError(f"interval must be positive, got {interval}.")
@@ -44,7 +29,6 @@ class OpsdRouteRefreshHook(Hook):
         self.export_limit = export_limit
         self.restrict_manifest_to_active_window = bool(restrict_manifest_to_active_window)
         self.save_checkpoint_route_snapshot = bool(save_checkpoint_route_snapshot)
-        self.export_resume_route_window = bool(export_resume_route_window)
 
     @staticmethod
     def _unwrap_model(runner):
@@ -111,9 +95,7 @@ class OpsdRouteRefreshHook(Hook):
     def _build_export_paths(self, runner, global_step: int):
         cache_dir = Path(runner.work_dir) / self.route_cache_dir
         cache_dir.mkdir(parents=True, exist_ok=True)
-        manifest_path = cache_dir / f"routes_step_{global_step:07d}.jsonl"
-        latest_path = cache_dir / "routes_latest.jsonl"
-        return manifest_path, latest_path
+        return cache_dir / f"routes_step_{global_step:07d}.jsonl"
 
     def _resolve_active_window_size(self, runner) -> int:
         train_loop, _, sampler = self._get_dataset_and_sampler(runner)
@@ -129,7 +111,7 @@ class OpsdRouteRefreshHook(Hook):
 
         if consumed_sample_keys is None:
             consumed_sample_keys = self._get_global_consumed_sample_keys(runner)
-        manifest_path, _ = self._build_export_paths(runner, global_step)
+        manifest_path = self._build_export_paths(runner, global_step)
         active_window_size = None
         if self.restrict_manifest_to_active_window:
             active_window_size = self._resolve_active_window_size(runner)
@@ -265,33 +247,6 @@ class OpsdRouteRefreshHook(Hook):
             skip_count,
         )
 
-    def _maybe_bootstrap_resume_routes(self, runner, train_loop, dataloader) -> None:
-        if not self.export_resume_route_window:
-            return
-        if getattr(train_loop, "_opsd_resume_route_bootstrap_done", False):
-            return
-        resume_iter = int(getattr(train_loop, "_iter", 0) or 0)
-        if resume_iter <= 0:
-            return
-        consumed_sample_keys = []
-        self._export_routes(runner, resume_iter, consumed_sample_keys=consumed_sample_keys)
-        self._refresh_dataset_and_log(runner, train_loop, dataloader)
-        train_loop.dataloader_iterator = self._SkipAdvanceIterator(
-            train_loop.dataloader_iterator,
-            skip_budget=resume_iter,
-        )
-        train_loop._opsd_resume_route_bootstrap_done = True
-        if self.save_checkpoint_route_snapshot:
-            self._save_checkpoint_route_snapshot(
-                runner,
-                resume_iter,
-                consumed_sample_keys=consumed_sample_keys,
-            )
-        runner.logger.info(
-            "Resume bootstrap exported OPSD routes for step=%s and reset dataloader advance on the new active manifest.",
-            resume_iter,
-        )
-
     def before_train_epoch(self, runner) -> None:
         train_loop, _, sampler = self._get_dataset_and_sampler(runner)
         if train_loop is None:
@@ -302,7 +257,6 @@ class OpsdRouteRefreshHook(Hook):
         if dataloader is None:
             return
         self._refresh_dataset_and_log(runner, train_loop, dataloader)
-        self._maybe_bootstrap_resume_routes(runner, train_loop, dataloader)
 
     def _refresh_dataset_and_log(self, runner, train_loop, dataloader) -> None:
         dataset = getattr(dataloader, "dataset", None)

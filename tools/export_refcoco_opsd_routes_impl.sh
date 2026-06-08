@@ -420,7 +420,6 @@ EXPORT_ARGS=(
   --route-model "${ROUTE_MODEL}"
   --global-step "${GLOBAL_STEP}"
   --image-root "${IMAGE_ROOT}"
-  --update-latest
   --cfg-options
   "path=${MODEL_PATH}"
   "tokenizer_path=${TOKENIZER_PATH}"

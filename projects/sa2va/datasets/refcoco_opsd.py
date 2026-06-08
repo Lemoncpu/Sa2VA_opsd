@@ -138,7 +138,6 @@ class Sa2VAOpsdRefCocoDataset(Dataset):
         skip_empty_masks: bool = True,
         skip_missing_images: bool = True,
         route_manifest_path: str = None,
-        route_manifest_latest_path: str = None,
         route_manifest_required: bool = False,
         skip_route_manifest_skip_samples: bool = True,
         sam_confuser_pool_dir: str = None,
@@ -162,7 +161,6 @@ class Sa2VAOpsdRefCocoDataset(Dataset):
         self.skip_empty_masks = skip_empty_masks
         self.skip_missing_images = skip_missing_images
         self.route_manifest_path = route_manifest_path
-        self.route_manifest_latest_path = route_manifest_latest_path
         self.route_manifest_required = route_manifest_required
         self.skip_route_manifest_skip_samples = skip_route_manifest_skip_samples
         self.sam_confuser_pool_dir = sam_confuser_pool_dir
@@ -208,9 +206,6 @@ class Sa2VAOpsdRefCocoDataset(Dataset):
         return [100] * len(self)
 
     def resolve_active_route_manifest_path(self) -> Optional[str]:
-        latest_path = self.route_manifest_latest_path
-        if latest_path and os.path.exists(latest_path):
-            return latest_path
         return self.route_manifest_path
 
     @staticmethod
@@ -250,20 +245,6 @@ class Sa2VAOpsdRefCocoDataset(Dataset):
         self.route_manifest_mtime = os.path.getmtime(path)
         self.route_manifest_version += 1
 
-    def _load_fallback_route_manifest_if_available(self) -> bool:
-        fallback_path = self.route_manifest_path
-        if not fallback_path:
-            return False
-        if self.active_route_manifest_path == fallback_path:
-            return False
-        if not os.path.exists(fallback_path):
-            return False
-        self.route_info_by_key = self.load_route_manifest_file(fallback_path)
-        self.active_route_manifest_path = fallback_path
-        self.route_manifest_mtime = os.path.getmtime(fallback_path)
-        self.route_manifest_version += 1
-        return True
-
     def _apply_route_manifest_filter(self):
         if self.skip_route_manifest_skip_samples and self.route_info_by_key:
             self.records = [
@@ -272,17 +253,10 @@ class Sa2VAOpsdRefCocoDataset(Dataset):
                 if self.get_route_for_sample_key(record["sample_key"]) != SKIP_OPSD_ROUTE
             ]
             if not self.records:
-                if self._load_fallback_route_manifest_if_available():
-                    self.records = [
-                        record
-                        for record in self._base_records
-                        if self.get_route_for_sample_key(record["sample_key"]) != SKIP_OPSD_ROUTE
-                    ]
-                if not self.records:
-                    raise ValueError(
-                        "All RefCOCO OPSD records were filtered by route manifest: "
-                        f"{self.active_route_manifest_path or self.route_manifest_path}"
-                    )
+                raise ValueError(
+                    "All RefCOCO OPSD records were filtered by route manifest: "
+                    f"{self.active_route_manifest_path or self.route_manifest_path}"
+                )
             return
         self.records = list(self._base_records)
 

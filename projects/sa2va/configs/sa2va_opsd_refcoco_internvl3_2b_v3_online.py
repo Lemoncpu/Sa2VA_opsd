@@ -10,12 +10,10 @@ use_manifest_routes = False
 model["use_online_route_for_loss"] = True
 
 train_dataset["route_manifest_path"] = None
-train_dataset["route_manifest_latest_path"] = None
 train_dataset["route_manifest_required"] = False
 train_dataset["skip_route_manifest_skip_samples"] = False
 
 train_dataloader["dataset"]["route_manifest_path"] = None
-train_dataloader["dataset"]["route_manifest_latest_path"] = None
 train_dataloader["dataset"]["route_manifest_required"] = False
 train_dataloader["dataset"]["skip_route_manifest_skip_samples"] = False
 

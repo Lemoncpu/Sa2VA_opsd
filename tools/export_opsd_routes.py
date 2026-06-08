@@ -36,11 +36,6 @@ def parse_args():
     parser.add_argument("--global-step", type=int, default=0, help="Step value recorded in manifest.")
     parser.add_argument("--image-root", default=None, help="Optional image root override.")
     parser.add_argument(
-        "--update-latest",
-        action="store_true",
-        help="Also update routes_latest.jsonl beside the output manifest.",
-    )
-    parser.add_argument(
         "--only-missing-from-manifest",
         action="store_true",
         help="Only export sample_keys missing from the existing manifest, then merge results back.",
@@ -415,21 +410,12 @@ def merge_shards(
     *,
     out_path: Path,
     shard_paths: Sequence[Path],
-    update_latest: bool = False,
 ):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as out_file:
         for shard_path in shard_paths:
             with open(shard_path, "r", encoding="utf-8") as shard_file:
                 shutil.copyfileobj(shard_file, out_file)
-    if update_latest:
-        latest_path = out_path.parent / "routes_latest.jsonl"
-        if latest_path.exists() or latest_path.is_symlink():
-            latest_path.unlink()
-        try:
-            latest_path.symlink_to(out_path.name)
-        except OSError:
-            shutil.copyfile(out_path, latest_path)
 
 
 def cleanup_shards(shard_paths: Sequence[Path]) -> None:
@@ -446,7 +432,6 @@ def export_routes(
     global_step: int = 0,
     route_model: str = "teacher",
     batch_size: int = 1,
-    update_latest: bool = False,
     limit: Optional[int] = None,
     consumed_sample_keys: Optional[Sequence[str]] = None,
     existing_manifest_path: Optional[str] = None,
@@ -586,7 +571,6 @@ def export_routes(
             merge_shards(
                 out_path=out_path,
                 shard_paths=shard_paths,
-                update_latest=update_latest,
             )
             if restrict_manifest_to_active_window:
                 exported_records = load_jsonl_records(out_path)
@@ -613,14 +597,6 @@ def export_routes(
                     updated_records=active_records,
                 )
                 write_jsonl_records(out_path, final_records)
-                if update_latest:
-                    latest_path = out_path.parent / "routes_latest.jsonl"
-                    if latest_path.exists() or latest_path.is_symlink():
-                        latest_path.unlink()
-                    try:
-                        latest_path.symlink_to(out_path.name)
-                    except OSError:
-                        shutil.copyfile(out_path, latest_path)
                 merged_counts = summarize_route_counts(final_records)
                 manifest_record_count = len(final_records)
                 active_record_count = count_active_records(final_records)
@@ -631,14 +607,6 @@ def export_routes(
                     updated_records=load_jsonl_records(out_path),
                 )
                 write_jsonl_records(out_path, merged_records)
-                if update_latest:
-                    latest_path = out_path.parent / "routes_latest.jsonl"
-                    if latest_path.exists() or latest_path.is_symlink():
-                        latest_path.unlink()
-                    try:
-                        latest_path.symlink_to(out_path.name)
-                    except OSError:
-                        shutil.copyfile(out_path, latest_path)
                 merged_counts = summarize_route_counts(merged_records)
                 manifest_record_count = len(merged_records)
                 active_record_count = count_active_records(merged_records)
@@ -723,7 +691,6 @@ def export_routes_from_runner(
         global_step=global_step,
         route_model=route_model,
         batch_size=batch_size,
-        update_latest=True,
         limit=limit,
         consumed_sample_keys=consumed_sample_keys,
         existing_manifest_path=existing_manifest_path,

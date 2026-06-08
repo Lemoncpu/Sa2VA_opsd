@@ -36,7 +36,6 @@ save_steps = 500
 save_total_limit = 2
 route_refresh_interval = 5000
 route_manifest_path = "./work_dirs/sa2va_opsd_refcoco_internvl3_2b_v3/route_cache/routes_step_0000000.jsonl"
-route_manifest_latest_path = "./work_dirs/sa2va_opsd_refcoco_internvl3_2b_v3/route_cache/routes_latest.jsonl"
 sam_confuser_pool_dir = "./work_dirs/refcoco_sam_confuser_pool"
 route_mode = "manifest"
 
@@ -111,7 +110,6 @@ train_dataset = dict(
     skip_empty_masks=True,
     student_question=DEFAULT_MASK_TO_CAPTION_QUESTION,
     route_manifest_path=route_manifest_path if use_manifest_routes else None,
-    route_manifest_latest_path=route_manifest_latest_path if use_manifest_routes else None,
     route_manifest_required=use_manifest_routes,
     skip_route_manifest_skip_samples=use_manifest_routes,
     sam_confuser_pool_dir=sam_confuser_pool_dir,

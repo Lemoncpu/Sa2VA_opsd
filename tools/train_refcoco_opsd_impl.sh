@@ -93,6 +93,29 @@ validate_positive_int() {
   fi
 }
 
+resolve_checkpoint_step() {
+  local checkpoint_path="$1"
+  local checkpoint_name
+
+  checkpoint_name="$(basename "${checkpoint_path}")"
+  if [[ "${checkpoint_name}" =~ ^iter_([0-9]+)\.pth$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  if [[ "${checkpoint_name}" =~ ^step_([0-9]+)\.pth$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  if [[ "${checkpoint_name}" =~ (^|[^0-9])iter_([0-9]+)([^0-9]|$) ]]; then
+    echo "${BASH_REMATCH[2]}"
+    return 0
+  fi
+
+  echo "Failed to parse training step from checkpoint name: ${checkpoint_name}" >&2
+  echo "Expected a name like iter_50.pth." >&2
+  exit 1
+}
+
 validate_cuda_device_ids() {
   local csv="${1// /}"
   local rest
@@ -447,8 +470,11 @@ EFFECTIVE_BATCH_SIZE="${BATCH_SIZE_OVERRIDE:-1}"
 EFFECTIVE_ACCUMULATIVE_COUNTS="${ACCUMULATIVE_COUNTS_OVERRIDE:-1}"
 PER_DEVICE_BATCH_SIZE_OVERRIDE=$((EFFECTIVE_BATCH_SIZE * EFFECTIVE_ACCUMULATIVE_COUNTS))
 ROUTE_CACHE_DIR="${WORK_DIR}/route_cache"
-ROUTE_MANIFEST_PATH="${ROUTE_CACHE_DIR}/routes_step_0000000.jsonl"
-ROUTE_MANIFEST_LATEST_PATH="${ROUTE_CACHE_DIR}/routes_latest.jsonl"
+ROUTE_MANIFEST_STEP=0
+if [[ -n "${RESUME_PATH}" ]]; then
+  ROUTE_MANIFEST_STEP="$(resolve_checkpoint_step "${RESUME_PATH}")"
+fi
+ROUTE_MANIFEST_PATH="${ROUTE_CACHE_DIR}/routes_step_$(printf '%07d' "${ROUTE_MANIFEST_STEP}").jsonl"
 
 if [[ "${ROUTE_MODE}" == "online" && "${EFFECTIVE_BATCH_SIZE}" -ne 1 ]]; then
   echo "--route-mode online currently requires per-device --batch-size 1 to avoid mixed online OPSD routes within one batch." >&2
@@ -491,9 +517,7 @@ fi
 if [[ "${ROUTE_MODE}" == "manifest" ]]; then
   TRAIN_ARGS+=(
     "train_dataset.route_manifest_path=${ROUTE_MANIFEST_PATH}"
-    "train_dataset.route_manifest_latest_path=${ROUTE_MANIFEST_LATEST_PATH}"
     "train_dataloader.dataset.route_manifest_path=${ROUTE_MANIFEST_PATH}"
-    "train_dataloader.dataset.route_manifest_latest_path=${ROUTE_MANIFEST_LATEST_PATH}"
   )
 fi
 if [[ -n "${BATCH_SIZE_OVERRIDE}" ]]; then
@@ -542,6 +566,7 @@ echo "  DEEPSPEED=${DEEPSPEED}"
 echo "  BATCH_SIZE_OVERRIDE=${BATCH_SIZE_OVERRIDE}"
 echo "  ACCUMULATIVE_COUNTS_OVERRIDE=${ACCUMULATIVE_COUNTS_OVERRIDE}"
 echo "  ROUTE_MODE=${ROUTE_MODE}"
+echo "  ROUTE_MANIFEST_PATH=${ROUTE_MANIFEST_PATH}"
 echo "  SAM_CONFUSER_POOL_DIR=${SAM_CONFUSER_POOL_DIR}"
 echo "  LOAD_FROM_PATH=${LOAD_FROM_PATH}"
 echo "  RESUME_PATH=${RESUME_PATH}"
