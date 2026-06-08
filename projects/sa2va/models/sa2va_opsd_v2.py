@@ -2471,11 +2471,16 @@ class Sa2VAOPSDModelV2(BaseModel):
     def _empty_loss_vector(self):
         return torch.empty(0, device=self.device, dtype=next(self.student_model.parameters()).dtype)
 
+    def _zero_scalar(self, *, requires_grad=False, dtype=None):
+        if dtype is None:
+            dtype = next(self.student_model.parameters()).dtype
+        return torch.zeros((), device=self.device, dtype=dtype, requires_grad=requires_grad)
+
     def _placeholder_loss_vector(self, count, *, reason):
         count = int(count)
         if count <= 0:
             return self._empty_loss_vector()
-        zero = next(self.student_model.parameters()).sum() * 0.0
+        zero = self._zero_scalar(requires_grad=True)
         if self._should_debug_print():
             print(
                 "[Sa2VA_OPSD_V2_DDP_DEBUG] "
@@ -2898,7 +2903,10 @@ class Sa2VAOPSDModelV2(BaseModel):
         )
         reward_span = float((reward_tensor.max() - reward_tensor.min()).item())
         if reward_span < self.grpo_advantage_eps:
-            zero_loss = next(self.student_model.parameters()).sum() * 0.0
+            zero_loss = self._zero_scalar(
+                requires_grad=True,
+                dtype=rollout_entries[0]["old_token_log_probs"].dtype,
+            )
             return zero_loss, {
                 "reward_sum": float(reward_tensor.sum().item()),
                 "reward_count": len(rollout_entries),
@@ -3075,7 +3083,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         routes = data.get("routes") or [None] * len(images)
         batch_route = self._resolve_batch_route(routes)
 
-        zero = next(self.student_model.parameters()).sum() * 0.0
+        zero = self._zero_scalar(dtype=next(self.student_model.parameters()).dtype)
         total_loss = None
         total_iou = 0.0
         routed_count = 0
@@ -3602,7 +3610,7 @@ class Sa2VAOPSDModelV2(BaseModel):
 
         if optimized_count == 0:
             metrics = {
-                "loss_opsd_total": zero,
+                "loss_opsd_total": self._zero_scalar(requires_grad=True, dtype=zero.dtype),
                 "opsd_regen_ce": zero,
                 "opsd_onpolicy_jsd": zero,
                 "opsd_grpo": zero,
