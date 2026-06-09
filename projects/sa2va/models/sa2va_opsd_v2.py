@@ -2999,34 +2999,12 @@ class Sa2VAOPSDModelV2(BaseModel):
             dtype=rollout_entries[0]["old_token_log_probs"].dtype,
         )
         reward_span = float((reward_tensor.max() - reward_tensor.min()).item())
-        if reward_span < self.grpo_advantage_eps:
-            zero_loss = self._zero_scalar(
-                requires_grad=True,
-                dtype=rollout_entries[0]["old_token_log_probs"].dtype,
-            )
-            return zero_loss, {
-                "reward_sum": float(reward_tensor.sum().item()),
-                "reward_count": len(rollout_entries),
-                "rollout_mcq_confidences": rollout_mcq_confidences,
-                "rollout_rewards": rollout_rewards,
-                "rollout_mcq_correct": rollout_mcq_correct,
-                "mcq_correct_count": int(sum(rollout_mcq_correct)),
-                "mcq_total_count": int(len(rollout_mcq_correct)),
-                "mcq_correct_conf_sum": float(
-                    sum(
-                        entry["correct_option_prob"]
-                        for entry in rollout_entries
-                        if entry["selected_correct"]
-                    )
-                ),
-                "skip_reason": "zero_reward_variance",
-                "confuser_candidate_count": int(confuser_meta.get("confuser_candidate_count", 0)),
-                "selected_confuser_count": int(confuser_meta.get("selected_confuser_count", 0)),
-                "scored_confuser_count": int(confuser_meta.get("scored_confuser_count", 0)),
-                "grpo_skip_reason": "zero_reward_variance",
-            }
-        reward_std = reward_tensor.std(unbiased=False).clamp_min(self.grpo_advantage_eps)
-        advantages = (reward_tensor - reward_tensor.mean()) / reward_std
+        zero_reward_variance = reward_span < self.grpo_advantage_eps
+        if zero_reward_variance:
+            advantages = torch.zeros_like(reward_tensor)
+        else:
+            reward_std = reward_tensor.std(unbiased=False).clamp_min(self.grpo_advantage_eps)
+            advantages = (reward_tensor - reward_tensor.mean()) / reward_std
 
         completion_pad_id = self.tokenizer.pad_token_id
         if completion_pad_id is None:
@@ -3098,7 +3076,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             "confuser_candidate_count": int(confuser_meta.get("confuser_candidate_count", 0)),
             "selected_confuser_count": int(confuser_meta.get("selected_confuser_count", 0)),
             "scored_confuser_count": int(confuser_meta.get("scored_confuser_count", 0)),
-            "grpo_skip_reason": None,
+            "grpo_skip_reason": "zero_reward_variance" if zero_reward_variance else None,
         }
 
     def compute_grpo_losses_batch(self, batch_items):
@@ -3112,6 +3090,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         mcq_total_count = 0
         mcq_correct_conf_sum = 0.0
         skip_reasons = []
+        local_modes = []
         for item in batch_items:
             sample_loss, grpo_meta = self.compute_grpo_loss(
                 image=item["image"],
@@ -3129,6 +3108,10 @@ class Sa2VAOPSDModelV2(BaseModel):
                 debug_record["confuser_candidate_count"] = grpo_meta.get("confuser_candidate_count")
                 debug_record["selected_confuser_count"] = grpo_meta.get("selected_confuser_count")
                 debug_record["scored_confuser_count"] = grpo_meta.get("scored_confuser_count")
+            grpo_mode = str(grpo_meta.get("grpo_skip_reason") or "real")
+            if grpo_mode == "zero_reward_variance":
+                grpo_mode = "real"
+            local_modes.append(grpo_mode)
             reward_sum += grpo_meta["reward_sum"]
             reward_count += grpo_meta["reward_count"]
             rollout_mcq_confidences.extend(grpo_meta.get("rollout_mcq_confidences", []))
@@ -3143,6 +3126,62 @@ class Sa2VAOPSDModelV2(BaseModel):
                 skip_reason = grpo_meta.get("skip_reason")
                 if skip_reason:
                     skip_reasons.append(str(skip_reason))
+        ddp_fallback_reasons = None
+        if self._dist_is_initialized():
+            payload = {
+                "rank": self._dist_rank(),
+                "modes": tuple(local_modes),
+            }
+            gathered_payloads = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(gathered_payloads, payload)
+            gathered_mode_signatures = {tuple(item.get("modes", ())) for item in gathered_payloads}
+            if len(gathered_mode_signatures) > 1:
+                ddp_fallback_reasons = [
+                    f"rank{item.get('rank')}:{','.join(item.get('modes', ())) or 'empty'}"
+                    for item in gathered_payloads
+                ]
+        if ddp_fallback_reasons is not None:
+            if self._should_debug_print():
+                print(
+                    "[Sa2VA_OPSD_V2_DDP_DEBUG] "
+                    "grpo_mode_mismatch forcing_dummy "
+                    f"reasons={ddp_fallback_reasons}",
+                    flush=True,
+                )
+            sample_losses = []
+            reward_sum = 0.0
+            reward_count = 0
+            rollout_mcq_confidences = []
+            rollout_rewards = []
+            rollout_mcq_correct = []
+            mcq_correct_count = 0
+            mcq_total_count = 0
+            mcq_correct_conf_sum = 0.0
+            skip_reasons = [f"ddp_grpo_mode_mismatch:{reason}" for reason in ddp_fallback_reasons]
+            for item in batch_items:
+                sample_loss, grpo_meta = self.compute_grpo_loss(
+                    image=item["image"],
+                    prompt_masks=item["prompt_masks"],
+                    student_question=item["student_question"],
+                    gt_mask=item["gt_mask"],
+                    confuser_candidate_masks=item.get("confuser_candidate_masks"),
+                    force_dummy=True,
+                    dummy_reason="ddp_grpo_mode_mismatch",
+                    dummy_completion_ids=item.get("completion_ids"),
+                )
+                debug_record = item.get("debug_record")
+                if isinstance(debug_record, dict):
+                    debug_record["grpo_skip_reason"] = "ddp_grpo_mode_mismatch"
+                reward_sum += grpo_meta["reward_sum"]
+                reward_count += grpo_meta["reward_count"]
+                rollout_mcq_confidences.extend(grpo_meta.get("rollout_mcq_confidences", []))
+                rollout_rewards.extend(grpo_meta.get("rollout_rewards", []))
+                rollout_mcq_correct.extend(grpo_meta.get("rollout_mcq_correct", []))
+                mcq_correct_count += int(grpo_meta.get("mcq_correct_count", 0))
+                mcq_total_count += int(grpo_meta.get("mcq_total_count", 0))
+                mcq_correct_conf_sum += float(grpo_meta.get("mcq_correct_conf_sum", 0.0))
+                if sample_loss is not None:
+                    sample_losses.append(sample_loss * float(item.get("loss_weight", 1.0)))
         if not sample_losses:
             return self._placeholder_loss_vector(
                 len(batch_items),
