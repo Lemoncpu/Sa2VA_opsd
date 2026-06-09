@@ -1,12 +1,22 @@
 import argparse
 import json
 import re
+import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 
 
-METRICS = ("loss_opsd_total", "loss_opsd_jsd", "verifier_iou")
+METRICS = (
+    "loss_opsd_total",
+    "opsd_regen_ce",
+    "opsd_onpolicy_jsd",
+    "opsd_grpo",
+    "verifier_iou",
+    "teacher_regenerate_gate_pass_rate",
+    "grpo_reward_mean",
+    "grpo_mcq_acc",
+)
 
 
 def parse_args():
@@ -29,6 +39,17 @@ def parse_args():
         type=int,
         default=1,
         help="Optional moving average window. Use 1 to disable smoothing.",
+    )
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="Continuously refresh the plot while training is running.",
+    )
+    parser.add_argument(
+        "--interval-seconds",
+        type=float,
+        default=10.0,
+        help="Refresh interval used with --watch. Default: 10 seconds.",
     )
     return parser.parse_args()
 
@@ -165,7 +186,7 @@ def choose_parser(path: Path):
 def plot_metrics(metric_data, output_path: Path, smooth: int):
     available_metrics = [metric for metric in METRICS if metric_data[metric]]
     if not available_metrics:
-        raise ValueError("No metric data found for loss_opsd_total/loss_opsd_jsd or verifier_iou.")
+        raise ValueError("No metric data found for configured training metrics.")
 
     fig, axes = plt.subplots(len(available_metrics), 1, figsize=(10, 4 * len(available_metrics)), sharex=True)
     if len(available_metrics) == 1:
@@ -193,18 +214,23 @@ def plot_metrics(metric_data, output_path: Path, smooth: int):
 def main():
     args = parse_args()
     log_path = Path(args.log_path)
-    candidate_files = find_candidate_files(log_path)
-    metric_groups = [choose_parser(path) for path in candidate_files]
-    metric_data = merge_metric_data(metric_groups)
-
     if args.output is not None:
         output_path = Path(args.output)
     else:
         base_dir = log_path if log_path.is_dir() else log_path.parent
         output_path = base_dir / "training_metrics.png"
+    watch = bool(args.watch)
+    refresh_interval = max(float(args.interval_seconds), 1.0)
 
-    plot_metrics(metric_data, output_path, smooth=max(1, args.smooth))
-    print(f"Saved plot to: {output_path}")
+    while True:
+        candidate_files = find_candidate_files(log_path)
+        metric_groups = [choose_parser(path) for path in candidate_files]
+        metric_data = merge_metric_data(metric_groups)
+        plot_metrics(metric_data, output_path, smooth=max(1, args.smooth))
+        print(f"Saved plot to: {output_path}")
+        if not watch:
+            break
+        time.sleep(refresh_interval)
 
 
 if __name__ == "__main__":

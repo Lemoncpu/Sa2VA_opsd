@@ -2923,6 +2923,23 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "scored_confuser_count": 0,
             }
 
+        def _current_token_log_probs_rows(rollout_entries):
+            current_rows = []
+            for entry in rollout_entries:
+                completion_ids = entry["completion_ids"]
+                student_logits = self._forward_sequence_with_model(
+                    self.student_model,
+                    image,
+                    prompt_masks,
+                    student_question,
+                    completion_ids,
+                    apply_mask_focus=True,
+                )
+                current_rows.append(
+                    self._token_log_probs_from_logits(student_logits, completion_ids)
+                )
+            return current_rows
+
         rollout_entries = []
         rollout_mcq_confidences = []
         rollout_rewards = []
@@ -3023,19 +3040,13 @@ class Sa2VAOPSDModelV2(BaseModel):
             dtype=rollout_entries[0]["old_token_log_probs"].dtype,
             device=self.device,
         )
-        student_logits = self._forward_sequence_batch_with_model(
-            self.student_model,
-            image,
-            prompt_masks,
-            student_question,
-            completion_batch,
-            apply_mask_focus=True,
+        current_token_log_probs_batch, _ = self._pad_tensor_rows(
+            _current_token_log_probs_rows(rollout_entries),
+            pad_value=0.0,
+            dtype=rollout_entries[0]["old_token_log_probs"].dtype,
+            device=self.device,
         )
-        current_token_log_probs = self._token_log_probs_from_logits(
-            student_logits,
-            completion_batch,
-        )
-        log_ratio = (current_token_log_probs - old_token_log_probs_batch).clamp(min=-20.0, max=20.0)
+        log_ratio = (current_token_log_probs_batch - old_token_log_probs_batch).clamp(min=-20.0, max=20.0)
         ratio = torch.exp(log_ratio)
         clipped_ratio = ratio.clamp(1.0 - self.grpo_clip_eps, 1.0 + self.grpo_clip_eps)
         advantage_batch = advantages.unsqueeze(1)
