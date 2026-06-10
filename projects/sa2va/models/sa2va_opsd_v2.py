@@ -447,21 +447,6 @@ class Sa2VAOPSDModelV2(BaseModel):
                     target_modules.append(name)
             lora_config.target_modules = target_modules
 
-        prepare_kwargs = {}
-        try:
-            prepare_signature = inspect.signature(prepare_model_for_kbit_training)
-        except (TypeError, ValueError):
-            prepare_signature = None
-        if (
-            prepare_signature is not None
-            and "use_activation_checkpointing" in prepare_signature.parameters
-        ):
-            prepare_kwargs["use_activation_checkpointing"] = True
-
-        language_model = prepare_model_for_kbit_training(
-            language_model,
-            **prepare_kwargs,
-        )
         language_model = get_peft_model(language_model, lora_config)
         enable_input_require_grads = getattr(language_model, "enable_input_require_grads", None)
         if callable(enable_input_require_grads):

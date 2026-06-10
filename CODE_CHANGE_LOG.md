@@ -140,3 +140,8 @@
 ### Follow-up Correction
 - After fixing the indexed assignment dtype mismatch, the runtime generation path still reached FlashAttention with `inputs_embeds` in `float32`.
 - FlashAttention in the Qwen2 stack only accepts `fp16` or `bf16`, so the runtime patch was extended to cast `inputs_embeds` to the language model compute dtype immediately before `language_model.generate()`.
+
+### Second Follow-up Correction
+- The remaining `float32` upcast came from applying `prepare_model_for_kbit_training()` on a non-quantized `Sa2VA-4B` language model before LoRA wrapping.
+- That helper is intended for k-bit preparation and can upcast embeddings or normalization-related states to `float32`, which then conflicts with FlashAttention in the Qwen2 generation path.
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py` to skip `prepare_model_for_kbit_training()` entirely for the current LoRA path and wrap the already-loaded bf16/fp16 language model directly with PEFT.
