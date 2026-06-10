@@ -120,3 +120,19 @@
 
 ### Implemented Changes
 - Updated `projects/sa2va/models/sa2va_opsd_v2.py` so `_predict_forward_eval()` inspects the loaded model signature and drops unsupported kwargs unless the method accepts arbitrary `**kwargs`.
+
+## 2026-06-10 Remote Generate DType Mismatch In GRPO
+
+### Problem
+- Training reached the `grpo_positive` route, then failed inside the runtime `Sa2VA-4B` `generate()` method with `RuntimeError: Index put requires the source and destination dtypes match`.
+
+### Root Cause Notes
+- The `trust_remote_code` runtime model under Hugging Face cache used a `generate()` implementation that writes `vp_embeds` into `input_embeds` after only moving devices, not aligning dtypes.
+- Under bf16 training, `vp_embeds` could be `BFloat16` while `input_embeds` stayed `Float`, causing the indexed assignment to fail.
+- Patching only the repository copy of `modeling_sa2va_chat.py` would not help because runtime execution uses the cached remote-code module.
+
+### Chosen Fix Direction
+- Monkey patch the loaded runtime model instance after load so `generate()` always casts visual prompt embeddings to `input_embeds.dtype` before indexed assignment.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py` so `_ensure_generation_ready()` patches the loaded `Sa2VAChatModel.generate()` implementation in-memory and enforces dtype alignment for `vit_embeds` and `vp_embeds`.

@@ -558,8 +558,123 @@ class Sa2VAOPSDModelV2(BaseModel):
         if not hasattr(model, "_count"):
             model._count = 0
 
+    @staticmethod
+    def _patch_sa2va_chat_generate_dtype(model):
+        generate_fn = getattr(model, "generate", None)
+        language_model = getattr(model, "language_model", None)
+        extract_feature = getattr(model, "extract_feature", None)
+        if not callable(generate_fn) or language_model is None or not callable(extract_feature):
+            return
+        if getattr(model, "_opsd_generate_dtype_patched", False):
+            return
+
+        def _generate(
+            self,
+            pixel_values=None,
+            input_ids=None,
+            attention_mask=None,
+            visual_features=None,
+            generation_config=None,
+            output_hidden_states=None,
+            return_dict=None,
+            prompt_masks=None,
+            vp_overall_mask=None,
+            **generate_kwargs,
+        ):
+            device = self.device
+            assert self.img_context_token_id is not None
+
+            if pixel_values is not None:
+                if visual_features is not None:
+                    vit_embeds = visual_features
+                else:
+                    if type(pixel_values) is list or pixel_values.ndim == 5:
+                        if type(pixel_values) is list:
+                            pixel_values = [
+                                x.unsqueeze(0) if x.ndim == 3 else x for x in pixel_values
+                            ]
+                        pixel_values = torch.cat(
+                            [image.to(self.vision_model.dtype) for image in pixel_values], dim=0
+                        )
+
+                    vit_embeds = self.extract_feature(pixel_values.to(device))
+                image_flags = torch.sum(pixel_values, dim=(1, 2, 3)) != 0
+                image_flags = image_flags.long()
+                vit_embeds = vit_embeds[image_flags == 1]
+
+                input_embeds = self.language_model.get_input_embeddings()(input_ids.to(device))
+                B, N, C = input_embeds.shape
+                input_embeds = input_embeds.reshape(B * N, C)
+
+                if vp_overall_mask is not None and prompt_masks is not None:
+                    vp_embeds = []
+                    vp_overall_mask = vp_overall_mask.to(vit_embeds.device).bool()
+                    prompt_masks = [item.to(vit_embeds.device).bool() for item in prompt_masks]
+
+                    vp_overall_mask = vp_overall_mask[image_flags == 1]
+                    overall_tile_vit_embeds = vit_embeds[vp_overall_mask]
+
+                    i_vp_img = 0
+                    for i_img in range(len(vit_embeds)):
+                        vp_embeds.append(vit_embeds[i_img].reshape(-1, C))
+                        if vp_overall_mask[i_img]:
+                            tile_vit_embeds = overall_tile_vit_embeds[i_vp_img].reshape(-1, C)
+                            objects_prompt_masks = prompt_masks[i_vp_img]
+                            n_obj = len(objects_prompt_masks)
+                            tile_vit_embeds = tile_vit_embeds.unsqueeze(0).repeat(n_obj, 1, 1)
+                            objects_prompt_masks = objects_prompt_masks.reshape(n_obj, -1)
+                            vp_embeds.append(tile_vit_embeds[objects_prompt_masks])
+                            i_vp_img += 1
+
+                    vp_embeds = torch.cat(vp_embeds, dim=0)
+                else:
+                    vp_embeds = None
+
+                input_ids = input_ids.reshape(B * N)
+                selected = input_ids == self.img_context_token_id
+                assert selected.sum() != 0
+                if vp_embeds is None:
+                    input_embeds[selected] = vit_embeds.reshape(-1, C).to(
+                        device=input_embeds.device,
+                        dtype=input_embeds.dtype,
+                    )
+                else:
+                    reshaped_vp_embeds = vp_embeds.reshape(-1, C).to(
+                        device=input_embeds.device,
+                        dtype=input_embeds.dtype,
+                    )
+                    if len(input_embeds[selected]) != len(reshaped_vp_embeds):
+                        print(
+                            "Shape mismatch, selected is {}, vp embeds is {} !!!".format(
+                                len(input_embeds[selected]), len(reshaped_vp_embeds)
+                            )
+                        )
+                        min_tokens = min(len(input_embeds[selected]), len(reshaped_vp_embeds))
+                        input_embeds[selected][:min_tokens] = reshaped_vp_embeds[:min_tokens]
+                    else:
+                        input_embeds[selected] = reshaped_vp_embeds
+
+                input_embeds = input_embeds.reshape(B, N, C)
+            else:
+                input_embeds = self.language_model.get_input_embeddings()(input_ids)
+
+            outputs = self.language_model.generate(
+                inputs_embeds=input_embeds,
+                attention_mask=attention_mask.to(device),
+                generation_config=generation_config,
+                output_hidden_states=output_hidden_states,
+                use_cache=True,
+                **generate_kwargs,
+            )
+
+            return outputs
+
+        model.generate = MethodType(_generate, model)
+        model._opsd_generate_dtype_patched = True
+
     def _ensure_generation_ready(self, model):
         self._ensure_runtime_state(model)
+        self._patch_sa2va_chat_generate_dtype(model)
         prepare_fn = getattr(model, "preparing_for_generation", None)
         if callable(prepare_fn):
             if not getattr(model, "init_prediction_config", False) or not hasattr(model, "stop_criteria"):
