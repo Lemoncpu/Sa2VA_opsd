@@ -3600,25 +3600,25 @@ class Sa2VAOPSDModelV2(BaseModel):
                 teacher_prompt = self._route_prompt_tag(loss_family)
                 regen_completion = None if teacher_regenerate is None else teacher_regenerate.completion_ids
                 if regen_completion is None or regen_completion.shape[1] == 0:
-                    is_dummy = True
                     dummy_reason = "teacher_empty_completion" if teacher_regenerate is not None else "teacher_not_available"
-                    regen_completion = self._build_dummy_completion_ids()
                 elif not (teacher_reconstruct_ok and teacher_gate_passed):
-                    is_dummy = True
                     dummy_reason = "teacher_gate_failed"
-                regen_entries.append(
-                    {
-                        "image": image,
-                        "prompt_masks": prompt_masks,
-                        "student_question": student_question,
-                        "completion_ids": regen_completion,
-                        "is_dummy": is_dummy,
-                        "loss_weight": 0.0 if is_dummy else 1.0,
-                        "dummy_reason": dummy_reason,
-                    }
-                )
-                sample_debug_record["entry_added"] = True
-                sample_debug_record["is_dummy"] = bool(is_dummy)
+                if dummy_reason is None:
+                    regen_entries.append(
+                        {
+                            "image": image,
+                            "prompt_masks": prompt_masks,
+                            "student_question": student_question,
+                            "completion_ids": regen_completion,
+                            "is_dummy": False,
+                            "loss_weight": 1.0,
+                            "dummy_reason": None,
+                        }
+                    )
+                    sample_debug_record["entry_added"] = True
+                else:
+                    is_dummy = True
+                sample_debug_record["is_dummy"] = bool(dummy_reason is not None)
                 sample_debug_record["dummy_reason"] = dummy_reason
                 last_caption = (
                     teacher_regenerate.clean_caption
@@ -3644,57 +3644,57 @@ class Sa2VAOPSDModelV2(BaseModel):
                 teacher_prompt_masks = self._build_teacher_prompt_masks(gt_mask_np, ref_mask_np)
                 onpolicy_completion = description.completion_ids
                 if onpolicy_completion.shape[1] == 0:
-                    is_dummy = True
                     dummy_reason = "empty_completion"
-                    onpolicy_completion = self._build_dummy_completion_ids()
                 elif description.status != "ok":
-                    is_dummy = True
                     dummy_reason = f"invalid_caption:{description.status}"
                 elif pred_mask is None:
-                    is_dummy = True
                     dummy_reason = f"missing_pred_mask:{reconstruct_status}"
-                onpolicy_entries.append(
-                    {
-                        "image": image,
-                        "prompt_masks": prompt_masks,
-                        "student_question": student_question,
-                        "teacher_prompt": teacher_prompt,
-                        "completion_ids": onpolicy_completion,
-                        "teacher_prompt_masks": teacher_prompt_masks,
-                        "iou": iou,
-                        "is_dummy": is_dummy,
-                        "loss_weight": 0.0 if is_dummy else 1.0,
-                        "dummy_reason": dummy_reason,
-                    }
-                )
-                sample_debug_record["entry_added"] = True
-                sample_debug_record["is_dummy"] = bool(is_dummy)
+                if dummy_reason is None:
+                    onpolicy_entries.append(
+                        {
+                            "image": image,
+                            "prompt_masks": prompt_masks,
+                            "student_question": student_question,
+                            "teacher_prompt": teacher_prompt,
+                            "completion_ids": onpolicy_completion,
+                            "teacher_prompt_masks": teacher_prompt_masks,
+                            "iou": iou,
+                            "is_dummy": False,
+                            "loss_weight": 1.0,
+                            "dummy_reason": None,
+                        }
+                    )
+                    sample_debug_record["entry_added"] = True
+                else:
+                    is_dummy = True
+                sample_debug_record["is_dummy"] = bool(dummy_reason is not None)
                 sample_debug_record["dummy_reason"] = dummy_reason
                 last_caption = description.clean_caption
             else:
                 grpo_positive_count += 1
                 if description.status != "ok":
-                    is_dummy = True
                     dummy_reason = f"invalid_caption:{description.status}"
                 elif pred_mask is None:
-                    is_dummy = True
                     dummy_reason = f"missing_pred_mask:{reconstruct_status}"
-                grpo_entries.append(
-                    {
-                        "image": image,
-                        "prompt_masks": prompt_masks,
-                        "student_question": student_question,
-                        "gt_mask": gt_mask_np,
-                        "confuser_candidate_masks": confuser_candidate_masks,
-                        "completion_ids": self._build_dummy_completion_ids() if is_dummy else None,
-                        "is_dummy": is_dummy,
-                        "loss_weight": 0.0 if is_dummy else 1.0,
-                        "dummy_reason": dummy_reason,
-                        "debug_record": sample_debug_record,
-                    }
-                )
-                sample_debug_record["entry_added"] = True
-                sample_debug_record["is_dummy"] = bool(is_dummy)
+                if dummy_reason is None:
+                    grpo_entries.append(
+                        {
+                            "image": image,
+                            "prompt_masks": prompt_masks,
+                            "student_question": student_question,
+                            "gt_mask": gt_mask_np,
+                            "confuser_candidate_masks": confuser_candidate_masks,
+                            "completion_ids": None,
+                            "is_dummy": False,
+                            "loss_weight": 1.0,
+                            "dummy_reason": None,
+                            "debug_record": sample_debug_record,
+                        }
+                    )
+                    sample_debug_record["entry_added"] = True
+                else:
+                    is_dummy = True
+                sample_debug_record["is_dummy"] = bool(dummy_reason is not None)
                 sample_debug_record["dummy_reason"] = dummy_reason
                 teacher_prompt = self._route_prompt_tag(loss_family)
                 last_caption = description.clean_caption
