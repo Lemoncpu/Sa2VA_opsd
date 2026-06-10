@@ -99,6 +99,7 @@ TRAIN_CMD=(
   --model-path "${MODEL_PATH}"
   --tokenizer-path "${TOKENIZER_PATH}"
   --work-dir "${WORK_DIR}"
+  --batch-size 1
   --sam-confuser-pool-dir "${SAM_CONFUSER_POOL_DIR}"
   --route-mode manifest
 )
