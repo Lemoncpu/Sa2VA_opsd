@@ -583,6 +583,11 @@ class Sa2VAOPSDModelV2(BaseModel):
         ):
             device = self.device
             assert self.img_context_token_id is not None
+            lm_compute_dtype = None
+            try:
+                lm_compute_dtype = next(self.language_model.parameters()).dtype
+            except StopIteration:
+                lm_compute_dtype = None
 
             if pixel_values is not None:
                 if visual_features is not None:
@@ -657,6 +662,9 @@ class Sa2VAOPSDModelV2(BaseModel):
                 input_embeds = input_embeds.reshape(B, N, C)
             else:
                 input_embeds = self.language_model.get_input_embeddings()(input_ids)
+
+            if lm_compute_dtype in {torch.float16, torch.bfloat16} and input_embeds.dtype != lm_compute_dtype:
+                input_embeds = input_embeds.to(dtype=lm_compute_dtype)
 
             outputs = self.language_model.generate(
                 inputs_embeds=input_embeds,

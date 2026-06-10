@@ -136,3 +136,7 @@
 
 ### Implemented Changes
 - Updated `projects/sa2va/models/sa2va_opsd_v2.py` so `_ensure_generation_ready()` patches the loaded `Sa2VAChatModel.generate()` implementation in-memory and enforces dtype alignment for `vit_embeds` and `vp_embeds`.
+
+### Follow-up Correction
+- After fixing the indexed assignment dtype mismatch, the runtime generation path still reached FlashAttention with `inputs_embeds` in `float32`.
+- FlashAttention in the Qwen2 stack only accepts `fp16` or `bf16`, so the runtime patch was extended to cast `inputs_embeds` to the language model compute dtype immediately before `language_model.generate()`.
