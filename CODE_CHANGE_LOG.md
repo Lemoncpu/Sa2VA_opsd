@@ -103,3 +103,20 @@
 ### Follow-up Correction
 - The server PEFT version does not support the newer `use_activation_checkpointing` keyword in `prepare_model_for_kbit_training`.
 - Updated `projects/sa2va/models/sa2va_opsd_v2.py` to inspect the function signature and only pass that keyword when the installed PEFT version supports it.
+
+## 2026-06-10 Remote Predict Forward Signature Mismatch
+
+### Problem
+- Training reached the first forward pass, but generation failed with `TypeError: Sa2VAChatModel.predict_forward() got an unexpected keyword argument 'max_new_tokens'`.
+
+### Root Cause Notes
+- The local repository version of `projects/sa2va/hf/models/modeling_sa2va_chat.py` accepts decoding kwargs in `predict_forward()`.
+- The runtime model loaded through `trust_remote_code=True` on the server exposed an older `predict_forward()` signature that does not accept those kwargs.
+- OPSD passed decoding controls unconditionally once generation started.
+
+### Chosen Fix Direction
+- Filter `predict_forward()` kwargs against the runtime method signature before calling it.
+- Keep the OPSD caller-side decoding controls for newer model versions, but degrade gracefully on older remote-code snapshots.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py` so `_predict_forward_eval()` inspects the loaded model signature and drops unsupported kwargs unless the method accepts arbitrary `**kwargs`.

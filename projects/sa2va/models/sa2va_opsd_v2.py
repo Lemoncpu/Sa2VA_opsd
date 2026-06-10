@@ -1583,9 +1583,19 @@ class Sa2VAOPSDModelV2(BaseModel):
         with self._temporary_eval_model(model):
             with torch.inference_mode():
                 signature = inspect.signature(model.predict_forward)
+                accepted_kwargs = dict(kwargs)
                 if "processor" in signature.parameters and "processor" not in kwargs:
-                    kwargs["processor"] = self.processor
-                return model.predict_forward(**kwargs)
+                    accepted_kwargs["processor"] = self.processor
+                if not any(
+                    parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in signature.parameters.values()
+                ):
+                    accepted_kwargs = {
+                        key: value
+                        for key, value in accepted_kwargs.items()
+                        if key in signature.parameters
+                    }
+                return model.predict_forward(**accepted_kwargs)
 
     def predict_text_with_masks(
         self,
