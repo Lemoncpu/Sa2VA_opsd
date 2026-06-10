@@ -444,10 +444,18 @@ class Sa2VAOPSDModelV2(BaseModel):
             target_modules = []
             for name, module in language_model.named_modules():
                 if isinstance(module, torch.nn.Linear):
-                    target_modules.append("language_model." + name)
+                    target_modules.append(name)
             lora_config.target_modules = target_modules
-        model.model = prepare_model_for_kbit_training(model.model, use_activation_checkpointing=True)
-        model.model = get_peft_model(model.model, lora_config)
+
+        language_model = prepare_model_for_kbit_training(
+            language_model,
+            use_activation_checkpointing=True,
+        )
+        language_model = get_peft_model(language_model, lora_config)
+        enable_input_require_grads = getattr(language_model, "enable_input_require_grads", None)
+        if callable(enable_input_require_grads):
+            enable_input_require_grads()
+        model.language_model = language_model
 
     @staticmethod
     def _prefer_non_reentrant_gradient_checkpointing(model):

@@ -78,3 +78,24 @@
 ### Follow-up Correction
 - The earlier attempt to align launchers to a shared `refcoco_sam_confuser_pool` directory was the wrong design for the current workflow.
 - The actual expected layout is a per-work-dir `sam_confuser_pool`, so the configs were updated to point at `.../sam_confuser_pool` under each training work directory, and the launcher defaults were reverted to `${WORK_DIR}/sam_confuser_pool`.
+
+### Second Follow-up
+- A fresh server still failed because the per-work-dir `sam_confuser_pool` was expected to exist before training.
+- Updated `tools/train.sh`, `tools/train1.sh`, and `tools/train_resume.sh` so they generate the confuser pool in-place with `tools/conf.sh` when the directory is missing, using the requested GPU shard layout before starting training.
+
+## 2026-06-10 Sa2VAChatModel LoRA Injection Failure
+
+### Problem
+- Training failed during model construction with `AttributeError: 'Sa2VAChatModel' object has no attribute 'model'`.
+
+### Root Cause Notes
+- `projects/sa2va/models/sa2va_opsd_v2.py` applied PEFT preparation and LoRA wrapping to `model.model`, assuming a generic wrapper layout.
+- The actual `Sa2VAChatModel` exposes the trainable LLM as `language_model`, not `model`.
+- The auto-generated LoRA target module names were also scoped as `language_model.<name>`, which is incorrect when PEFT is attached directly to the language model object.
+
+### Chosen Fix Direction
+- Apply `prepare_model_for_kbit_training` and `get_peft_model` directly to `language_model`.
+- Generate target module names relative to `language_model` itself.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py` so student LoRA preparation targets `language_model`, enables input grads when supported, and writes the wrapped module back to `model.language_model`.

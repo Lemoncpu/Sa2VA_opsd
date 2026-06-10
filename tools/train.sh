@@ -15,6 +15,9 @@ WORK_DIR="${WORK_DIR:-${PROJECT_ROOT}/work_dirs/sa2va_opsd_refcoco_sa2va4b_in25_
 SAM_CONFUSER_POOL_DIR="${SAM_CONFUSER_POOL_DIR:-${WORK_DIR}/sam_confuser_pool}"
 RESUME_PATH="${RESUME_PATH:-}"
 LOAD_FROM_PATH="${LOAD_FROM_PATH:-}"
+SAM2_CONFIG="${SAM2_CONFIG:-configs/sam2/sam2_hiera_l.yaml}"
+SAM2_CHECKPOINT="${SAM2_CHECKPOINT:-${PROJECT_ROOT}/pretrained/sam2/sam21L/sam2_hiera_large.pt}"
+CONF_OVERWRITE="${CONF_OVERWRITE:-0}"
 
 rjob submit \
   --cpu="${JOB_CPU}" \
@@ -39,6 +42,9 @@ rjob submit \
   SAM_CONFUSER_POOL_DIR="${SAM_CONFUSER_POOL_DIR}" \
   RESUME_PATH="${RESUME_PATH}" \
   LOAD_FROM_PATH="${LOAD_FROM_PATH}" \
+  SAM2_CONFIG="${SAM2_CONFIG}" \
+  SAM2_CHECKPOINT="${SAM2_CHECKPOINT}" \
+  CONF_OVERWRITE="${CONF_OVERWRITE}" \
   bash -lc '
 set -euo pipefail
 
@@ -51,6 +57,9 @@ TOKENIZER_PATH="${TOKENIZER_PATH:?}"
 WORK_DIR="${WORK_DIR:?}"
 SAM_CONFUSER_POOL_DIR="${SAM_CONFUSER_POOL_DIR:?}"
 LOG_FILE="${WORK_DIR}/train_${JOB_GPU}gpu.log"
+SAM2_CONFIG="${SAM2_CONFIG:?}"
+SAM2_CHECKPOINT="${SAM2_CHECKPOINT:?}"
+CONF_OVERWRITE="${CONF_OVERWRITE:-0}"
 
 mkdir -p "${WORK_DIR}"
 : >"${LOG_FILE}"
@@ -71,6 +80,58 @@ EOF
 apt update
 apt install -y libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
 /opt/vlm/bin/python -c "import torch, transformers; print(\"ok\")"
+
+if [[ ! -d "${SAM_CONFUSER_POOL_DIR}" ]]; then
+  echo "SAM confuser pool dir missing, generating: ${SAM_CONFUSER_POOL_DIR}"
+  mkdir -p "${SAM_CONFUSER_POOL_DIR}"
+
+  IFS="," read -r -a CUDA_DEVICE_ARRAY <<< "${CUDA_DEVICES}"
+  if [[ "${#CUDA_DEVICE_ARRAY[@]}" -ne "${JOB_GPU}" ]]; then
+    echo "JOB_GPU (${JOB_GPU}) does not match CUDA_DEVICES count (${#CUDA_DEVICE_ARRAY[@]})." >&2
+    exit 1
+  fi
+
+  CONF_PIDS=()
+  CONF_LOGS=()
+  for ((idx = 0; idx < JOB_GPU; idx++)); do
+    physical_device="${CUDA_DEVICE_ARRAY[$idx]}"
+    shard_log="${WORK_DIR}/conf_shard${idx}_of_${JOB_GPU}.log"
+    conf_cmd=(
+      bash "${PROJECT_ROOT}/tools/conf.sh"
+      --data-root "${DATA_ROOT}"
+      --image-root "${IMAGE_ROOT}"
+      --dataset refcoco
+      --split train
+      --out-dir "${SAM_CONFUSER_POOL_DIR}"
+      --sam2-config "${SAM2_CONFIG}"
+      --sam2-checkpoint "${SAM2_CHECKPOINT}"
+      --device cuda:0
+      --shard-index "${idx}"
+      --num-shards "${JOB_GPU}"
+    )
+    if [[ "${CONF_OVERWRITE}" == "1" ]]; then
+      conf_cmd+=(--overwrite)
+    fi
+    (
+      export CUDA_VISIBLE_DEVICES="${physical_device}"
+      "${conf_cmd[@]}"
+    ) >"${shard_log}" 2>&1 &
+    CONF_PIDS+=("$!")
+    CONF_LOGS+=("${shard_log}")
+  done
+
+  conf_status=0
+  for idx in "${!CONF_PIDS[@]}"; do
+    if ! wait "${CONF_PIDS[$idx]}"; then
+      conf_status=1
+      echo "Confuser export shard ${idx} failed. Log: ${CONF_LOGS[$idx]}" >&2
+      tail -n 200 "${CONF_LOGS[$idx]}" >&2 || true
+    fi
+  done
+  if (( conf_status != 0 )); then
+    exit "${conf_status}"
+  fi
+fi
 
 PLOT_CMD=(
   /opt/vlm/bin/python
