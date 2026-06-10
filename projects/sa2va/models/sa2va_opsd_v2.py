@@ -1211,6 +1211,65 @@ class Sa2VAOPSDModelV2(BaseModel):
             return int(torch.distributed.get_rank())
         return 0
 
+    def _cuda_memory_stats(self):
+        if self.device.type != "cuda" or not torch.cuda.is_available():
+            return {
+                "allocated": 0,
+                "reserved": 0,
+                "max_allocated": 0,
+                "max_reserved": 0,
+                "free": 0,
+                "total": 0,
+            }
+        device = self.device
+        allocated = int(torch.cuda.memory_allocated(device))
+        reserved = int(torch.cuda.memory_reserved(device))
+        max_allocated = int(torch.cuda.max_memory_allocated(device))
+        max_reserved = int(torch.cuda.max_memory_reserved(device))
+        try:
+            free, total = torch.cuda.mem_get_info(device)
+            free = int(free)
+            total = int(total)
+        except Exception:
+            free = 0
+            total = 0
+        return {
+            "allocated": allocated,
+            "reserved": reserved,
+            "max_allocated": max_allocated,
+            "max_reserved": max_reserved,
+            "free": free,
+            "total": total,
+        }
+
+    @staticmethod
+    def _format_memory_value(num_bytes):
+        gib = float(num_bytes) / float(1024 ** 3)
+        return f"{gib:.2f}GiB"
+
+    def _format_cuda_memory_stats(self):
+        stats = self._cuda_memory_stats()
+        return (
+            "cuda_mem("
+            f"alloc={self._format_memory_value(stats['allocated'])}, "
+            f"reserved={self._format_memory_value(stats['reserved'])}, "
+            f"max_alloc={self._format_memory_value(stats['max_allocated'])}, "
+            f"max_reserved={self._format_memory_value(stats['max_reserved'])}, "
+            f"free={self._format_memory_value(stats['free'])}, "
+            f"total={self._format_memory_value(stats['total'])})"
+        )
+
+    def _log_realtime_memory(self, stage, *, extra=None):
+        if not self._should_debug_print():
+            return
+        suffix = "" if not extra else f" {extra}"
+        print(
+            "[Sa2VA_OPSD_V2_MEM] "
+            f"rank={self._dist_rank()} stage={stage} "
+            f"{self._format_cuda_memory_stats()}{suffix}",
+            flush=True,
+        )
+
     def _log_ddp_route_alignment_debug(self, payload):
         if not self.enable_debug_sample_logging:
             return
@@ -1223,7 +1282,8 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"regen_entries={payload.get('regen_entry_count')} "
                 f"onpolicy_entries={payload.get('onpolicy_entry_count')} "
                 f"grpo_entries={payload.get('grpo_entry_count')} "
-                f"optimized_count={payload.get('optimized_count')}",
+                f"optimized_count={payload.get('optimized_count')} "
+                f"{self._format_cuda_memory_stats()}",
                 flush=True,
             )
             return
@@ -1240,7 +1300,8 @@ class Sa2VAOPSDModelV2(BaseModel):
             f"regen_loss_count={payload.get('regen_loss_count')} "
             f"onpolicy_loss_count={payload.get('onpolicy_loss_count')} "
             f"grpo_loss_count={payload.get('grpo_loss_count')} "
-            f"optimized_count={payload.get('optimized_count')}",
+            f"optimized_count={payload.get('optimized_count')} "
+            f"{self._format_cuda_memory_stats()}",
             flush=True,
         )
         gathered_payloads = [None] * torch.distributed.get_world_size()
@@ -1387,6 +1448,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             f"onpolicy_loss_count={onpolicy_loss_count} grpo_loss_count={grpo_loss_count} "
             f"total_loss={total_loss_value} total_regen_ce={total_regen_value} "
             f"total_onpolicy_jsd={total_onpolicy_value} total_grpo={total_grpo_value} "
+            f"{self._format_cuda_memory_stats()} "
             f"records=[{' ; '.join(records_text)}]",
             flush=True,
         )
@@ -2915,6 +2977,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         dummy_completion_ids=None,
     ):
         old_policy_model = self.require_old_policy_model("GRPO confuser")
+        self._log_realtime_memory("grpo_start")
 
         def _dummy_grpo_result(skip_reason):
             completion_ids = dummy_completion_ids if dummy_completion_ids is not None else self._build_dummy_completion_ids()
@@ -2948,6 +3011,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             ratio = torch.exp(current_token_log_probs - old_token_log_probs)
             token_weights = torch.ones_like(ratio, dtype=ratio.dtype)
             sample_losses = -(ratio * 0.0 * token_weights).sum(dim=-1) / token_weights.sum(dim=-1).clamp_min(1.0)
+            self._log_realtime_memory("grpo_dummy_result", extra=f"skip_reason={skip_reason}")
             return sample_losses.mean(), {
                 "reward_sum": 0.0,
                 "reward_count": 0,
@@ -2973,6 +3037,14 @@ class Sa2VAOPSDModelV2(BaseModel):
             gt_mask=gt_mask,
             candidate_masks=confuser_candidate_masks,
         )
+        self._log_realtime_memory(
+            "grpo_after_confuser_select",
+            extra=(
+                f"candidate_count={confuser_meta.get('confuser_candidate_count')} "
+                f"selected_count={confuser_meta.get('selected_confuser_count')} "
+                f"scored_count={confuser_meta.get('scored_confuser_count')}"
+            ),
+        )
         if confuser_masks is None:
             sample_loss, grpo_meta = _dummy_grpo_result("missing_confuser_masks")
             grpo_meta.update(confuser_meta)
@@ -2983,7 +3055,8 @@ class Sa2VAOPSDModelV2(BaseModel):
             prompt_masks=prompt_masks,
             student_question=student_question,
         )
-        for description in descriptions:
+        self._log_realtime_memory("grpo_after_rollout_sample", extra=f"rollout_count={len(descriptions)}")
+        for rollout_idx, description in enumerate(descriptions):
             completion_ids = description.completion_ids
             if completion_ids.shape[1] == 0:
                 continue
@@ -3028,6 +3101,13 @@ class Sa2VAOPSDModelV2(BaseModel):
                     "selected_correct": bool(selection.selected_correct),
                 }
             )
+            self._log_realtime_memory(
+                "grpo_after_rollout_eval",
+                extra=(
+                    f"rollout_idx={rollout_idx} completion_len={int(completion_ids.shape[1])} "
+                    f"reward={reward_value:.4f} selected_correct={int(selection.selected_correct)}"
+                ),
+            )
 
         if not rollout_entries:
             sample_loss, grpo_meta = _dummy_grpo_result("empty_rollout_entries")
@@ -3047,6 +3127,10 @@ class Sa2VAOPSDModelV2(BaseModel):
         else:
             reward_std = reward_tensor.std(unbiased=False).clamp_min(self.grpo_advantage_eps)
             advantages = (reward_tensor - reward_tensor.mean()) / reward_std
+        self._log_realtime_memory(
+            "grpo_after_advantages",
+            extra=f"rollout_entries={len(rollout_entries)} zero_reward_variance={int(zero_reward_variance)}",
+        )
 
         completion_pad_id = self.tokenizer.pad_token_id
         if completion_pad_id is None:
@@ -3072,6 +3156,13 @@ class Sa2VAOPSDModelV2(BaseModel):
             student_question,
             completion_batch,
             apply_mask_focus=True,
+        )
+        self._log_realtime_memory(
+            "grpo_after_current_forward",
+            extra=(
+                f"completion_batch_shape={tuple(completion_batch.shape)} "
+                f"logits_shape={tuple(student_logits.shape)}"
+            ),
         )
         current_token_log_probs_batch = self._token_log_probs_from_logits(
             student_logits,
@@ -3099,6 +3190,10 @@ class Sa2VAOPSDModelV2(BaseModel):
             grpo_meta.update(confuser_meta)
             grpo_meta["grpo_skip_reason"] = "non_finite_grpo_losses"
             return sample_loss, grpo_meta
+        self._log_realtime_memory(
+            "grpo_after_loss",
+            extra=f"sample_loss_count={int(sample_losses.numel())} mean_loss={float(sample_losses.mean().detach().item()):.6f}",
+        )
 
         return sample_losses.mean(), {
             "reward_sum": float(reward_tensor.sum().item()),
@@ -3890,7 +3985,8 @@ class Sa2VAOPSDModelV2(BaseModel):
                     f"grpo_mcq_acc={batch_grpo_mcq_acc:.4f} "
                     f"grpo_mcq_correct_conf_mean={batch_grpo_mcq_correct_conf_mean:.4f} "
                     f"grpo_rollout_confidences={grpo_rollout_conf_text} "
-                    f"grpo_rollout_rewards={grpo_rollout_rewards_text}"
+                    f"grpo_rollout_rewards={grpo_rollout_rewards_text} "
+                    f"{self._format_cuda_memory_stats()}"
                 )
         else:
             print(
@@ -3910,7 +4006,8 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"grpo_mcq_acc={batch_grpo_mcq_acc:.4f} "
                 f"grpo_mcq_correct_conf_mean={batch_grpo_mcq_correct_conf_mean:.4f} "
                 f"grpo_rollout_confidences={grpo_rollout_conf_text} "
-                f"grpo_rollout_rewards={grpo_rollout_rewards_text}"
+                f"grpo_rollout_rewards={grpo_rollout_rewards_text} "
+                f"{self._format_cuda_memory_stats()}"
             )
         self._log_pre_return_debug(
             batch_route=batch_route,
