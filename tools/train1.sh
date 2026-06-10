@@ -53,7 +53,8 @@ SAM_CONFUSER_POOL_DIR="${SAM_CONFUSER_POOL_DIR:?}"
 LOG_FILE="${WORK_DIR}/train_${JOB_GPU}gpu.log"
 
 mkdir -p "${WORK_DIR}"
-exec >"${LOG_FILE}" 2>&1 < /dev/null
+: >"${LOG_FILE}"
+export PYTHONUNBUFFERED=1
 
 cd /opt
 tar -xzf vlm_env.tar.gz -C /opt/vlm
@@ -71,6 +72,24 @@ apt update
 apt install -y libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
 /opt/vlm/bin/python -c "import torch, transformers; print(\"ok\")"
 
+PLOT_CMD=(
+  /opt/vlm/bin/python
+  "${PROJECT_ROOT}/tools/plot_training_metrics.py"
+  "${WORK_DIR}"
+  --watch
+  --interval-seconds 10
+  --smooth 1
+)
+
+"${PLOT_CMD[@]}" &
+PLOT_PID=$!
+cleanup() {
+  if [[ -n "${PLOT_PID:-}" ]]; then
+    kill "${PLOT_PID}" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
 TRAIN_CMD=(
   bash "${PROJECT_ROOT}/tools/train_refcoco_opsd_4b.sh"
   --gpus "${JOB_GPU}"
@@ -80,6 +99,7 @@ TRAIN_CMD=(
   --model-path "${MODEL_PATH}"
   --tokenizer-path "${TOKENIZER_PATH}"
   --work-dir "${WORK_DIR}"
+  --batch-size 1
   --sam-confuser-pool-dir "${SAM_CONFUSER_POOL_DIR}"
   --route-mode manifest
 )
@@ -92,7 +112,5 @@ if [[ -n "${RESUME_PATH:-}" ]]; then
   TRAIN_CMD+=(--resume "${RESUME_PATH}")
 fi
 
-"${TRAIN_CMD[@]}"
+stdbuf -oL -eL "${TRAIN_CMD[@]}" 2>&1 | tee -a "${LOG_FILE}"
 '
-
-
