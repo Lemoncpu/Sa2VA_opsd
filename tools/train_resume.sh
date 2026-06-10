@@ -11,7 +11,7 @@ DATA_ROOT="${DATA_ROOT:-/mnt/shared-storage-user/dnacoding/wuyucheng/dataset/ref
 IMAGE_ROOT="${IMAGE_ROOT:-${DATA_ROOT}/train2014}"
 MODEL_PATH="${MODEL_PATH:-/mnt/shared-storage-user/dnacoding/wuyucheng/workspace/Nemotrontiaozheng/Sa2VA-4B}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-${MODEL_PATH}}"
-WORK_DIR="${WORK_DIR:-${PROJECT_ROOT}/work_dirs/sa2va_opsd_refcoco_internvl3_4b_v3_manifest}"
+WORK_DIR="${WORK_DIR:-${PROJECT_ROOT}/work_dirs/sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3_manifest}"
 SAM_CONFUSER_POOL_DIR="${SAM_CONFUSER_POOL_DIR:-${WORK_DIR}/sam_confuser_pool}"
 RESUME_PATH="${RESUME_PATH:-}"
 

@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 from mmengine.model import BaseModel
 from PIL import Image
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import AutoModel, AutoProcessor, AutoTokenizer
 from transformers.modeling_outputs import BaseModelOutput
 from transformers.modeling_utils import PreTrainedModel
@@ -132,6 +133,9 @@ class Sa2VAOPSDModelV2(BaseModel):
         max_teacher_regenerate_fraction=0.2,
         max_recovery_fraction=0.1,
         enable_debug_sample_logging=False,
+        student_freeze_llm=True,
+        student_freeze_visual_encoder=True,
+        student_llm_lora=None,
     ):
         super().__init__()
         if teacher_model_path == "__skip__":
@@ -219,6 +223,9 @@ class Sa2VAOPSDModelV2(BaseModel):
         self.max_teacher_regenerate_fraction = float(max_teacher_regenerate_fraction)
         self.max_recovery_fraction = float(max_recovery_fraction)
         self.enable_debug_sample_logging = bool(enable_debug_sample_logging)
+        self.student_freeze_llm = bool(student_freeze_llm)
+        self.student_freeze_visual_encoder = bool(student_freeze_visual_encoder)
+        self.student_llm_lora = student_llm_lora
         self._cumulative_valid_count = 0
         self._cumulative_description_ok_count = 0
         self._cumulative_description_empty_count = 0
@@ -402,8 +409,45 @@ class Sa2VAOPSDModelV2(BaseModel):
                 model.to(self.device)
         self._prefer_non_reentrant_gradient_checkpointing(model)
         self._ensure_runtime_state(model)
+        self._configure_student_trainability(model)
         self._ensure_generation_ready(model)
         return model
+
+    def _configure_student_trainability(self, model):
+        language_model = getattr(model, "language_model", None)
+        visual_model = getattr(model, "visual_model", None)
+        if visual_model is None:
+            visual_model = getattr(model, "visual", None)
+
+        if self.student_freeze_llm and language_model is not None:
+            language_model.requires_grad_(False)
+        if self.student_freeze_visual_encoder and visual_model is not None:
+            visual_model.requires_grad_(False)
+
+        if self.student_llm_lora:
+            self._apply_student_llm_lora(model)
+
+    def _apply_student_llm_lora(self, model):
+        language_model = getattr(model, "language_model", None)
+        if language_model is None:
+            raise ValueError("student_llm_lora requires the model to expose language_model.")
+
+        lora_config = self.student_llm_lora
+        if isinstance(lora_config, dict):
+            lora_config = dict(lora_config)
+            lora_config.setdefault("task_type", "CAUSAL_LM")
+            lora_config.setdefault("bias", "none")
+            lora_config.setdefault("target_modules", None)
+            lora_config.setdefault("modules_to_save", ["lm_head", "embed_tokens"])
+            lora_config = LoraConfig(**lora_config)
+        if getattr(lora_config, "target_modules", None) is None:
+            target_modules = []
+            for name, module in language_model.named_modules():
+                if isinstance(module, torch.nn.Linear):
+                    target_modules.append("language_model." + name)
+            lora_config.target_modules = target_modules
+        model.model = prepare_model_for_kbit_training(model.model, use_activation_checkpointing=True)
+        model.model = get_peft_model(model.model, lora_config)
 
     @staticmethod
     def _prefer_non_reentrant_gradient_checkpointing(model):
@@ -2043,6 +2087,10 @@ class Sa2VAOPSDModelV2(BaseModel):
             past_text="",
             mask_prompts=formatted_mask_prompts,
             tokenizer=self.tokenizer,
+            max_new_tokens=self.description_max_new_tokens,
+            do_sample=False,
+            repetition_penalty=self.description_repetition_penalty,
+            no_repeat_ngram_size=self.description_no_repeat_ngram_size,
         )
         raw_prediction = predict_dict.get("prediction", "")
         clean_caption = self._clean_caption_text(raw_prediction)
@@ -2125,6 +2173,8 @@ class Sa2VAOPSDModelV2(BaseModel):
             past_text="",
             mask_prompts=None,
             tokenizer=self.tokenizer,
+            max_new_tokens=self.low_iou_regen_max_new_tokens,
+            do_sample=False,
         )
         raw_prediction = predict_dict.get("prediction", "")
         prediction_masks = predict_dict.get("prediction_masks")

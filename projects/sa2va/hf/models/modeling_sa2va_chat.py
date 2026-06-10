@@ -595,6 +595,12 @@ class Sa2VAChatModel(PreTrainedModel):
             mask_prompts=None,
             tokenizer=None,
             processor=None,
+            max_new_tokens=None,
+            do_sample=None,
+            temperature=None,
+            top_p=None,
+            repetition_penalty=None,
+            no_repeat_ngram_size=None,
     ):
         if not self.init_prediction_config:
             assert tokenizer
@@ -732,9 +738,23 @@ class Sa2VAChatModel(PreTrainedModel):
                 'vp_overall_mask': input_dict['vp_overall_mask'],
             }
 
+        generation_config = GenerationConfig.from_dict(self.gen_config.to_dict())
+        if max_new_tokens is not None:
+            generation_config.max_new_tokens = int(max_new_tokens)
+        if do_sample is not None:
+            generation_config.do_sample = bool(do_sample)
+        if temperature is not None:
+            generation_config.temperature = float(temperature)
+        if top_p is not None:
+            generation_config.top_p = float(top_p)
+        if repetition_penalty is not None:
+            generation_config.repetition_penalty = float(repetition_penalty)
+        if no_repeat_ngram_size is not None:
+            generation_config.no_repeat_ngram_size = int(no_repeat_ngram_size)
+
         generate_output = self.generate(
             **mm_inputs,
-            generation_config=self.gen_config,
+            generation_config=generation_config,
             streamer=None,
             bos_token_id=self.tokenizer.bos_token_id,
             stopping_criteria=self.stop_criteria,
