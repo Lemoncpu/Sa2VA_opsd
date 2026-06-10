@@ -99,3 +99,7 @@
 
 ### Implemented Changes
 - Updated `projects/sa2va/models/sa2va_opsd_v2.py` so student LoRA preparation targets `language_model`, enables input grads when supported, and writes the wrapped module back to `model.language_model`.
+
+### Follow-up Correction
+- The server PEFT version does not support the newer `use_activation_checkpointing` keyword in `prepare_model_for_kbit_training`.
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py` to inspect the function signature and only pass that keyword when the installed PEFT version supports it.
