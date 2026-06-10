@@ -38,7 +38,7 @@ save_total_limit = 2
 route_refresh_interval = 50
 route_cache_dir = "./work_dirs/sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3/route_cache"
 route_manifest_path = f"{route_cache_dir}/routes_step_0000000.jsonl"
-sam_confuser_pool_dir = "./work_dirs/refcoco_sam_confuser_pool"
+sam_confuser_pool_dir = "./work_dirs/sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3_manifest/sam_confuser_pool"
 route_mode = "manifest"
 
 if route_mode not in {"manifest", "online"}:

@@ -226,8 +226,14 @@ def main():
         candidate_files = find_candidate_files(log_path)
         metric_groups = [choose_parser(path) for path in candidate_files]
         metric_data = merge_metric_data(metric_groups)
-        plot_metrics(metric_data, output_path, smooth=max(1, args.smooth))
-        print(f"Saved plot to: {output_path}")
+        available_metrics = [metric for metric in METRICS if metric_data[metric]]
+        if available_metrics:
+            plot_metrics(metric_data, output_path, smooth=max(1, args.smooth))
+            print(f"Saved plot to: {output_path}")
+        elif watch:
+            print("No metric data found yet; waiting for training logs...")
+        else:
+            raise ValueError("No metric data found for configured training metrics.")
         if not watch:
             break
         time.sleep(refresh_interval)
