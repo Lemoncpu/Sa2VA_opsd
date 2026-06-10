@@ -6,6 +6,7 @@ from torch.optim import AdamW
 from xtuner.engine.runner import TrainLoop
 
 from projects.sa2va.hooks.ema_teacher_hook import EMATeacherHook
+from projects.sa2va.hooks.old_policy_sync_hook import OldPolicySyncHook
 from projects.sa2va.hooks.opsd_route_refresh_hook import OpsdRouteRefreshHook
 from projects.sa2va.datasets.common import DEFAULT_MASK_TO_CAPTION_QUESTION
 from projects.sa2va.datasets.data_utils_opsd_v2 import sa2va_opsd_collect_fn_v2
@@ -173,7 +174,7 @@ param_scheduler = [
 
 train_cfg = dict(type=TrainLoop, max_epochs=max_epochs)
 
-custom_hooks = [dict(type=EMATeacherHook)]
+custom_hooks = [dict(type=OldPolicySyncHook), dict(type=EMATeacherHook)]
 if use_manifest_routes:
     custom_hooks.append(
         dict(

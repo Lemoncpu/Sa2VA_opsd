@@ -8,6 +8,7 @@ from xtuner.dataset.samplers import LengthGroupedSampler
 from xtuner.engine.runner import TrainLoop
 
 from projects.sa2va.hooks.ema_teacher_hook import EMATeacherHook
+from projects.sa2va.hooks.old_policy_sync_hook import OldPolicySyncHook
 from projects.sa2va.datasets.data_utils_opsd_v2 import sa2va_opsd_collect_fn_v2
 from projects.sa2va.datasets.sa2va_opsd_npz_v2 import Sa2VAOpsdNPZDatasetV2
 from projects.sa2va.models.sa2va_opsd_v2 import Sa2VAOPSDModelV2
@@ -106,6 +107,7 @@ param_scheduler = [
 train_cfg = dict(type=TrainLoop, max_epochs=max_epochs)
 
 custom_hooks = [
+    dict(type=OldPolicySyncHook),
     dict(type=EMATeacherHook),
 ]
 

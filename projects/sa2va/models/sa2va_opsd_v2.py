@@ -318,6 +318,8 @@ class Sa2VAOPSDModelV2(BaseModel):
             self.processor = None
         self.model_dtype = self._resolve_torch_dtype(torch_dtype)
         self.student_model = self._load_model(self.model_path)
+        object.__setattr__(self, "old_policy_model", self._load_model(self.model_path))
+        self._sync_old_policy()
         self.teacher_model = None
         if self.enable_teacher:
             self.teacher_model = self._load_model(self.teacher_model_path)
@@ -507,6 +509,9 @@ class Sa2VAOPSDModelV2(BaseModel):
     def has_teacher_model(self):
         return self.enable_teacher and self.teacher_model is not None
 
+    def has_old_policy_model(self):
+        return getattr(self, "old_policy_model", None) is not None
+
     def require_teacher_model(self, context="this operation"):
         if self.has_teacher_model():
             return self.teacher_model
@@ -515,8 +520,16 @@ class Sa2VAOPSDModelV2(BaseModel):
             "Teacher-free evaluation does not construct teacher_model."
         )
 
+    def require_old_policy_model(self, context="this operation"):
+        old_policy_model = getattr(self, "old_policy_model", None)
+        if old_policy_model is not None:
+            return old_policy_model
+        raise RuntimeError(f"{context} requires old_policy_model to be initialized.")
+
     def train(self, mode=True):
         super().train(mode)
+        if self.has_old_policy_model():
+            self.old_policy_model.eval()
         if self.has_teacher_model():
             self.teacher_model.eval()
         return self
@@ -527,13 +540,27 @@ class Sa2VAOPSDModelV2(BaseModel):
             target_dtype = args[0]
         if target_dtype is not None:
             self.student_model.to(dtype=target_dtype)
+            if self.has_old_policy_model():
+                self.old_policy_model.to(dtype=target_dtype)
             if self.has_teacher_model():
                 self.teacher_model.to(dtype=target_dtype)
         self.student_model.to(self.device)
+        if self.has_old_policy_model():
+            self.old_policy_model.to(self.device)
+            self.old_policy_model.eval()
         if self.has_teacher_model():
             self.teacher_model.to(self.device)
             self.teacher_model.eval()
         return self
+
+    def _sync_old_policy(self):
+        if not self.has_old_policy_model():
+            return False
+        self.old_policy_model.load_state_dict(self.student_model.state_dict(), strict=False)
+        self.old_policy_model.to(self.device)
+        self.old_policy_model.requires_grad_(False)
+        self.old_policy_model.eval()
+        return True
 
     def _sync_teacher(self):
         if not self.has_teacher_model():
@@ -582,25 +609,35 @@ class Sa2VAOPSDModelV2(BaseModel):
 
     def load_state_dict(self, state_dict, strict=True):
         has_teacher_state = any(k.startswith("teacher_model.") for k in state_dict)
-
-        if not self.has_teacher_model():
-            filtered_state = {
-                k: v
-                for k, v in state_dict.items()
-                if not k.startswith(("teacher_model.",))
-            }
-            return super().load_state_dict(filtered_state, strict=strict)
-
-        if has_teacher_state:
-            return super().load_state_dict(state_dict, strict=strict)
-
         filtered_state = {
             k: v
             for k, v in state_dict.items()
+            if not k.startswith(("old_policy_model.",))
+        }
+
+        if not self.has_teacher_model():
+            student_only_state = {
+                k: v
+                for k, v in filtered_state.items()
+                if not k.startswith(("teacher_model.",))
+            }
+            result = super().load_state_dict(student_only_state, strict=strict)
+            self._sync_old_policy()
+            return result
+
+        if has_teacher_state:
+            result = super().load_state_dict(filtered_state, strict=strict)
+            self._sync_old_policy()
+            return result
+
+        student_only_state = {
+            k: v
+            for k, v in filtered_state.items()
             if not k.startswith(("teacher_model.",))
         }
-        result = super().load_state_dict(filtered_state, strict=False)
+        result = super().load_state_dict(student_only_state, strict=False)
         self._sync_teacher()
+        self._sync_old_policy()
         return result
 
     @staticmethod
@@ -2696,7 +2733,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             )
         return torch.stack(sample_losses)
 
-    def _sample_grpo_descriptions(self, *, image, prompt_masks, student_question):
+    def _sample_grpo_descriptions(self, *, model, image, prompt_masks, student_question):
         target_rollout_count = int(self.grpo_group_size)
         if target_rollout_count <= 0:
             return []
@@ -2704,7 +2741,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         for _ in range(target_rollout_count):
             descriptions.append(
                 self.generate_description_with_model(
-                    self.student_model,
+                    model,
                     image=image,
                     mask_prompts=prompt_masks,
                     student_question=student_question,
@@ -2819,6 +2856,7 @@ class Sa2VAOPSDModelV2(BaseModel):
     def _score_caption_against_mask_options(
         self,
         *,
+        model,
         image,
         option_masks,
         caption,
@@ -2839,10 +2877,10 @@ class Sa2VAOPSDModelV2(BaseModel):
             }
             for completion_ids in answer_completion_ids
         ]
-        with self._temporary_eval_model(self.student_model):
+        with self._temporary_eval_model(model):
             with torch.inference_mode():
                 answer_logits = self._forward_sequence_multi_sample_with_model(
-                    self.student_model,
+                    model,
                     samples,
                 )["logits"]
         first_step_logits = answer_logits[:, 0, :]
@@ -2876,12 +2914,14 @@ class Sa2VAOPSDModelV2(BaseModel):
         dummy_reason=None,
         dummy_completion_ids=None,
     ):
+        old_policy_model = self.require_old_policy_model("GRPO confuser")
+
         def _dummy_grpo_result(skip_reason):
             completion_ids = dummy_completion_ids if dummy_completion_ids is not None else self._build_dummy_completion_ids()
-            with self._temporary_eval_model(self.student_model):
+            with self._temporary_eval_model(old_policy_model):
                 with torch.inference_mode():
                     old_policy_logits = self._forward_sequence_with_model(
-                        self.student_model,
+                        old_policy_model,
                         image,
                         prompt_masks,
                         student_question,
@@ -2938,6 +2978,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             grpo_meta.update(confuser_meta)
             return sample_loss, grpo_meta
         descriptions = self._sample_grpo_descriptions(
+            model=old_policy_model,
             image=image,
             prompt_masks=prompt_masks,
             student_question=student_question,
@@ -2953,16 +2994,17 @@ class Sa2VAOPSDModelV2(BaseModel):
                 if float(self._compute_iou(gt_mask, candidate_mask)) >= self.grpo_confuser_duplicate_iou_threshold
             )
             selection = self._score_caption_against_mask_options(
+                model=old_policy_model,
                 image=image,
                 option_masks=np.stack(option_masks, axis=0).astype(np.float32),
                 caption=description.clean_caption,
                 correct_option_idx=correct_option_idx,
             )
             reward_value = selection.reward
-            with self._temporary_eval_model(self.student_model):
+            with self._temporary_eval_model(old_policy_model):
                 with torch.inference_mode():
                     old_policy_logits = self._forward_sequence_with_model(
-                        self.student_model,
+                        old_policy_model,
                         image,
                         prompt_masks,
                         student_question,

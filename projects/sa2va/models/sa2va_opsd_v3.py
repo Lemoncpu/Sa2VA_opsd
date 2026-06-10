@@ -39,7 +39,7 @@ class Sa2VAOPSDModelV3(Sa2VAOPSDModelV2):
             self._disable_gradient_checkpointing_for_ddp()
 
     def _disable_gradient_checkpointing_for_ddp(self):
-        for model in (self.student_model, self.teacher_model):
+        for model in (self.student_model, self.teacher_model, getattr(self, "old_policy_model", None)):
             if model is None:
                 continue
             disable_fn = getattr(model, "gradient_checkpointing_disable", None)
