@@ -196,3 +196,34 @@
 - Updated `projects/sa2va/models/sa2va_opsd_v2.py` so `_teacher_regenerate_gate_passed()` now returns true for either:
   - `teacher_iou - student_iou > 0.5`, or
   - `teacher_iou >= 0.6 and teacher_iou - student_iou >= 0.1`.
+
+## 2026-06-11 Dense GRPO Reward For Confuser MCQ
+
+### Problem
+- The GRPO confuser reward was sparse: wrong argmax predictions usually received `0`, so many rollout groups produced low-variance or zero-variance reward signals.
+- Recent diagnostics showed GRPO remained the dominant route, so sparse MCQ reward limited how often this route could provide useful policy gradients.
+
+### Root Cause Notes
+- `_score_caption_against_mask_options()` only rewarded the GT option probability when the predicted option matched the GT, ignoring the rest of the option distribution.
+- The reward did not account for how much probability mass the model placed on confusers that are visually similar to the GT mask.
+
+### Chosen Fix Direction
+- Replace the sparse argmax-style reward with a dense expected reward over the full option distribution:
+  - positive term: `p(gt)`
+  - negative term: `sum_i p(confuser_i) * IoU(confuser_i, gt)`
+- Keep PPO/GRPO rollout, clipping, and route logic unchanged.
+- Add explicit logging for GT probability, confuser penalty, and unclipped reward mean.
+
+### Rejected Direction
+- Do not mix caption-quality reward or reconstruction-IoU reward into this change. Keep the dense reward local to the confuser MCQ path so its effect is interpretable.
+- Do not only penalize the chosen wrong option; use the full distribution so reward stays dense even when argmax is correct but confuser mass is high.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py`:
+  - Extended `ConfuserSelectionResult` with dense reward metadata.
+  - Replaced sparse MCQ reward with `clip(p_gt - sum_i p_confuser_i * IoU(confuser_i, gt), -1, 1)`.
+  - Added GRPO aggregation and rolling metrics for:
+    - `grpo_reward_raw_mean`
+    - `grpo_gt_prob_mean`
+    - `grpo_confuser_penalty_mean`
+  - Extended GRPO per-rollout debug logging to print dense reward components.

@@ -65,8 +65,11 @@ class ConfuserSelectionResult:
     predicted_option_idx: int
     correct_option_idx: int
     reward: float
+    reward_raw: float
     selected_correct: bool
     correct_option_prob: float
+    confuser_iou_weights: torch.Tensor
+    confuser_penalty: float
 
 
 class Sa2VAOPSDModelV2(BaseModel):
@@ -1276,6 +1279,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             "grpo_reward_count",
             "grpo_mcq_correct_count",
             "grpo_mcq_count",
+            "grpo_reward_raw_count",
             "recovery_caption_count",
             "invalid_caption_penalty_count",
             "hard_reconstruct_failure_count",
@@ -1307,6 +1311,9 @@ class Sa2VAOPSDModelV2(BaseModel):
             "onpolicy_jsd_sum",
             "grpo_sum",
             "grpo_reward_sum",
+            "grpo_reward_raw_sum",
+            "grpo_gt_prob_sum",
+            "grpo_confuser_penalty_sum",
             "grpo_mcq_correct_conf_sum",
             "teacher_regenerate_verified_iou_sum",
             "teacher_iou_gain_sum",
@@ -3272,16 +3279,24 @@ class Sa2VAOPSDModelV2(BaseModel):
         predicted_option_idx = int(option_probs.argmax().item())
         correct_option_prob = float(option_probs[correct_option_idx].item())
         selected_correct = predicted_option_idx == int(correct_option_idx)
-        reward = correct_option_prob if selected_correct else 0.0
-        if not selected_correct and not self.grpo_confuser_zero_reward_on_wrong:
-            reward = correct_option_prob
+        confuser_iou_weights = torch.zeros_like(option_probs)
+        for option_idx, candidate_mask in enumerate(option_masks):
+            if option_idx == int(correct_option_idx):
+                continue
+            confuser_iou_weights[option_idx] = float(self._compute_iou(gt_mask=option_masks[correct_option_idx], pred_mask=candidate_mask))
+        confuser_penalty = float((option_probs * confuser_iou_weights).sum().item())
+        reward_raw = correct_option_prob - confuser_penalty
+        reward = float(max(min(reward_raw, 1.0), -1.0))
         return ConfuserSelectionResult(
             option_probs=option_probs.detach(),
             predicted_option_idx=predicted_option_idx,
             correct_option_idx=int(correct_option_idx),
-            reward=float(reward),
+            reward=reward,
+            reward_raw=float(reward_raw),
             selected_correct=selected_correct,
             correct_option_prob=correct_option_prob,
+            confuser_iou_weights=confuser_iou_weights.detach(),
+            confuser_penalty=confuser_penalty,
         )
 
     def compute_grpo_loss(
@@ -3335,6 +3350,10 @@ class Sa2VAOPSDModelV2(BaseModel):
             return sample_losses.mean(), {
                 "reward_sum": 0.0,
                 "reward_count": 0,
+                "reward_raw_sum": 0.0,
+                "gt_prob_sum": 0.0,
+                "confuser_penalty_sum": 0.0,
+                "reward_raw_count": 0,
                 "rollout_mcq_confidences": [],
                 "rollout_rewards": [],
                 "rollout_mcq_correct": [],
@@ -3351,6 +3370,9 @@ class Sa2VAOPSDModelV2(BaseModel):
         rollout_mcq_confidences = []
         rollout_rewards = []
         rollout_mcq_correct = []
+        reward_raw_sum = 0.0
+        gt_prob_sum = 0.0
+        confuser_penalty_sum = 0.0
         if force_dummy:
             return _dummy_grpo_result(dummy_reason or "forced_dummy")
         confuser_masks, confuser_meta = self._select_confuser_masks(
@@ -3413,6 +3435,9 @@ class Sa2VAOPSDModelV2(BaseModel):
             rollout_mcq_confidences.append(selection.correct_option_prob)
             rollout_rewards.append(reward_value)
             rollout_mcq_correct.append(int(selection.selected_correct))
+            reward_raw_sum += float(selection.reward_raw)
+            gt_prob_sum += float(selection.correct_option_prob)
+            confuser_penalty_sum += float(selection.confuser_penalty)
             rollout_entries.append(
                 {
                     "completion_ids": completion_ids,
@@ -3426,7 +3451,10 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "grpo_after_rollout_eval",
                 extra=(
                     f"rollout_idx={rollout_idx} completion_len={int(completion_ids.shape[1])} "
-                    f"reward={reward_value:.4f} selected_correct={int(selection.selected_correct)}"
+                    f"reward={reward_value:.4f} reward_raw={float(selection.reward_raw):.4f} "
+                    f"gt_prob={float(selection.correct_option_prob):.4f} "
+                    f"confuser_penalty={float(selection.confuser_penalty):.4f} "
+                    f"selected_correct={int(selection.selected_correct)}"
                 ),
             )
 
@@ -3521,6 +3549,10 @@ class Sa2VAOPSDModelV2(BaseModel):
         return sample_losses.mean(), {
             "reward_sum": float(reward_tensor.sum().item()),
             "reward_count": len(rollout_entries),
+            "reward_raw_sum": float(reward_raw_sum),
+            "gt_prob_sum": float(gt_prob_sum),
+            "confuser_penalty_sum": float(confuser_penalty_sum),
+            "reward_raw_count": int(len(rollout_entries)),
             "rollout_mcq_confidences": rollout_mcq_confidences,
             "rollout_rewards": rollout_rewards,
             "rollout_mcq_correct": rollout_mcq_correct,
@@ -3544,6 +3576,10 @@ class Sa2VAOPSDModelV2(BaseModel):
         sample_losses = []
         reward_sum = 0.0
         reward_count = 0
+        reward_raw_sum = 0.0
+        gt_prob_sum = 0.0
+        confuser_penalty_sum = 0.0
+        reward_raw_count = 0
         rollout_mcq_confidences = []
         rollout_rewards = []
         rollout_mcq_correct = []
@@ -3578,6 +3614,10 @@ class Sa2VAOPSDModelV2(BaseModel):
             local_modes.append(grpo_mode)
             reward_sum += grpo_meta["reward_sum"]
             reward_count += grpo_meta["reward_count"]
+            reward_raw_sum += float(grpo_meta.get("reward_raw_sum", 0.0))
+            gt_prob_sum += float(grpo_meta.get("gt_prob_sum", 0.0))
+            confuser_penalty_sum += float(grpo_meta.get("confuser_penalty_sum", 0.0))
+            reward_raw_count += int(grpo_meta.get("reward_raw_count", 0))
             zero_reward_variance_count += int(bool(grpo_meta.get("zero_reward_variance", False)))
             missing_confuser_count += int((grpo_meta.get("grpo_skip_reason") or grpo_meta.get("skip_reason")) == "missing_confuser_masks")
             nonzero_reward_count += int(sum(1 for reward in grpo_meta.get("rollout_rewards", []) if float(reward) > 0.0))
@@ -3618,6 +3658,10 @@ class Sa2VAOPSDModelV2(BaseModel):
             sample_losses = []
             reward_sum = 0.0
             reward_count = 0
+            reward_raw_sum = 0.0
+            gt_prob_sum = 0.0
+            confuser_penalty_sum = 0.0
+            reward_raw_count = 0
             zero_reward_variance_count = 0
             missing_confuser_count = 0
             nonzero_reward_count = 0
@@ -3644,6 +3688,10 @@ class Sa2VAOPSDModelV2(BaseModel):
                     debug_record["grpo_skip_reason"] = "ddp_grpo_mode_mismatch"
                 reward_sum += grpo_meta["reward_sum"]
                 reward_count += grpo_meta["reward_count"]
+                reward_raw_sum += float(grpo_meta.get("reward_raw_sum", 0.0))
+                gt_prob_sum += float(grpo_meta.get("gt_prob_sum", 0.0))
+                confuser_penalty_sum += float(grpo_meta.get("confuser_penalty_sum", 0.0))
+                reward_raw_count += int(grpo_meta.get("reward_raw_count", 0))
                 zero_reward_variance_count += int(bool(grpo_meta.get("zero_reward_variance", False)))
                 missing_confuser_count += int((grpo_meta.get("grpo_skip_reason") or grpo_meta.get("skip_reason")) == "missing_confuser_masks")
                 nonzero_reward_count += int(sum(1 for reward in grpo_meta.get("rollout_rewards", []) if float(reward) > 0.0))
@@ -3662,6 +3710,10 @@ class Sa2VAOPSDModelV2(BaseModel):
             ), {
                 "reward_sum": reward_sum,
                 "reward_count": reward_count,
+                "reward_raw_sum": reward_raw_sum,
+                "gt_prob_sum": gt_prob_sum,
+                "confuser_penalty_sum": confuser_penalty_sum,
+                "reward_raw_count": reward_raw_count,
                 "rollout_mcq_confidences": rollout_mcq_confidences,
                 "rollout_rewards": rollout_rewards,
                 "rollout_mcq_correct": rollout_mcq_correct,
@@ -3676,6 +3728,10 @@ class Sa2VAOPSDModelV2(BaseModel):
         return torch.stack(sample_losses), {
             "reward_sum": reward_sum,
             "reward_count": reward_count,
+            "reward_raw_sum": reward_raw_sum,
+            "gt_prob_sum": gt_prob_sum,
+            "confuser_penalty_sum": confuser_penalty_sum,
+            "reward_raw_count": reward_raw_count,
             "rollout_mcq_confidences": rollout_mcq_confidences,
             "rollout_rewards": rollout_rewards,
             "rollout_mcq_correct": rollout_mcq_correct,
@@ -3727,6 +3783,10 @@ class Sa2VAOPSDModelV2(BaseModel):
         total_grpo = None
         grpo_reward_sum = 0.0
         grpo_reward_count = 0
+        grpo_reward_raw_sum = 0.0
+        grpo_reward_raw_count = 0
+        grpo_gt_prob_sum = 0.0
+        grpo_confuser_penalty_sum = 0.0
         grpo_rollout_mcq_confidences = []
         grpo_rollout_rewards = []
         grpo_rollout_mcq_correct = []
@@ -4081,6 +4141,10 @@ class Sa2VAOPSDModelV2(BaseModel):
             grpo_losses, grpo_meta = self.compute_grpo_losses_batch(grpo_entries)
             grpo_reward_sum += grpo_meta["reward_sum"]
             grpo_reward_count += grpo_meta["reward_count"]
+            grpo_reward_raw_sum += float(grpo_meta.get("reward_raw_sum", 0.0))
+            grpo_reward_raw_count += int(grpo_meta.get("reward_raw_count", 0))
+            grpo_gt_prob_sum += float(grpo_meta.get("gt_prob_sum", 0.0))
+            grpo_confuser_penalty_sum += float(grpo_meta.get("confuser_penalty_sum", 0.0))
             grpo_zero_reward_variance_count += int(grpo_meta.get("zero_reward_variance_count", 0))
             grpo_nonzero_reward_count += int(grpo_meta.get("nonzero_reward_count", 0))
             grpo_missing_confuser_count += int(grpo_meta.get("missing_confuser_count", 0))
@@ -4199,6 +4263,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             "onpolicy_loss_count": onpolicy_loss_count,
             "grpo_loss_count": grpo_loss_count,
             "grpo_reward_count": grpo_reward_count,
+            "grpo_reward_raw_count": grpo_reward_raw_count,
             "grpo_mcq_correct_count": grpo_mcq_correct_count,
             "grpo_mcq_count": grpo_mcq_total_count,
             "recovery_caption_count": recovery_caption_count,
@@ -4227,6 +4292,9 @@ class Sa2VAOPSDModelV2(BaseModel):
             "onpolicy_jsd_sum": 0.0 if total_onpolicy_jsd is None else float(total_onpolicy_jsd.detach().item()),
             "grpo_sum": 0.0 if total_grpo is None else float(total_grpo.detach().item()),
             "grpo_reward_sum": grpo_reward_sum,
+            "grpo_reward_raw_sum": grpo_reward_raw_sum,
+            "grpo_gt_prob_sum": grpo_gt_prob_sum,
+            "grpo_confuser_penalty_sum": grpo_confuser_penalty_sum,
             "grpo_mcq_correct_conf_sum": grpo_mcq_correct_conf_sum,
             "teacher_regenerate_verified_iou_sum": teacher_regenerate_verified_iou_sum,
             "teacher_iou_gain_sum": teacher_iou_gain_sum,
@@ -4252,6 +4320,11 @@ class Sa2VAOPSDModelV2(BaseModel):
         window_on_policy_distill_rate = window_totals["on_policy_distill_count"] / window_route_count
         window_grpo_positive_rate = window_totals["grpo_positive_count"] / window_route_count
         window_grpo_reward_mean = window_totals["grpo_reward_sum"] / max(window_totals["grpo_reward_count"], 1)
+        window_grpo_reward_raw_mean = window_totals["grpo_reward_raw_sum"] / max(window_totals["grpo_reward_raw_count"], 1)
+        window_grpo_gt_prob_mean = window_totals["grpo_gt_prob_sum"] / max(window_totals["grpo_reward_raw_count"], 1)
+        window_grpo_confuser_penalty_mean = (
+            window_totals["grpo_confuser_penalty_sum"] / max(window_totals["grpo_reward_raw_count"], 1)
+        )
         window_grpo_mcq_acc = window_totals["grpo_mcq_correct_count"] / max(window_totals["grpo_mcq_count"], 1)
         window_grpo_mcq_correct_conf_mean = (
             window_totals["grpo_mcq_correct_conf_sum"] / max(window_totals["grpo_mcq_correct_count"], 1)
@@ -4383,6 +4456,9 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "opsd_onpolicy_jsd": zero,
                 "opsd_grpo": zero,
                 "grpo_reward_mean": zero,
+                "grpo_reward_raw_mean": zero,
+                "grpo_gt_prob_mean": zero,
+                "grpo_confuser_penalty_mean": zero,
                 "grpo_mcq_acc": zero,
                 "grpo_mcq_correct_conf_mean": zero,
                 "grpo_group_size": self._metric_tensor(float(self.grpo_group_size), zero.dtype),
@@ -4468,6 +4544,9 @@ class Sa2VAOPSDModelV2(BaseModel):
                     f"window_grpo_zero_reward_variance_rate={window_grpo_zero_reward_variance_rate:.4f} "
                     f"window_grpo_nonzero_reward_rate={window_grpo_nonzero_reward_rate:.4f} "
                     f"window_grpo_missing_confuser_rate={window_grpo_missing_confuser_rate:.4f} "
+                    f"window_grpo_reward_raw_mean={window_grpo_reward_raw_mean:.4f} "
+                    f"window_grpo_gt_prob_mean={window_grpo_gt_prob_mean:.4f} "
+                    f"window_grpo_confuser_penalty_mean={window_grpo_confuser_penalty_mean:.4f} "
                     f"grpo_mcq_acc={batch_grpo_mcq_acc:.4f} "
                     f"grpo_mcq_correct_conf_mean={batch_grpo_mcq_correct_conf_mean:.4f} "
                     f"grpo_rollout_confidences={grpo_rollout_conf_text} "
@@ -4494,6 +4573,9 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"window_grpo_zero_reward_variance_rate={window_grpo_zero_reward_variance_rate:.4f} "
                 f"window_grpo_nonzero_reward_rate={window_grpo_nonzero_reward_rate:.4f} "
                 f"window_grpo_missing_confuser_rate={window_grpo_missing_confuser_rate:.4f} "
+                f"window_grpo_reward_raw_mean={window_grpo_reward_raw_mean:.4f} "
+                f"window_grpo_gt_prob_mean={window_grpo_gt_prob_mean:.4f} "
+                f"window_grpo_confuser_penalty_mean={window_grpo_confuser_penalty_mean:.4f} "
                 f"grpo_mcq_acc={batch_grpo_mcq_acc:.4f} "
                 f"grpo_mcq_correct_conf_mean={batch_grpo_mcq_correct_conf_mean:.4f} "
                 f"grpo_rollout_confidences={grpo_rollout_conf_text} "
@@ -4519,6 +4601,9 @@ class Sa2VAOPSDModelV2(BaseModel):
             "opsd_onpolicy_jsd": avg_onpolicy_jsd.detach(),
             "opsd_grpo": avg_grpo.detach(),
             "grpo_reward_mean": self._metric_tensor(window_grpo_reward_mean, avg_total_loss.dtype),
+            "grpo_reward_raw_mean": self._metric_tensor(window_grpo_reward_raw_mean, avg_total_loss.dtype),
+            "grpo_gt_prob_mean": self._metric_tensor(window_grpo_gt_prob_mean, avg_total_loss.dtype),
+            "grpo_confuser_penalty_mean": self._metric_tensor(window_grpo_confuser_penalty_mean, avg_total_loss.dtype),
             "grpo_mcq_acc": self._metric_tensor(window_grpo_mcq_acc, avg_total_loss.dtype),
             "grpo_mcq_correct_conf_mean": self._metric_tensor(
                 window_grpo_mcq_correct_conf_mean, avg_total_loss.dtype
