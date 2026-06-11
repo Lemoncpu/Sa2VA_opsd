@@ -2868,6 +2868,21 @@ class Sa2VAOPSDModelV2(BaseModel):
             resized = True
         return pred_mask, resized, pred_shape_before_resize, tuple(pred_mask.shape)
 
+    @staticmethod
+    def _mask_summary(mask):
+        if mask is None:
+            return "empty mask"
+        mask = np.asarray(mask)
+        ys, xs = np.where(mask > 0)
+        h, w = mask.shape
+        area = int(mask.sum())
+        area_ratio = float(area) / float(max(h * w, 1))
+        if len(xs) == 0 or len(ys) == 0:
+            return f"empty mask, area_ratio={area_ratio:.4f}"
+        bbox = [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
+        center = [round(float(xs.mean()), 2), round(float(ys.mean()), 2)]
+        return f"area_ratio={area_ratio:.4f}, bbox={bbox}, center={center}"
+
     def build_teacher_privileged_prompt_v3(
         self,
         *,

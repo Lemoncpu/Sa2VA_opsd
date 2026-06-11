@@ -348,3 +348,8 @@
 - The first four-stage training run crashed in rolling metric aggregation with `KeyError: 'teacher_regenerate_analysis_count'`.
 - Root cause: `_window_metric_counts()` was not updated to include the new teacher pipeline counter keys, so `window_totals` omitted them when old and new metric windows were aggregated together.
 - Updated `projects/sa2va/models/sa2va_opsd_v2.py` to register all new teacher pipeline count metrics in `_window_metric_counts()` so rolling stats remain backward-compatible during live training.
+
+### Second Follow-up Fix
+- A later cleanup removed `_mask_summary()` from `projects/sa2va/models/sa2va_opsd_v2.py`, but `projects/sa2va/evaluation/teacher_diagnosis_common.py` still calls `model._mask_summary(...)` while building teacher privileged relation context.
+- This caused teacher regenerate to fail immediately at fault-report prompt construction with `AttributeError: 'Sa2VAOPSDModelV3' object has no attribute '_mask_summary'`.
+- Restored `_mask_summary()` as a compatibility helper because it remains part of the active teacher diagnosis call chain.
