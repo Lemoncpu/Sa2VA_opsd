@@ -1244,7 +1244,10 @@ class Sa2VAOPSDModelV2(BaseModel):
 
     @staticmethod
     def _teacher_regenerate_gate_passed(student_iou, teacher_iou):
-        return (float(teacher_iou) - float(student_iou)) > 0.5
+        student_iou = float(student_iou)
+        teacher_iou = float(teacher_iou)
+        iou_gain = teacher_iou - student_iou
+        return iou_gain > 0.5 or (teacher_iou >= 0.6 and iou_gain >= 0.1)
 
     @staticmethod
     def _window_metric_counts():

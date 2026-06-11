@@ -173,3 +173,26 @@
   - Added fallback generation-config overrides inside `_predict_forward_eval()` so old remote-code models still honor OPSD decoding limits.
   - Added a local caption completion truncation guard based on `description_max_new_tokens`.
   - Added rolling diagnostics for `teacher_positive_gain_rate`, `teacher_iou_gain_mean`, `grpo_zero_reward_variance_rate`, `grpo_nonzero_reward_rate`, and `grpo_missing_confuser_rate`.
+
+## 2026-06-11 Teacher Gate Relaxation And GRPO Rollout Expansion
+
+### Problem
+- Recent rolling diagnostics showed that teacher regenerate frequently improved IoU but still almost never entered CE supervision.
+- GRPO was the dominant route, while the rollout group size had been temporarily reduced to 2 for debugging and produced relatively sparse pairwise reward diversity.
+
+### Root Cause Notes
+- The teacher regenerate gate required an IoU gain greater than `0.5`, which rejected many practically useful teacher captions with moderate but real improvement.
+- The 4B RefCOCO training config still set `grpo_group_size=2`, limiting within-group reward variation.
+
+### Chosen Fix Direction
+- Restore `grpo_group_size` to 4 in the active 4B RefCOCO OPSD config.
+- Relax teacher CE admission so regeneration is accepted either when IoU gain is greater than `0.5`, or when the teacher reaches at least `0.6` IoU and improves the student by at least `0.1`.
+
+### Rejected Direction
+- Do not remove the strong `>0.5` gate path entirely. Keep it as a high-confidence fast path and add the moderate-improvement clause alongside it.
+
+### Implemented Changes
+- Updated `projects/sa2va/configs/sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3.py` to set `grpo_group_size=4`.
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py` so `_teacher_regenerate_gate_passed()` now returns true for either:
+  - `teacher_iou - student_iou > 0.5`, or
+  - `teacher_iou >= 0.6 and teacher_iou - student_iou >= 0.1`.
