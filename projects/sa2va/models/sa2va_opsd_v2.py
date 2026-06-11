@@ -74,6 +74,17 @@ class ConfuserSelectionResult:
     confuser_penalty: float
 
 
+@dataclass
+class TeacherRegenerateResult:
+    raw_prediction: str
+    detailed_caption: str
+    verification_caption: str
+    detailed_completion_ids: torch.Tensor
+    detailed_status: str
+    verification_status: str
+    dual_output_parsed: bool
+
+
 class Sa2VAOPSDModelV2(BaseModel):
     """Standalone OPSD implementation aligned to official sample.py usage."""
 
@@ -274,6 +285,9 @@ class Sa2VAOPSDModelV2(BaseModel):
         self._cumulative_teacher_regenerate_verified_count = 0
         self._cumulative_teacher_regenerate_rejected_count = 0
         self._cumulative_teacher_regenerate_verified_iou_sum = 0.0
+        self._cumulative_teacher_regenerate_dual_output_count = 0
+        self._cumulative_teacher_regenerate_verification_valid_count = 0
+        self._cumulative_teacher_regenerate_verification_iou_sum = 0.0
         self._cumulative_recovery_ce_applied_count = 0
         self._cumulative_recovery_suppressed_count = 0
         self._cumulative_scene_spill_caption_count = 0
@@ -1299,6 +1313,8 @@ class Sa2VAOPSDModelV2(BaseModel):
             "grpo_blocked_by_seg_style_count",
             "teacher_recovery_seg_style_count",
             "teacher_recovery_seg_style_success_count",
+            "teacher_regenerate_dual_output_count",
+            "teacher_regenerate_verification_valid_count",
             "grpo_zero_reward_variance_count",
             "grpo_nonzero_reward_count",
             "grpo_missing_confuser_count",
@@ -1326,6 +1342,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             "grpo_confuser_penalty_sum",
             "grpo_mcq_correct_conf_sum",
             "teacher_regenerate_verified_iou_sum",
+            "teacher_regenerate_verification_iou_sum",
             "teacher_iou_gain_sum",
         )
 
@@ -1522,6 +1539,54 @@ class Sa2VAOPSDModelV2(BaseModel):
             status=status,
             raw_failure_mode=raw_failure_mode,
             clean_status=clean_status,
+        )
+
+    @staticmethod
+    def _extract_labeled_teacher_text(raw_prediction, label):
+        if raw_prediction is None:
+            return ""
+        pattern = rf"(?is)(?:^|\n)\s*{re.escape(label)}\s*:\s*(.*?)(?=\n\s*[A-Z_]+\s*:|\Z)"
+        match = re.search(pattern, str(raw_prediction))
+        if not match:
+            return ""
+        return match.group(1).strip()
+
+    def _parse_teacher_regenerate_dual_output(self, raw_prediction):
+        raw_prediction = "" if raw_prediction is None else str(raw_prediction)
+        detailed_caption = self._extract_labeled_teacher_text(raw_prediction, "DLC")
+        verification_caption = self._extract_labeled_teacher_text(raw_prediction, "VERIFICATION_CAPTION")
+        dual_output_parsed = bool(detailed_caption and verification_caption)
+        detailed_caption = self._clean_caption_text(detailed_caption)
+        verification_caption = self._clean_caption_text(verification_caption)
+
+        detailed_completion_ids = self._encode_completion_from_caption(detailed_caption)
+        detailed_caption, detailed_completion_ids, detailed_was_truncated = self._truncate_caption_completion(
+            detailed_caption,
+            detailed_completion_ids,
+            max_tokens=self.description_max_new_tokens,
+        )
+
+        detailed_status = self._infer_description_status(detailed_caption)
+        if detailed_status == "ok" and not self._is_caption_content_sufficient(detailed_caption):
+            detailed_status = "truncated_caption"
+        if detailed_status != "seg_style_answer" and detailed_was_truncated:
+            detailed_status = "truncated_caption"
+
+        verification_status = self._infer_description_status(verification_caption)
+        if verification_status == "ok" and (
+            not self._is_caption_content_sufficient(verification_caption)
+            or self._is_overly_generic_caption(verification_caption)
+        ):
+            verification_status = "truncated_caption"
+
+        return TeacherRegenerateResult(
+            raw_prediction=raw_prediction,
+            detailed_caption=detailed_caption,
+            verification_caption=verification_caption,
+            detailed_completion_ids=detailed_completion_ids,
+            detailed_status=detailed_status,
+            verification_status=verification_status,
+            dual_output_parsed=dual_output_parsed,
         )
 
     def _truncate_caption_completion(self, caption, completion_ids, *, max_tokens):
@@ -2509,13 +2574,23 @@ class Sa2VAOPSDModelV2(BaseModel):
         )
         teacher_fields["teacher_regenerate_prompt"] = teacher_prompt
         teacher_model = self.require_teacher_model("Teacher privileged regeneration")
-        return self.generate_description_with_model(
+        formatted_mask_prompts = self._format_mask_prompts_for_predict_forward(teacher_prompt_masks)
+        prompt_image = self._build_mask_focused_image(image, teacher_prompt_masks)
+        predict_dict = self._predict_forward_eval(
             teacher_model,
-            image=image,
-            mask_prompts=teacher_prompt_masks,
-            student_question=teacher_prompt,
-            apply_mask_focus=True,
+            image=prompt_image,
+            text=teacher_prompt,
+            past_text="",
+            mask_prompts=formatted_mask_prompts,
+            tokenizer=self.tokenizer,
+            max_new_tokens=self.description_max_new_tokens,
+            do_sample=False,
+            repetition_penalty=self.description_repetition_penalty,
+            no_repeat_ngram_size=self.description_no_repeat_ngram_size,
+            bad_words_ids=self._caption_bad_words_ids,
         )
+        raw_prediction = predict_dict.get("prediction", "")
+        return self._parse_teacher_regenerate_dual_output(raw_prediction)
 
     def reconstruct_mask(self, image, caption, description_status, spatial_hint="", gt_mask=None):
         del spatial_hint
@@ -2693,17 +2768,25 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "2. Analyze what region2 actually contains.\n"
                 "3. Compare the two masks and identify missing target evidence and extra distractor evidence.\n"
                 "4. Diagnose why the student's caption leads to region2 instead of region1, and which phrases are wrong, missing, too generic, or misleading.\n"
-                "5. Regenerate a better caption that would move reconstruction from region2 toward region1.\n"
+                "5. Regenerate a better detailed localized caption for region1.\n"
+                "6. Based on that detailed caption and the gtmask, write one shorter verification caption that is easier for mask reconstruction to follow while still preserving concrete visible distinguishing traits.\n"
                 f"{route_guidance}\n"
                 "Output requirements:\n"
-                "- Return exactly one natural and complete sentence describing region1.\n"
-                "- Focus on visible appearance, attributes, parts, markings, clothing, pose, and only the minimum local context needed to localize the target.\n"
-                "- Prefer concrete visible details over generic statements.\n"
-                "- Fix the specific mistakes that caused region2 to differ from region1.\n"
+                "- Output exactly two lines in the following format:\n"
+                "DLC: <one natural and complete detailed localized caption>\n"
+                "VERIFICATION_CAPTION: <one shorter verifier-friendly caption>\n"
+                "- The DLC must be one natural and complete sentence describing region1.\n"
+                "- The DLC must focus on visible appearance, attributes, parts, markings, clothing, pose, and only the minimum local context needed to localize the target.\n"
+                "- The DLC must fix the specific mistakes that caused region2 to differ from region1.\n"
+                "- The VERIFICATION_CAPTION must be derived from the DLC and gtmask.\n"
+                "- The VERIFICATION_CAPTION must stay shorter than the DLC but must still preserve concrete visible distinguishing traits.\n"
+                "- The VERIFICATION_CAPTION must not collapse into a generic category-only phrase such as 'the man', 'the person', 'the object', or similar vague labels.\n"
+                "- The VERIFICATION_CAPTION should keep only the minimum visible local detail and spatial cue needed to identify the target reliably.\n"
                 "- Do not explain.\n"
-                "- Do not output labels.\n"
+                "- Do not output any labels other than DLC: and VERIFICATION_CAPTION:.\n"
                 "- Do not mention region1 or region2.\n"
                 "- Do not describe anything that is not visible.\n"
+                "- Do not output [SEG], segmentation tags, or placeholder tokens.\n"
                 "- Do not copy the failed student caption if it still matches region2."
             )
         return prompt
@@ -3019,6 +3102,11 @@ class Sa2VAOPSDModelV2(BaseModel):
             "teacher_iou_plain": None,
             "teacher_completion_len": None,
             "caption_mode_failure": False,
+            "teacher_dual_output_parsed": False,
+            "teacher_verification_caption_status": "empty",
+            "teacher_verification_caption": "",
+            "teacher_dlc": "",
+            "teacher_verification_iou": 0.0,
         }
         if not allow_teacher_ce:
             return result
@@ -3041,8 +3129,12 @@ class Sa2VAOPSDModelV2(BaseModel):
             teacher_fields=teacher_fields,
         )
         result["teacher_regenerate"] = teacher_regenerate
-        result["teacher_completion_len"] = int(teacher_regenerate.completion_ids.shape[1])
-        if teacher_regenerate.completion_ids.shape[1] == 0:
+        result["teacher_completion_len"] = int(teacher_regenerate.detailed_completion_ids.shape[1])
+        result["teacher_dual_output_parsed"] = bool(teacher_regenerate.dual_output_parsed)
+        result["teacher_verification_caption_status"] = str(teacher_regenerate.verification_status)
+        result["teacher_verification_caption"] = teacher_regenerate.verification_caption
+        result["teacher_dlc"] = teacher_regenerate.detailed_caption
+        if teacher_regenerate.detailed_completion_ids.shape[1] == 0:
             result["teacher_reconstruct_ok"] = False
             result["teacher_gate_passed"] = False
             result["teacher_iou_plain"] = 0.0
@@ -3050,14 +3142,15 @@ class Sa2VAOPSDModelV2(BaseModel):
 
         teacher_reconstruction = self.reconstruct_mask(
             image=image,
-            caption=teacher_regenerate.clean_caption,
-            description_status=teacher_regenerate.status,
+            caption=teacher_regenerate.verification_caption,
+            description_status=teacher_regenerate.verification_status,
             gt_mask=gt_mask_np,
         )
         teacher_pred_mask = None if teacher_reconstruction is None else teacher_reconstruction.pred_mask
         teacher_iou_plain = (
             self._compute_iou(gt_mask_np, teacher_pred_mask) if teacher_pred_mask is not None else 0.0
         )
+        result["teacher_verification_iou"] = float(teacher_iou_plain)
         teacher_reconstruct_ok = (
             teacher_reconstruction is not None
             and teacher_reconstruction.status == "ok"
@@ -3898,6 +3991,9 @@ class Sa2VAOPSDModelV2(BaseModel):
         teacher_reconstruct_ok_count = 0
         teacher_positive_gain_count = 0
         teacher_iou_gain_sum = 0.0
+        teacher_regenerate_dual_output_count = 0
+        teacher_regenerate_verification_valid_count = 0
+        teacher_regenerate_verification_iou_sum = 0.0
         caption_mode_failure_count = 0
         onpolicy_blocked_by_seg_style_count = 0
         grpo_blocked_by_seg_style_count = 0
@@ -4068,6 +4164,16 @@ class Sa2VAOPSDModelV2(BaseModel):
             teacher_iou_plain = teacher_analysis["teacher_iou_plain"]
             teacher_completion_len = teacher_analysis["teacher_completion_len"]
             teacher_regenerate = teacher_analysis["teacher_regenerate"]
+            teacher_dual_output_parsed = bool(teacher_analysis.get("teacher_dual_output_parsed", False))
+            teacher_verification_caption_status = str(teacher_analysis.get("teacher_verification_caption_status", "empty"))
+            teacher_verification_caption = str(teacher_analysis.get("teacher_verification_caption", ""))
+            teacher_dlc = str(teacher_analysis.get("teacher_dlc", ""))
+            teacher_verification_iou = float(teacher_analysis.get("teacher_verification_iou", 0.0))
+            if teacher_dual_output_parsed:
+                teacher_regenerate_dual_output_count += 1
+            if teacher_verification_caption_status == "ok":
+                teacher_regenerate_verification_valid_count += 1
+            teacher_regenerate_verification_iou_sum += teacher_verification_iou
             caption_mode_failure = bool(teacher_analysis.get("caption_mode_failure", False))
             if caption_mode_failure:
                 teacher_recovery_seg_style_count += 1
@@ -4112,6 +4218,11 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "teacher_gate_passed": teacher_gate_passed,
                 "teacher_iou_plain": teacher_iou_plain,
                 "teacher_completion_len": teacher_completion_len,
+                "teacher_dual_output_parsed": teacher_dual_output_parsed,
+                "teacher_verification_caption_status": teacher_verification_caption_status,
+                "teacher_verification_caption": teacher_verification_caption,
+                "teacher_verification_iou": teacher_verification_iou,
+                "teacher_dlc": teacher_dlc,
                 "raw_caption_failure_mode": description.raw_failure_mode,
                 "clean_description_status": description.clean_status,
                 "student_caption_trainable": bool(student_caption_trainable),
@@ -4127,7 +4238,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             if loss_family == TEACHER_REGENERATE_ROUTE:
                 teacher_regenerate_count += 1
                 teacher_prompt = self._route_prompt_tag(loss_family)
-                regen_completion = None if teacher_regenerate is None else teacher_regenerate.completion_ids
+                regen_completion = None if teacher_regenerate is None else teacher_regenerate.detailed_completion_ids
                 if regen_completion is None or regen_completion.shape[1] == 0:
                     dummy_reason = "teacher_empty_completion" if teacher_regenerate is not None else "teacher_not_available"
                 elif not (teacher_reconstruct_ok and teacher_gate_passed):
@@ -4150,8 +4261,8 @@ class Sa2VAOPSDModelV2(BaseModel):
                 sample_debug_record["is_dummy"] = bool(dummy_reason is not None)
                 sample_debug_record["dummy_reason"] = dummy_reason
                 last_caption = (
-                    teacher_regenerate.clean_caption
-                    if teacher_regenerate is not None and teacher_regenerate.clean_caption
+                    teacher_regenerate.detailed_caption
+                    if teacher_regenerate is not None and teacher_regenerate.detailed_caption
                     else description.clean_caption
                 )
             elif loss_family == ON_POLICY_DISTILL_ROUTE:
@@ -4343,6 +4454,9 @@ class Sa2VAOPSDModelV2(BaseModel):
         self._cumulative_teacher_regenerate_verified_count += teacher_regenerate_verified_count
         self._cumulative_teacher_regenerate_rejected_count += teacher_regenerate_rejected_count
         self._cumulative_teacher_regenerate_verified_iou_sum += teacher_regenerate_verified_iou_sum
+        self._cumulative_teacher_regenerate_dual_output_count += teacher_regenerate_dual_output_count
+        self._cumulative_teacher_regenerate_verification_valid_count += teacher_regenerate_verification_valid_count
+        self._cumulative_teacher_regenerate_verification_iou_sum += teacher_regenerate_verification_iou_sum
         self._cumulative_recovery_ce_applied_count += recovery_ce_applied_count
         self._cumulative_recovery_suppressed_count += recovery_suppressed_count
         self._cumulative_scene_spill_caption_count += scene_spill_caption_count
@@ -4395,6 +4509,8 @@ class Sa2VAOPSDModelV2(BaseModel):
             "teacher_regenerate_rejected_count": teacher_regenerate_rejected_count,
             "teacher_reconstruct_ok_count": teacher_reconstruct_ok_count,
             "teacher_positive_gain_count": teacher_positive_gain_count,
+            "teacher_regenerate_dual_output_count": teacher_regenerate_dual_output_count,
+            "teacher_regenerate_verification_valid_count": teacher_regenerate_verification_valid_count,
             "caption_mode_failure_count": caption_mode_failure_count,
             "onpolicy_blocked_by_seg_style_count": onpolicy_blocked_by_seg_style_count,
             "grpo_blocked_by_seg_style_count": grpo_blocked_by_seg_style_count,
@@ -4422,6 +4538,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             "grpo_confuser_penalty_sum": grpo_confuser_penalty_sum,
             "grpo_mcq_correct_conf_sum": grpo_mcq_correct_conf_sum,
             "teacher_regenerate_verified_iou_sum": teacher_regenerate_verified_iou_sum,
+            "teacher_regenerate_verification_iou_sum": teacher_regenerate_verification_iou_sum,
             "teacher_iou_gain_sum": teacher_iou_gain_sum,
         }
         self._append_window_metrics(window_payload)
@@ -4474,6 +4591,15 @@ class Sa2VAOPSDModelV2(BaseModel):
         )
         window_teacher_regenerate_verified_iou_mean = (
             window_totals["teacher_regenerate_verified_iou_sum"] / max(window_totals["teacher_regenerate_verified_count"], 1)
+        )
+        window_teacher_regenerate_dual_output_rate = (
+            window_totals["teacher_regenerate_dual_output_count"] / max(window_totals["teacher_regenerate_count"], 1)
+        )
+        window_teacher_regenerate_verification_caption_valid_rate = (
+            window_totals["teacher_regenerate_verification_valid_count"] / max(window_totals["teacher_regenerate_count"], 1)
+        )
+        window_teacher_regenerate_verification_iou_mean = (
+            window_totals["teacher_regenerate_verification_iou_sum"] / max(window_totals["teacher_regenerate_count"], 1)
         )
         window_loss_opsd_total = window_totals["total_loss_sum"] / window_loss_count
         window_regen_ce = window_totals["regen_ce_sum"] / max(window_totals["regen_loss_count"], 1)
@@ -4562,6 +4688,15 @@ class Sa2VAOPSDModelV2(BaseModel):
             self._cumulative_teacher_regenerate_verified_iou_sum
             / max(self._cumulative_teacher_regenerate_verified_count, 1)
         )
+        cumulative_teacher_regenerate_dual_output_rate = (
+            self._cumulative_teacher_regenerate_dual_output_count / max(self._cumulative_teacher_regenerate_count, 1)
+        )
+        cumulative_teacher_regenerate_verification_caption_valid_rate = (
+            self._cumulative_teacher_regenerate_verification_valid_count / max(self._cumulative_teacher_regenerate_count, 1)
+        )
+        cumulative_teacher_regenerate_verification_iou_mean = (
+            self._cumulative_teacher_regenerate_verification_iou_sum / max(self._cumulative_teacher_regenerate_count, 1)
+        )
 
         if optimized_count == 0:
             self._log_pre_return_debug(
@@ -4621,6 +4756,18 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "teacher_regenerate_verified_iou_mean": self._metric_tensor(
                     window_teacher_regenerate_verified_iou_mean, zero.dtype
                 ),
+                "teacher_regenerate_dual_output_rate": self._metric_tensor(
+                    window_teacher_regenerate_dual_output_rate, zero.dtype
+                ),
+                "teacher_regenerate_verification_caption_valid_rate": self._metric_tensor(
+                    window_teacher_regenerate_verification_caption_valid_rate, zero.dtype
+                ),
+                "teacher_regenerate_verification_iou_mean": self._metric_tensor(
+                    window_teacher_regenerate_verification_iou_mean, zero.dtype
+                ),
+                "teacher_regenerate_dlc_ce_applied_count": self._metric_tensor(
+                    window_totals["teacher_regenerate_ce_applied_count"], zero.dtype
+                ),
                 "onpolicy_blocked_by_seg_style_count": self._metric_tensor(
                     window_totals["onpolicy_blocked_by_seg_style_count"], zero.dtype
                 ),
@@ -4679,6 +4826,9 @@ class Sa2VAOPSDModelV2(BaseModel):
                     f"teacher_regen_verified_iou_mean={batch_teacher_regenerate_verified_iou_mean:.4f} "
                     f"teacher_regenerate_ce_applied={teacher_regenerate_ce_applied_count} "
                     f"teacher_regenerate_suppressed={teacher_regenerate_suppressed_count} "
+                    f"window_teacher_regenerate_dual_output_rate={window_teacher_regenerate_dual_output_rate:.4f} "
+                    f"window_teacher_regenerate_verification_caption_valid_rate={window_teacher_regenerate_verification_caption_valid_rate:.4f} "
+                    f"window_teacher_regenerate_verification_iou_mean={window_teacher_regenerate_verification_iou_mean:.4f} "
                     f"window_avg_caption_tokens={window_avg_caption_tokens:.2f} "
                     f"window_caption_seg_style_rate_raw={window_caption_seg_style_rate_raw:.4f} "
                     f"window_caption_mode_failure_rate={window_caption_mode_failure_rate:.4f} "
@@ -4686,6 +4836,10 @@ class Sa2VAOPSDModelV2(BaseModel):
                     f"window_grpo_blocked_by_seg_style_count={window_totals['grpo_blocked_by_seg_style_count']} "
                     f"window_teacher_recovery_seg_style_count={window_totals['teacher_recovery_seg_style_count']} "
                     f"window_teacher_recovery_seg_style_success_count={window_totals['teacher_recovery_seg_style_success_count']} "
+                    f"cumulative_teacher_regenerate_dual_output_rate={cumulative_teacher_regenerate_dual_output_rate:.4f} "
+                    f"cumulative_teacher_regenerate_verification_caption_valid_rate={cumulative_teacher_regenerate_verification_caption_valid_rate:.4f} "
+                    f"cumulative_teacher_regenerate_verification_iou_mean={cumulative_teacher_regenerate_verification_iou_mean:.4f} "
+                    f"cumulative_teacher_regenerate_dlc_ce_applied_count={self._cumulative_teacher_regenerate_ce_applied_count} "
                     f"window_teacher_positive_gain_rate={window_teacher_positive_gain_rate:.4f} "
                     f"window_teacher_iou_gain_mean={window_teacher_iou_gain_mean:.4f} "
                     f"window_grpo_zero_reward_variance_rate={window_grpo_zero_reward_variance_rate:.4f} "
@@ -4714,6 +4868,9 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"teacher_regen_verified_iou_mean={batch_teacher_regenerate_verified_iou_mean:.4f} "
                 f"teacher_regenerate_ce_applied={teacher_regenerate_ce_applied_count} "
                 f"teacher_regenerate_suppressed={teacher_regenerate_suppressed_count} "
+                f"window_teacher_regenerate_dual_output_rate={window_teacher_regenerate_dual_output_rate:.4f} "
+                f"window_teacher_regenerate_verification_caption_valid_rate={window_teacher_regenerate_verification_caption_valid_rate:.4f} "
+                f"window_teacher_regenerate_verification_iou_mean={window_teacher_regenerate_verification_iou_mean:.4f} "
                 f"window_avg_caption_tokens={window_avg_caption_tokens:.2f} "
                 f"window_caption_seg_style_rate_raw={window_caption_seg_style_rate_raw:.4f} "
                 f"window_caption_mode_failure_rate={window_caption_mode_failure_rate:.4f} "
@@ -4721,6 +4878,10 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"window_grpo_blocked_by_seg_style_count={window_totals['grpo_blocked_by_seg_style_count']} "
                 f"window_teacher_recovery_seg_style_count={window_totals['teacher_recovery_seg_style_count']} "
                 f"window_teacher_recovery_seg_style_success_count={window_totals['teacher_recovery_seg_style_success_count']} "
+                f"cumulative_teacher_regenerate_dual_output_rate={cumulative_teacher_regenerate_dual_output_rate:.4f} "
+                f"cumulative_teacher_regenerate_verification_caption_valid_rate={cumulative_teacher_regenerate_verification_caption_valid_rate:.4f} "
+                f"cumulative_teacher_regenerate_verification_iou_mean={cumulative_teacher_regenerate_verification_iou_mean:.4f} "
+                f"cumulative_teacher_regenerate_dlc_ce_applied_count={self._cumulative_teacher_regenerate_ce_applied_count} "
                 f"window_teacher_positive_gain_rate={window_teacher_positive_gain_rate:.4f} "
                 f"window_teacher_iou_gain_mean={window_teacher_iou_gain_mean:.4f} "
                 f"window_grpo_zero_reward_variance_rate={window_grpo_zero_reward_variance_rate:.4f} "
@@ -4795,6 +4956,18 @@ class Sa2VAOPSDModelV2(BaseModel):
             "teacher_regenerate_gate_pass_rate": self._metric_tensor(window_teacher_regenerate_gate_pass_rate, avg_total_loss.dtype),
             "teacher_regenerate_verified_iou_mean": self._metric_tensor(
                 window_teacher_regenerate_verified_iou_mean, avg_total_loss.dtype
+            ),
+            "teacher_regenerate_dual_output_rate": self._metric_tensor(
+                window_teacher_regenerate_dual_output_rate, avg_total_loss.dtype
+            ),
+            "teacher_regenerate_verification_caption_valid_rate": self._metric_tensor(
+                window_teacher_regenerate_verification_caption_valid_rate, avg_total_loss.dtype
+            ),
+            "teacher_regenerate_verification_iou_mean": self._metric_tensor(
+                window_teacher_regenerate_verification_iou_mean, avg_total_loss.dtype
+            ),
+            "teacher_regenerate_dlc_ce_applied_count": self._metric_tensor(
+                window_totals["teacher_regenerate_ce_applied_count"], avg_total_loss.dtype
             ),
             "onpolicy_blocked_by_seg_style_count": self._metric_tensor(
                 window_totals["onpolicy_blocked_by_seg_style_count"], avg_total_loss.dtype

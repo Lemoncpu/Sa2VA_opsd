@@ -258,3 +258,32 @@
 ### Follow-up Correction
 - The first version initialized caption `bad_words_ids` before `self.tokenizer` was constructed, which caused model build to fail with `AttributeError: 'Sa2VAOPSDModelV3' object has no attribute 'tokenizer'`.
 - Updated `projects/sa2va/models/sa2va_opsd_v2.py` so caption bad-word tokenization happens immediately after tokenizer initialization instead of earlier in `__init__`.
+
+## 2026-06-11 Teacher Regenerate DLC + Verification Caption
+
+### Problem
+- Teacher regenerate was expected to use privileged mask information to produce better long DLC targets, but long-caption reconstruction gate pass remained too low to serve as a reliable supervision source.
+- The verifier path appears to prefer shorter, more directly referential descriptions than the full detailed caption needed by the main task.
+
+### Root Cause Notes
+- Teacher regenerate previously used a single long caption for both CE supervision and reconstruction IoU gate validation.
+- This coupled the DLC training target to a verifier that is more stable on shorter verifier-friendly phrases, making teacher usefulness look near-random even when the long caption still carried useful detail.
+
+### Chosen Fix Direction
+- Split teacher regenerate outputs into:
+  - `DLC`: the long detailed localized caption used for CE
+  - `VERIFICATION_CAPTION`: a shorter, still discriminative caption used only for reconstruction IoU gate validation
+- Keep student route IoU, on-policy, and GRPO tied to long captions so the main task does not collapse into short referring expressions.
+- Add matching window metrics plus cumulative log-only diagnostics for teacher dual-output quality.
+
+### Rejected Direction
+- Do not switch student route IoU, on-policy, or GRPO to short captions in this patch.
+- Do not train CE on the verification caption. It is a gate-only verifier text, not the primary caption target.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py`:
+  - Added a teacher regenerate dual-output prompt contract with strict `DLC:` and `VERIFICATION_CAPTION:` fields.
+  - Added dedicated parsing and status handling for teacher dual-output captions.
+  - Switched teacher regenerate gate reconstruction to use only the generated verification caption.
+  - Kept regenerate CE supervision on the detailed caption only.
+  - Added window metrics and cumulative log fields for dual-output parse rate, verification-caption validity, verification IoU, and DLC CE application counts.
