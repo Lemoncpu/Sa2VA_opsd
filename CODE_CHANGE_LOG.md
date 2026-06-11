@@ -218,6 +218,23 @@
 - Do not mix caption-quality reward or reconstruction-IoU reward into this change. Keep the dense reward local to the confuser MCQ path so its effect is interpretable.
 - Do not only penalize the chosen wrong option; use the full distribution so reward stays dense even when argmax is correct but confuser mass is high.
 
+## 2026-06-12 Teacher Regenerate Cumulative Rate Fix And Verification Caption Logging
+
+### Problem
+- The newly added cumulative/window teacher regenerate dual-output metrics produced impossible values greater than `1.0`, so the logged rates could not be interpreted.
+- When inspecting the `teacher_regenerate` route, the logs did not surface the actual verification caption text used for gate reconstruction, which made it hard to audit why gate passes were rare.
+
+### Root Cause Notes
+- `teacher_regenerate_dual_output_rate`, `teacher_regenerate_verification_caption_valid_rate`, and `teacher_regenerate_verification_iou_mean` used counts collected from every teacher analysis attempt gated by `allow_teacher_ce`, but divided them by `teacher_regenerate_count`, which only counts samples whose final loss branch is `teacher_regenerate`.
+- The per-sample pre-return debug summary already carried teacher verification caption fields in memory, but the formatted log line did not print them.
+
+### Chosen Fix Direction
+- Add a dedicated `teacher_regenerate_analysis_count` denominator for the dual-output / verification-caption metrics and use it for both rolling and cumulative log-only summaries.
+- Extend the per-sample debug log text so `teacher_regenerate` route inspection includes `teacher_verification_caption` and its status directly in the emitted record.
+
+### Rejected Direction
+- Do not redefine these metrics against `teacher_regenerate_count`, because that would keep mixing route-assignment counts with teacher-analysis counts and continue to skew rates whenever teacher analysis runs outside the final regenerate branch.
+
 ### Implemented Changes
 - Updated `projects/sa2va/models/sa2va_opsd_v2.py`:
   - Extended `ConfuserSelectionResult` with dense reward metadata.
@@ -287,3 +304,35 @@
   - Switched teacher regenerate gate reconstruction to use only the generated verification caption.
   - Kept regenerate CE supervision on the detailed caption only.
   - Added window metrics and cumulative log fields for dual-output parse rate, verification-caption validity, verification IoU, and DLC CE application counts.
+
+## 2026-06-12 Teacher Regenerate Four-Stage Diagnosis Pipeline
+
+### Problem
+- The single-step teacher regenerate prompt still let the teacher jump straight to rewriting a caption, so privileged mask information was not being converted into an explicit, auditable diagnosis of why the student caption first failed.
+- Low regenerate gate pass rate remained hard to interpret because logs did not distinguish whether failure came from poor diagnosis, weak rewrite planning, bad DLC generation, or weak verification caption generation.
+
+### Root Cause Notes
+- The previous teacher regenerate flow combined diagnosis, rewrite planning, DLC generation, and verification caption generation in one response, so there was no structured intermediate signal to validate or filter before CE.
+- Regenerate logging tracked only end-state caption validity and gate outcomes, which hid where the teacher pipeline broke down.
+
+### Chosen Fix Direction
+- Replace the single-step teacher regenerate output with a four-stage pipeline:
+  - structured fault report
+  - structured repair plan
+  - DLC generation
+  - verification-caption generation
+- Validate each stage before allowing the next one to run, and stop early with a stage-specific failure reason when diagnosis or rewrite structure is not usable.
+- Keep teacher regenerate CE on the DLC only and keep gate reconstruction on the verification caption only.
+
+### Rejected Direction
+- Do not keep the old dual-output regenerate prompt as the main path, because it still mixes diagnosis and generation too early.
+- Do not add new training losses in this patch; the new structure is used only for teacher-side generation, filtering, gating, and diagnostics.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py`:
+  - Replaced the old teacher dual-output result with a richer four-stage pipeline result object.
+  - Added structured parsing and validation for fault-report and repair-plan outputs.
+  - Added dedicated generation paths for fault report, repair plan, DLC, and verification caption.
+  - Switched teacher regenerate analysis to run the staged pipeline, stop early on invalid intermediate outputs, and surface stage-specific failure reasons.
+  - Added rolling metrics and cumulative log-only diagnostics for fault-report validity, repair-plan validity, DLC validity, verification gate pass rate, low-confidence diagnosis rate, and non-empty missing/distractor evidence rates.
+  - Extended debug logs to print teacher diagnosis fields, rewrite fields, verification caption, and pipeline stop stage/failure reason.
