@@ -282,7 +282,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         self._cumulative_generic_caption_count = 0
         self._cumulative_repetitive_caption_count = 0
         self._metric_window = deque(maxlen=self.rolling_metric_window_iters)
-        self._caption_bad_words_ids = self._build_caption_bad_words_ids()
+        self._caption_bad_words_ids = None
 
         self.teacher_summary_template = teacher_summary_template or (
             "You are optimizing the following task: given a gtmask, generate a caption that describes it. "
@@ -324,6 +324,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             padding_side="right",
             use_fast=False,
         )
+        self._caption_bad_words_ids = self._build_caption_bad_words_ids()
         self._grpo_option_letters = tuple(chr(ord("A") + idx) for idx in range(self.grpo_confuser_num_options))
         self._grpo_option_token_ids = self._resolve_grpo_option_token_ids()
         try:

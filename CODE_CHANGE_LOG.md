@@ -254,3 +254,7 @@
   - Blocked `seg_style_answer`, `truncated_caption`, `empty`, and `decode_error` captions from on-policy and GRPO entries via a unified trainability check.
   - Allowed seg-style caption failures to use teacher regenerate as a recovery path when the teacher returns a valid caption, without applying the normal IoU gate to that specific failure class.
   - Added rolling metrics and debug fields for raw seg-style rate, caption-mode failure rate, seg-style route blocking counts, and teacher recovery counts.
+
+### Follow-up Correction
+- The first version initialized caption `bad_words_ids` before `self.tokenizer` was constructed, which caused model build to fail with `AttributeError: 'Sa2VAOPSDModelV3' object has no attribute 'tokenizer'`.
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py` so caption bad-word tokenization happens immediately after tokenizer initialization instead of earlier in `__init__`.
