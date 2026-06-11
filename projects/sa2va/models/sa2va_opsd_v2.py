@@ -335,24 +335,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         self._metric_window = deque(maxlen=self.rolling_metric_window_iters)
         self._caption_bad_words_ids = None
 
-        self.teacher_summary_template = teacher_summary_template or (
-            "You are optimizing the following task: given a gtmask, generate a caption that describes it. "
-            "You are now given the original input, the student question, and privileged verification information. "
-            "Use these privileged signals to improve the caption generation.\n"
-            "Original student prompt: {student_question}\n"
-            "Student caption: {student_caption}\n"
-            "Verifier caption used for reconstruction: {verifier_caption}\n"
-            "Reconstruction question: {reconstruct_question}\n"
-            "Description generation status: {description_status}\n"
-            "Reconstruction status: {reconstruct_status}\n"
-            "caption_to_mask_seg_correct: {caption_to_mask_seg_correct}\n"
-            "IoU between gtmask (region1) and refmask (region2): {iou:.4f}\n"
-            "Reconstruction produced a valid mask: {has_mask}\n"
-            "region1 = gtmask summary: {gtmask_summary}\n"
-            "region2 = refmask summary: {refmask_summary}\n"
-            "Compare region1 and region2, then infer how the caption should be revised so the reconstruction moves from region2 toward region1.\n"
-            "Use that strategy to better model the student's caption tokens."
-        )
+        del teacher_summary_template
         self.reconstruct_question_template = reconstruct_question_template or (
             "<image>\n"
             "Return the segmentation mask for the target region referred to by the description below.\n"
@@ -1345,6 +1328,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             "teacher_regenerate_rejected_count",
             "teacher_reconstruct_ok_count",
             "teacher_positive_gain_count",
+            "teacher_regenerate_analysis_count",
             "caption_mode_failure_count",
             "onpolicy_blocked_by_seg_style_count",
             "grpo_blocked_by_seg_style_count",
@@ -1352,6 +1336,13 @@ class Sa2VAOPSDModelV2(BaseModel):
             "teacher_recovery_seg_style_success_count",
             "teacher_regenerate_dual_output_count",
             "teacher_regenerate_verification_valid_count",
+            "teacher_fault_report_valid_count",
+            "teacher_repair_plan_valid_count",
+            "teacher_dlc_valid_count",
+            "teacher_fault_unknown_count",
+            "teacher_fault_low_confidence_count",
+            "teacher_fault_missing_evidence_nonempty_count",
+            "teacher_fault_distractor_evidence_nonempty_count",
             "grpo_zero_reward_variance_count",
             "grpo_nonzero_reward_count",
             "grpo_missing_confuser_count",
@@ -2877,21 +2868,6 @@ class Sa2VAOPSDModelV2(BaseModel):
             resized = True
         return pred_mask, resized, pred_shape_before_resize, tuple(pred_mask.shape)
 
-    @staticmethod
-    def _mask_summary(mask):
-        if mask is None:
-            return "empty mask"
-        mask = np.asarray(mask)
-        ys, xs = np.where(mask > 0)
-        h, w = mask.shape
-        area = int(mask.sum())
-        area_ratio = float(area) / float(max(h * w, 1))
-        if len(xs) == 0 or len(ys) == 0:
-            return f"empty mask, area_ratio={area_ratio:.4f}"
-        bbox = [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
-        center = [round(float(xs.mean()), 2), round(float(ys.mean()), 2)]
-        return f"area_ratio={area_ratio:.4f}, bbox={bbox}, center={center}"
-
     def build_teacher_privileged_prompt_v3(
         self,
         *,
@@ -3080,42 +3056,6 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "- It must not collapse into a generic phrase like the man, the person, or the object.\n"
                 "- It must not introduce any attribute not already supported by the DLC and diagnosis.\n"
                 "- It must not include AVOID_PHRASES, explanations, extra labels, bullets, or [SEG]."
-            )
-        elif generation_mode == "regenerate_caption":
-            prompt = prompt_intro + (
-                f"Student prompt: {clean_question}\n"
-                f"Failed student caption: {student_caption}\n"
-                f"Description status: {description_status}\n"
-                f"Reconstruction status: {reconstruction.status}\n"
-                f"Current IoU between region1 and region2: {iou:.4f}\n"
-                f"Shared overlap summary: {relation_context['overlap_summary']}\n"
-                f"Region1-only summary (missing target pixels): {relation_context['gt_only_summary']}\n"
-                f"Region2-only summary (distractor pixels wrongly predicted): {relation_context['ref_only_summary']}\n"
-                "Before writing the new caption, reason in this order internally:\n"
-                "1. Analyze what region1 actually contains.\n"
-                "2. Analyze what region2 actually contains.\n"
-                "3. Compare the two masks and identify missing target evidence and extra distractor evidence.\n"
-                "4. Diagnose why the student's caption leads to region2 instead of region1, and which phrases are wrong, missing, too generic, or misleading.\n"
-                "5. Regenerate a better detailed localized caption for region1.\n"
-                "6. Based on that detailed caption and the gtmask, write one shorter verification caption that is easier for mask reconstruction to follow while still preserving concrete visible distinguishing traits.\n"
-                f"{route_guidance}\n"
-                "Output requirements:\n"
-                "- Output exactly two lines in the following format:\n"
-                "DLC: <one natural and complete detailed localized caption>\n"
-                "VERIFICATION_CAPTION: <one shorter verifier-friendly caption>\n"
-                "- The DLC must be one natural and complete sentence describing region1.\n"
-                "- The DLC must focus on visible appearance, attributes, parts, markings, clothing, pose, and only the minimum local context needed to localize the target.\n"
-                "- The DLC must fix the specific mistakes that caused region2 to differ from region1.\n"
-                "- The VERIFICATION_CAPTION must be derived from the DLC and gtmask.\n"
-                "- The VERIFICATION_CAPTION must stay shorter than the DLC but must still preserve concrete visible distinguishing traits.\n"
-                "- The VERIFICATION_CAPTION must not collapse into a generic category-only phrase such as 'the man', 'the person', 'the object', or similar vague labels.\n"
-                "- The VERIFICATION_CAPTION should keep only the minimum visible local detail and spatial cue needed to identify the target reliably.\n"
-                "- Do not explain.\n"
-                "- Do not output any labels other than DLC: and VERIFICATION_CAPTION:.\n"
-                "- Do not mention region1 or region2.\n"
-                "- Do not describe anything that is not visible.\n"
-                "- Do not output [SEG], segmentation tags, or placeholder tokens.\n"
-                "- Do not copy the failed student caption if it still matches region2."
             )
         return prompt
 

@@ -336,3 +336,15 @@
   - Switched teacher regenerate analysis to run the staged pipeline, stop early on invalid intermediate outputs, and surface stage-specific failure reasons.
   - Added rolling metrics and cumulative log-only diagnostics for fault-report validity, repair-plan validity, DLC validity, verification gate pass rate, low-confidence diagnosis rate, and non-empty missing/distractor evidence rates.
   - Extended debug logs to print teacher diagnosis fields, rewrite fields, verification caption, and pipeline stop stage/failure reason.
+
+### Follow-up Cleanup
+- Removed teacher regenerate code paths that became unreachable after the four-stage migration:
+  - the old `teacher_summary_template` storage
+  - the unused `_mask_summary()` helper
+  - the obsolete `generation_mode="regenerate_caption"` prompt branch
+- Kept compatibility-facing counters and log names that are still read by training dashboards, even when their internal semantics now reflect the staged pipeline.
+
+### Follow-up Fix
+- The first four-stage training run crashed in rolling metric aggregation with `KeyError: 'teacher_regenerate_analysis_count'`.
+- Root cause: `_window_metric_counts()` was not updated to include the new teacher pipeline counter keys, so `window_totals` omitted them when old and new metric windows were aggregated together.
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py` to register all new teacher pipeline count metrics in `_window_metric_counts()` so rolling stats remain backward-compatible during live training.
