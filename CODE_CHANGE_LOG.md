@@ -227,3 +227,30 @@
     - `grpo_gt_prob_mean`
     - `grpo_confuser_penalty_mean`
   - Extended GRPO per-rollout debug logging to print dense reward components.
+
+## 2026-06-11 Caption/Segmentation Mode Drift Guardrails
+
+### Problem
+- Mid-training caption generation could drift into segmentation-answer templates such as `Sure, the segmentation result is [SEG].`, after which student captions became invalid and the main optimization routes stopped providing useful training signal.
+
+### Root Cause Notes
+- Caption generation and segmentation generation share the same model, special tokens, and region-prompt injection path, so the model can fall back to the strong `[SEG]` answer prior when caption-mode control weakens.
+- The previous status pipeline cleaned `[SEG]` out of raw text before classification, so seg-style failures were often misreported as `truncated_caption`.
+- On-policy distillation and GRPO only checked the cleaned status, which made early caption degradation hard to distinguish from normal short captions and obscured route-level blocking reasons.
+
+### Chosen Fix Direction
+- Detect seg-style failures on the raw caption output before cleanup.
+- Add caption-only decode guardrails that ban core segmentation tokens where the runtime generation interface allows it.
+- Block seg-style and truncated captions from on-policy / GRPO self-reinforcement, and give seg-style failures a dedicated teacher-recovery escape hatch without changing the normal teacher gate for other samples.
+
+### Rejected Direction
+- Do not change reconstruction prompts, GRPO reward formulas, or the normal teacher gate semantics for non-caption-mode-failure samples in this patch.
+- Do not rely on cleanup-only handling, because once `[SEG]` is stripped from the text the failure mode becomes ambiguous in logs and metrics.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py`:
+  - Added raw caption failure-mode detection and carried it through `DescriptionResult`.
+  - Passed caption-only `bad_words_ids` for `[SEG]` / segmentation phrases through the caption generation path, with existing generation-config fallback handling preserved for older remote-code runtimes.
+  - Blocked `seg_style_answer`, `truncated_caption`, `empty`, and `decode_error` captions from on-policy and GRPO entries via a unified trainability check.
+  - Allowed seg-style caption failures to use teacher regenerate as a recovery path when the teacher returns a valid caption, without applying the normal IoU gate to that specific failure class.
+  - Added rolling metrics and debug fields for raw seg-style rate, caption-mode failure rate, seg-style route blocking counts, and teacher recovery counts.

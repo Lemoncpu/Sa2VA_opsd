@@ -47,6 +47,8 @@ class DescriptionResult:
     clean_caption: str
     completion_ids: torch.Tensor
     status: str
+    raw_failure_mode: str = ""
+    clean_status: str = ""
 
 
 @dataclass
@@ -280,6 +282,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         self._cumulative_generic_caption_count = 0
         self._cumulative_repetitive_caption_count = 0
         self._metric_window = deque(maxlen=self.rolling_metric_window_iters)
+        self._caption_bad_words_ids = self._build_caption_bad_words_ids()
 
         self.teacher_summary_template = teacher_summary_template or (
             "You are optimizing the following task: given a gtmask, generate a caption that describes it. "
@@ -1263,6 +1266,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             "description_empty_count",
             "description_truncated_count",
             "description_seg_style_count",
+            "description_raw_seg_style_count",
             "reconstruct_ok_count",
             "reconstruct_failed_count",
             "reconstruct_skip_count",
@@ -1289,6 +1293,11 @@ class Sa2VAOPSDModelV2(BaseModel):
             "teacher_regenerate_rejected_count",
             "teacher_reconstruct_ok_count",
             "teacher_positive_gain_count",
+            "caption_mode_failure_count",
+            "onpolicy_blocked_by_seg_style_count",
+            "grpo_blocked_by_seg_style_count",
+            "teacher_recovery_seg_style_count",
+            "teacher_recovery_seg_style_success_count",
             "grpo_zero_reward_variance_count",
             "grpo_nonzero_reward_count",
             "grpo_missing_confuser_count",
@@ -1432,6 +1441,87 @@ class Sa2VAOPSDModelV2(BaseModel):
             add_special_tokens=False,
             return_tensors="pt",
         ).input_ids.to(self.device)
+
+    def _build_caption_bad_words_ids(self):
+        phrases = (
+            "[SEG]",
+            "segmentation",
+            "segmentation result",
+            "the segmentation result",
+        )
+        bad_words_ids = []
+        seen = set()
+        for phrase in phrases:
+            for candidate in (phrase, f" {phrase}"):
+                token_ids = self.tokenizer(candidate, add_special_tokens=False).input_ids
+                if not token_ids:
+                    continue
+                key = tuple(int(token_id) for token_id in token_ids)
+                if key in seen:
+                    continue
+                seen.add(key)
+                bad_words_ids.append(list(key))
+        return bad_words_ids
+
+    @staticmethod
+    def _infer_raw_caption_failure_mode(raw_prediction):
+        normalized = "" if raw_prediction is None else str(raw_prediction).strip()
+        if not normalized:
+            return ""
+        lowered = normalized.lower()
+        compact = re.sub(r"\s+", " ", lowered)
+        if "[seg]" in compact:
+            return "seg_style_answer"
+        if "segmentation result" in compact:
+            return "seg_style_answer"
+        if re.search(r"</?p>", compact) and "[seg]" in compact:
+            return "seg_style_answer"
+        short_seg_patterns = (
+            "sure, [seg].",
+            "sure, it is [seg].",
+            "it is [seg].",
+            "[seg].",
+        )
+        if compact.strip() in short_seg_patterns:
+            return "seg_style_answer"
+        return ""
+
+    @staticmethod
+    def _is_caption_mode_failure_status(status):
+        return status in {"seg_style_answer", "truncated_caption", "empty", "decode_error"}
+
+    def _is_caption_trainable_for_student_losses(self, description):
+        if description is None:
+            return False
+        if self._is_caption_mode_failure_status(description.status):
+            return False
+        if description.raw_failure_mode == "seg_style_answer":
+            return False
+        return True
+
+    def _finalize_description_result(self, *, raw_prediction, clean_caption, completion_ids):
+        raw_failure_mode = self._infer_raw_caption_failure_mode(raw_prediction)
+        clean_status = self._infer_description_status(clean_caption)
+        status = clean_status
+        if raw_failure_mode == "seg_style_answer":
+            status = "seg_style_answer"
+        elif status == "ok" and not self._is_caption_content_sufficient(clean_caption):
+            status = "truncated_caption"
+        clean_caption, completion_ids, was_truncated = self._truncate_caption_completion(
+            clean_caption,
+            completion_ids,
+            max_tokens=self.description_max_new_tokens,
+        )
+        if status != "seg_style_answer" and was_truncated:
+            status = "truncated_caption"
+        return DescriptionResult(
+            raw_prediction=raw_prediction,
+            clean_caption=clean_caption,
+            completion_ids=completion_ids,
+            status=status,
+            raw_failure_mode=raw_failure_mode,
+            clean_status=clean_status,
+        )
 
     def _truncate_caption_completion(self, caption, completion_ids, *, max_tokens):
         max_tokens = max(int(max_tokens), 1)
@@ -1737,6 +1827,9 @@ class Sa2VAOPSDModelV2(BaseModel):
         raw_prediction,
         caption,
         description_status,
+        raw_caption_failure_mode="",
+        clean_description_status="",
+        student_caption_trainable=None,
         reconstruct_question,
         raw_reconstruct_prediction,
         reconstruct_status,
@@ -1768,6 +1861,9 @@ class Sa2VAOPSDModelV2(BaseModel):
             f"student_caption={caption!r}\n"
             f"raw_prediction={raw_prediction!r}\n"
             f"description_status={description_status}\n"
+            f"raw_caption_failure_mode={raw_caption_failure_mode}\n"
+            f"clean_description_status={clean_description_status}\n"
+            f"student_caption_trainable={student_caption_trainable}\n"
             f"reconstruct_question={reconstruct_question!r}\n"
             f"raw_reconstruct_prediction={raw_reconstruct_prediction!r}\n"
             f"reconstruct_status={reconstruct_status}\n"
@@ -1803,6 +1899,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                     "top_p",
                     "repetition_penalty",
                     "no_repeat_ngram_size",
+                    "bad_words_ids",
                 )
                 if "processor" in signature.parameters and "processor" not in kwargs:
                     accepted_kwargs["processor"] = self.processor
@@ -2313,6 +2410,8 @@ class Sa2VAOPSDModelV2(BaseModel):
                 clean_caption="",
                 completion_ids=student_completion_ids,
                 status="empty",
+                raw_failure_mode="",
+                clean_status="empty",
             )
 
         teacher_model = self.require_teacher_model("Teacher trajectory prediction")
@@ -2328,14 +2427,10 @@ class Sa2VAOPSDModelV2(BaseModel):
         predicted_ids = teacher_logits.argmax(dim=-1)
         raw_prediction = self.tokenizer.decode(predicted_ids[0], skip_special_tokens=False).strip()
         clean_caption = self._clean_caption_text(raw_prediction)
-        status = self._infer_description_status(clean_caption)
-        if status == "ok" and not self._is_caption_content_sufficient(clean_caption):
-            status = "truncated_caption"
-        return DescriptionResult(
+        return self._finalize_description_result(
             raw_prediction=raw_prediction,
             clean_caption=clean_caption,
             completion_ids=predicted_ids,
-            status=status,
         )
 
     def generate_description_with_model(
@@ -2360,25 +2455,15 @@ class Sa2VAOPSDModelV2(BaseModel):
             do_sample=False,
             repetition_penalty=self.description_repetition_penalty,
             no_repeat_ngram_size=self.description_no_repeat_ngram_size,
+            bad_words_ids=self._caption_bad_words_ids,
         )
         raw_prediction = predict_dict.get("prediction", "")
         clean_caption = self._clean_caption_text(raw_prediction)
-        status = self._infer_description_status(clean_caption)
-        if status == "ok" and not self._is_caption_content_sufficient(clean_caption):
-            status = "truncated_caption"
         completion_ids = self._encode_completion_from_caption(clean_caption, model=model)
-        clean_caption, completion_ids, was_truncated = self._truncate_caption_completion(
-            clean_caption,
-            completion_ids,
-            max_tokens=self.description_max_new_tokens,
-        )
-        if was_truncated:
-            status = "truncated_caption"
-        return DescriptionResult(
+        return self._finalize_description_result(
             raw_prediction=raw_prediction,
             clean_caption=clean_caption,
             completion_ids=completion_ids,
-            status=status,
         )
 
     def generate_description(self, image, mask_prompts, student_question):
@@ -2932,9 +3017,12 @@ class Sa2VAOPSDModelV2(BaseModel):
             "teacher_gate_passed": None,
             "teacher_iou_plain": None,
             "teacher_completion_len": None,
+            "caption_mode_failure": False,
         }
         if not allow_teacher_ce:
             return result
+        caption_mode_failure = bool(description.raw_failure_mode == "seg_style_answer" or description.status == "seg_style_answer")
+        result["caption_mode_failure"] = caption_mode_failure
 
         teacher_fields = self._build_training_teacher_fields(
             route=TEACHER_REGENERATE_ROUTE,
@@ -2975,9 +3063,13 @@ class Sa2VAOPSDModelV2(BaseModel):
             and teacher_pred_mask is not None
         )
         teacher_gate_passed = (
-            self._teacher_regenerate_gate_passed(iou, teacher_iou_plain)
-            if teacher_reconstruct_ok
-            else False
+            bool(teacher_reconstruct_ok)
+            if caption_mode_failure
+            else (
+                self._teacher_regenerate_gate_passed(iou, teacher_iou_plain)
+                if teacher_reconstruct_ok
+                else False
+            )
         )
         result["teacher_reconstruct_ok"] = bool(teacher_reconstruct_ok)
         result["teacher_gate_passed"] = bool(teacher_gate_passed)
@@ -3767,6 +3859,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         description_empty_count = 0
         description_truncated_count = 0
         description_seg_style_count = 0
+        description_raw_seg_style_count = 0
         reconstruct_ok_count = 0
         reconstruct_failed_count = 0
         reconstruct_skip_count = 0
@@ -3804,6 +3897,11 @@ class Sa2VAOPSDModelV2(BaseModel):
         teacher_reconstruct_ok_count = 0
         teacher_positive_gain_count = 0
         teacher_iou_gain_sum = 0.0
+        caption_mode_failure_count = 0
+        onpolicy_blocked_by_seg_style_count = 0
+        grpo_blocked_by_seg_style_count = 0
+        teacher_recovery_seg_style_count = 0
+        teacher_recovery_seg_style_success_count = 0
         recovery_ce_applied_count = 0
         recovery_suppressed_count = 0
         reconstruct_invalid_caption_skip_count = 0
@@ -3855,6 +3953,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             nonempty_gt_count += 1
 
             description = self.generate_description(image=image, mask_prompts=prompt_masks, student_question=student_question)
+            student_caption_trainable = self._is_caption_trainable_for_student_losses(description)
             caption_token_count = self._caption_token_count(description.clean_caption)
             if caption_token_count > 0:
                 nonempty_caption_count += 1
@@ -3880,6 +3979,10 @@ class Sa2VAOPSDModelV2(BaseModel):
             elif description.status == "seg_style_answer":
                 description_seg_style_count += 1
                 invalid_caption_penalty_count += 1
+            if description.raw_failure_mode == "seg_style_answer":
+                description_raw_seg_style_count += 1
+            if self._is_caption_mode_failure_status(description.status):
+                caption_mode_failure_count += 1
 
             reconstruction = None
             if description.status == "ok":
@@ -3923,19 +4026,22 @@ class Sa2VAOPSDModelV2(BaseModel):
                 sample_key=sample_key,
                 route=f"{loss_family} (online={online_route})" if loss_family != online_route else loss_family,
                 student_question=student_question,
-                    raw_prediction=description.raw_prediction,
-                    caption=description.clean_caption,
-                    description_status=description.status,
-                    reconstruct_question=reconstruct_question,
-                    raw_reconstruct_prediction=raw_reconstruct_prediction,
-                    reconstruct_status=reconstruct_status,
-                    seg_token_count=seg_token_count,
-                    prediction_masks_count=prediction_masks_count,
-                    pred_mask=pred_mask,
-                    gt_mask=gt_mask_np,
-                    iou=iou,
-                    empty_gt_mask=False,
-                )
+                raw_prediction=description.raw_prediction,
+                caption=description.clean_caption,
+                description_status=description.status,
+                raw_caption_failure_mode=description.raw_failure_mode,
+                clean_description_status=description.clean_status,
+                student_caption_trainable=student_caption_trainable,
+                reconstruct_question=reconstruct_question,
+                raw_reconstruct_prediction=raw_reconstruct_prediction,
+                reconstruct_status=reconstruct_status,
+                seg_token_count=seg_token_count,
+                prediction_masks_count=prediction_masks_count,
+                pred_mask=pred_mask,
+                gt_mask=gt_mask_np,
+                iou=iou,
+                empty_gt_mask=False,
+            )
 
             is_recovery_case = description.status != "ok" or pred_mask is None
             if is_recovery_case:
@@ -3961,9 +4067,14 @@ class Sa2VAOPSDModelV2(BaseModel):
             teacher_iou_plain = teacher_analysis["teacher_iou_plain"]
             teacher_completion_len = teacher_analysis["teacher_completion_len"]
             teacher_regenerate = teacher_analysis["teacher_regenerate"]
+            caption_mode_failure = bool(teacher_analysis.get("caption_mode_failure", False))
+            if caption_mode_failure:
+                teacher_recovery_seg_style_count += 1
             teacher_iou_gain = self._teacher_regenerate_iou_improvement(iou, teacher_iou_plain)
             if teacher_reconstruct_ok:
                 teacher_reconstruct_ok_count += 1
+                if caption_mode_failure:
+                    teacher_recovery_seg_style_success_count += 1
             if teacher_iou_gain > 0.0:
                 teacher_positive_gain_count += 1
                 teacher_iou_gain_sum += float(teacher_iou_gain)
@@ -4000,6 +4111,9 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "teacher_gate_passed": teacher_gate_passed,
                 "teacher_iou_plain": teacher_iou_plain,
                 "teacher_completion_len": teacher_completion_len,
+                "raw_caption_failure_mode": description.raw_failure_mode,
+                "clean_description_status": description.clean_status,
+                "student_caption_trainable": bool(student_caption_trainable),
                 "is_dummy": False,
                 "dummy_reason": None,
                 "entry_added": False,
@@ -4059,8 +4173,10 @@ class Sa2VAOPSDModelV2(BaseModel):
                 onpolicy_completion = description.completion_ids
                 if onpolicy_completion.shape[1] == 0:
                     dummy_reason = "empty_completion"
-                elif description.status != "ok":
+                elif not student_caption_trainable:
                     dummy_reason = f"invalid_caption:{description.status}"
+                    if description.raw_failure_mode == "seg_style_answer" or description.status == "seg_style_answer":
+                        onpolicy_blocked_by_seg_style_count += 1
                 elif pred_mask is None:
                     dummy_reason = f"missing_pred_mask:{reconstruct_status}"
                 if dummy_reason is None:
@@ -4086,8 +4202,10 @@ class Sa2VAOPSDModelV2(BaseModel):
                 last_caption = description.clean_caption
             else:
                 grpo_positive_count += 1
-                if description.status != "ok":
+                if not student_caption_trainable:
                     dummy_reason = f"invalid_caption:{description.status}"
+                    if description.raw_failure_mode == "seg_style_answer" or description.status == "seg_style_answer":
+                        grpo_blocked_by_seg_style_count += 1
                 elif pred_mask is None:
                     dummy_reason = f"missing_pred_mask:{reconstruct_status}"
                 if dummy_reason is None:
@@ -4249,6 +4367,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             "description_empty_count": description_empty_count,
             "description_truncated_count": description_truncated_count,
             "description_seg_style_count": description_seg_style_count,
+            "description_raw_seg_style_count": description_raw_seg_style_count,
             "reconstruct_ok_count": reconstruct_ok_count,
             "reconstruct_failed_count": reconstruct_failed_count,
             "reconstruct_skip_count": reconstruct_skip_count,
@@ -4275,6 +4394,11 @@ class Sa2VAOPSDModelV2(BaseModel):
             "teacher_regenerate_rejected_count": teacher_regenerate_rejected_count,
             "teacher_reconstruct_ok_count": teacher_reconstruct_ok_count,
             "teacher_positive_gain_count": teacher_positive_gain_count,
+            "caption_mode_failure_count": caption_mode_failure_count,
+            "onpolicy_blocked_by_seg_style_count": onpolicy_blocked_by_seg_style_count,
+            "grpo_blocked_by_seg_style_count": grpo_blocked_by_seg_style_count,
+            "teacher_recovery_seg_style_count": teacher_recovery_seg_style_count,
+            "teacher_recovery_seg_style_success_count": teacher_recovery_seg_style_success_count,
             "grpo_zero_reward_variance_count": grpo_zero_reward_variance_count,
             "grpo_nonzero_reward_count": grpo_nonzero_reward_count,
             "grpo_missing_confuser_count": grpo_missing_confuser_count,
@@ -4333,6 +4457,8 @@ class Sa2VAOPSDModelV2(BaseModel):
         window_caption_empty_rate = window_totals["description_empty_count"] / window_nonempty_gt_count
         window_caption_truncated_rate = window_totals["description_truncated_count"] / window_nonempty_gt_count
         window_caption_seg_style_rate = window_totals["description_seg_style_count"] / window_nonempty_gt_count
+        window_caption_seg_style_rate_raw = window_totals["description_raw_seg_style_count"] / window_nonempty_gt_count
+        window_caption_mode_failure_rate = window_totals["caption_mode_failure_count"] / window_nonempty_gt_count
         window_reconstruct_invalid_caption_skip_rate = (
             window_totals["reconstruct_invalid_caption_skip_count"] / window_nonempty_gt_count
         )
@@ -4474,6 +4600,8 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "caption_empty_rate": self._metric_tensor(window_caption_empty_rate, zero.dtype),
                 "caption_truncated_rate": self._metric_tensor(window_caption_truncated_rate, zero.dtype),
                 "caption_seg_style_rate": self._metric_tensor(window_caption_seg_style_rate, zero.dtype),
+                "caption_seg_style_rate_raw": self._metric_tensor(window_caption_seg_style_rate_raw, zero.dtype),
+                "caption_mode_failure_rate": self._metric_tensor(window_caption_mode_failure_rate, zero.dtype),
                 "reconstruct_invalid_caption_skip_rate": self._metric_tensor(
                     window_reconstruct_invalid_caption_skip_rate, zero.dtype
                 ),
@@ -4491,6 +4619,18 @@ class Sa2VAOPSDModelV2(BaseModel):
                 ),
                 "teacher_regenerate_verified_iou_mean": self._metric_tensor(
                     window_teacher_regenerate_verified_iou_mean, zero.dtype
+                ),
+                "onpolicy_blocked_by_seg_style_count": self._metric_tensor(
+                    window_totals["onpolicy_blocked_by_seg_style_count"], zero.dtype
+                ),
+                "grpo_blocked_by_seg_style_count": self._metric_tensor(
+                    window_totals["grpo_blocked_by_seg_style_count"], zero.dtype
+                ),
+                "teacher_recovery_seg_style_count": self._metric_tensor(
+                    window_totals["teacher_recovery_seg_style_count"], zero.dtype
+                ),
+                "teacher_recovery_seg_style_success_count": self._metric_tensor(
+                    window_totals["teacher_recovery_seg_style_success_count"], zero.dtype
                 ),
                 "teacher_positive_gain_rate": self._metric_tensor(window_teacher_positive_gain_rate, zero.dtype),
                 "teacher_iou_gain_mean": self._metric_tensor(window_teacher_iou_gain_mean, zero.dtype),
@@ -4539,6 +4679,12 @@ class Sa2VAOPSDModelV2(BaseModel):
                     f"teacher_regenerate_ce_applied={teacher_regenerate_ce_applied_count} "
                     f"teacher_regenerate_suppressed={teacher_regenerate_suppressed_count} "
                     f"window_avg_caption_tokens={window_avg_caption_tokens:.2f} "
+                    f"window_caption_seg_style_rate_raw={window_caption_seg_style_rate_raw:.4f} "
+                    f"window_caption_mode_failure_rate={window_caption_mode_failure_rate:.4f} "
+                    f"window_onpolicy_blocked_by_seg_style_count={window_totals['onpolicy_blocked_by_seg_style_count']} "
+                    f"window_grpo_blocked_by_seg_style_count={window_totals['grpo_blocked_by_seg_style_count']} "
+                    f"window_teacher_recovery_seg_style_count={window_totals['teacher_recovery_seg_style_count']} "
+                    f"window_teacher_recovery_seg_style_success_count={window_totals['teacher_recovery_seg_style_success_count']} "
                     f"window_teacher_positive_gain_rate={window_teacher_positive_gain_rate:.4f} "
                     f"window_teacher_iou_gain_mean={window_teacher_iou_gain_mean:.4f} "
                     f"window_grpo_zero_reward_variance_rate={window_grpo_zero_reward_variance_rate:.4f} "
@@ -4568,6 +4714,12 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"teacher_regenerate_ce_applied={teacher_regenerate_ce_applied_count} "
                 f"teacher_regenerate_suppressed={teacher_regenerate_suppressed_count} "
                 f"window_avg_caption_tokens={window_avg_caption_tokens:.2f} "
+                f"window_caption_seg_style_rate_raw={window_caption_seg_style_rate_raw:.4f} "
+                f"window_caption_mode_failure_rate={window_caption_mode_failure_rate:.4f} "
+                f"window_onpolicy_blocked_by_seg_style_count={window_totals['onpolicy_blocked_by_seg_style_count']} "
+                f"window_grpo_blocked_by_seg_style_count={window_totals['grpo_blocked_by_seg_style_count']} "
+                f"window_teacher_recovery_seg_style_count={window_totals['teacher_recovery_seg_style_count']} "
+                f"window_teacher_recovery_seg_style_success_count={window_totals['teacher_recovery_seg_style_success_count']} "
                 f"window_teacher_positive_gain_rate={window_teacher_positive_gain_rate:.4f} "
                 f"window_teacher_iou_gain_mean={window_teacher_iou_gain_mean:.4f} "
                 f"window_grpo_zero_reward_variance_rate={window_grpo_zero_reward_variance_rate:.4f} "
@@ -4625,6 +4777,8 @@ class Sa2VAOPSDModelV2(BaseModel):
             "caption_empty_rate": self._metric_tensor(window_caption_empty_rate, avg_total_loss.dtype),
             "caption_truncated_rate": self._metric_tensor(window_caption_truncated_rate, avg_total_loss.dtype),
             "caption_seg_style_rate": self._metric_tensor(window_caption_seg_style_rate, avg_total_loss.dtype),
+            "caption_seg_style_rate_raw": self._metric_tensor(window_caption_seg_style_rate_raw, avg_total_loss.dtype),
+            "caption_mode_failure_rate": self._metric_tensor(window_caption_mode_failure_rate, avg_total_loss.dtype),
             "reconstruct_invalid_caption_skip_rate": self._metric_tensor(
                 window_reconstruct_invalid_caption_skip_rate, avg_total_loss.dtype
             ),
@@ -4640,6 +4794,18 @@ class Sa2VAOPSDModelV2(BaseModel):
             "teacher_regenerate_gate_pass_rate": self._metric_tensor(window_teacher_regenerate_gate_pass_rate, avg_total_loss.dtype),
             "teacher_regenerate_verified_iou_mean": self._metric_tensor(
                 window_teacher_regenerate_verified_iou_mean, avg_total_loss.dtype
+            ),
+            "onpolicy_blocked_by_seg_style_count": self._metric_tensor(
+                window_totals["onpolicy_blocked_by_seg_style_count"], avg_total_loss.dtype
+            ),
+            "grpo_blocked_by_seg_style_count": self._metric_tensor(
+                window_totals["grpo_blocked_by_seg_style_count"], avg_total_loss.dtype
+            ),
+            "teacher_recovery_seg_style_count": self._metric_tensor(
+                window_totals["teacher_recovery_seg_style_count"], avg_total_loss.dtype
+            ),
+            "teacher_recovery_seg_style_success_count": self._metric_tensor(
+                window_totals["teacher_recovery_seg_style_success_count"], avg_total_loss.dtype
             ),
             "teacher_positive_gain_rate": self._metric_tensor(window_teacher_positive_gain_rate, avg_total_loss.dtype),
             "teacher_iou_gain_mean": self._metric_tensor(window_teacher_iou_gain_mean, avg_total_loss.dtype),
