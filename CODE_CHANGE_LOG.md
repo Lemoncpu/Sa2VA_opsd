@@ -145,3 +145,31 @@
 - The remaining `float32` upcast came from applying `prepare_model_for_kbit_training()` on a non-quantized `Sa2VA-4B` language model before LoRA wrapping.
 - That helper is intended for k-bit preparation and can upcast embeddings or normalization-related states to `float32`, which then conflicts with FlashAttention in the Qwen2 generation path.
 - Updated `projects/sa2va/models/sa2va_opsd_v2.py` to skip `prepare_model_for_kbit_training()` entirely for the current LoRA path and wrap the already-loaded bf16/fp16 language model directly with PEFT.
+
+## 2026-06-11 OPSD Rolling Metrics And Training Diagnostics
+
+### Problem
+- Training logs and plots reported global cumulative metrics, which hid short-horizon regressions and made route quality harder to diagnose.
+- Runtime logs showed anomalous `completion_len=2048` and `avg_caption_tokens≈414`, while teacher regenerate acceptance and GRPO reward signals stayed unexpectedly sparse.
+
+### Root Cause Notes
+- `projects/sa2va/models/sa2va_opsd_v2.py` emitted most training metrics from lifetime accumulators instead of a recent-iteration window, so later bad behavior was diluted by early good samples.
+- Older remote-code `predict_forward()` snapshots can silently ignore caller-side generation kwargs; when that happens, caption generation can fall back to the model default `max_new_tokens=2048`.
+- OPSD also re-tokenized cleaned captions without a local post-check, so a runaway raw generation could still become an oversized training completion.
+- The existing logs exposed only coarse GRPO and teacher outcomes, not the key rates needed to separate gate strictness from confuser/reward sparsity.
+
+### Chosen Fix Direction
+- Keep existing cumulative counters for compatibility, but switch the surfaced training metrics to a rolling window over the last 10 optimization updates.
+- Enforce generation limits even when remote `predict_forward()` does not accept decoding kwargs, and add a local completion truncation guard before captions enter training losses.
+- Add rolling diagnostics for teacher positive-IoU gain and GRPO zero-variance / nonzero-reward / missing-confuser rates.
+
+### Rejected Direction
+- Do not remove the cumulative counters entirely. They are still useful for offline analysis and changing every internal counter would add unnecessary migration risk.
+- Do not immediately relax teacher gates or redesign GRPO reward in the same patch; first improve observability and stop the runaway generation path.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py`:
+  - Added a configurable `rolling_metric_window_iters` window and switched surfaced training metrics to use the recent window instead of lifetime averages.
+  - Added fallback generation-config overrides inside `_predict_forward_eval()` so old remote-code models still honor OPSD decoding limits.
+  - Added a local caption completion truncation guard based on `description_max_new_tokens`.
+  - Added rolling diagnostics for `teacher_positive_gain_rate`, `teacher_iou_gain_mean`, `grpo_zero_reward_variance_rate`, `grpo_nonzero_reward_rate`, and `grpo_missing_confuser_rate`.
