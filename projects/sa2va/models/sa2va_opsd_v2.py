@@ -88,11 +88,6 @@ class TeacherRegeneratePipelineResult:
     shared_evidence: str = ""
     target_only_evidence: str = ""
     distractor_only_evidence: str = ""
-    primary_target_cue: str = ""
-    primary_distractor_cue: str = ""
-    secondary_target_cue: str = ""
-    secondary_distractor_cue: str = ""
-    cue_conflict_summary: str = ""
     target_localization_hint: str = ""
     distractor_localization_hint: str = ""
     likely_drift_reason: str = ""
@@ -327,9 +322,6 @@ class Sa2VAOPSDModelV2(BaseModel):
         self._cumulative_teacher_problem_valid_count = 0
         self._cumulative_teacher_direction_valid_count = 0
         self._cumulative_teacher_reason_valid_count = 0
-        self._cumulative_teacher_problem_primary_target_hit_count = 0
-        self._cumulative_teacher_reason_primary_target_hit_count = 0
-        self._cumulative_teacher_reason_primary_distractor_hit_count = 0
         self._cumulative_teacher_reason_coarse_count = 0
         self._cumulative_teacher_diagnosis_valid_count = 0
         self._cumulative_teacher_dlc_valid_count = 0
@@ -1348,9 +1340,6 @@ class Sa2VAOPSDModelV2(BaseModel):
             "teacher_problem_valid_count",
             "teacher_direction_valid_count",
             "teacher_reason_valid_count",
-            "teacher_problem_primary_target_hit_count",
-            "teacher_reason_primary_target_hit_count",
-            "teacher_reason_primary_distractor_hit_count",
             "teacher_reason_coarse_count",
             "teacher_regenerate_verification_valid_count",
             "teacher_diagnosis_valid_count",
@@ -1652,11 +1641,19 @@ class Sa2VAOPSDModelV2(BaseModel):
             "small patch",
             "local offset",
             "size contrast",
-            "target-only cue",
-            "distractor-only cue",
             "target-specific",
             "distractor",
             "target-only",
+            "distractor-only",
+            "shared evidence",
+            "shared overlap",
+            "overlap",
+            "boundary",
+            "edge",
+            "centered",
+            "shifted",
+            "size",
+            "shape",
         )
         return any(pattern in normalized for pattern in anchor_patterns)
 
@@ -1689,10 +1686,15 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "higher toward",
                 "lower toward",
                 "competing region",
-                "primary target cue",
-                "primary distractor cue",
                 "still matches",
                 "still fits",
+                "boundary",
+                "edge",
+                "centered",
+                "shifted",
+                "size",
+                "shape",
+                "overlap",
             )
         )
         return coarse_hits and not fine_hits
@@ -1736,16 +1738,43 @@ class Sa2VAOPSDModelV2(BaseModel):
             return False, "problem_invalid:missing_caption_problem"
         if len(result.caption_problem.split()) < 6:
             return False, "problem_invalid:too_short"
+        normalized_problem = result.caption_problem.lower()
         if not any(
-            token in result.caption_problem.lower()
-            for token in ("too generic", "underspecified", "does not specify", "fails to distinguish", "missing")
+            token in normalized_problem
+            for token in (
+                "too generic",
+                "underspecified",
+                "does not specify",
+                "fails to distinguish",
+                "missing",
+                "does not separate",
+                "does not isolate",
+                "does not accurately describe",
+                "fails to capture",
+                "under-describes",
+            )
         ):
             return False, "problem_invalid:generic_problem"
-        target_hints = self._build_difference_field_phrase_hints(result.primary_target_cue)
-        if not target_hints:
-            target_hints = self._build_difference_field_phrase_hints(result.secondary_target_cue)
-        if target_hints and not any(hint.lower() in result.caption_problem.lower() for hint in target_hints):
-            return False, "problem_invalid:missing_primary_target_cue"
+        semantic_anchor_ok = (
+            self._difference_text_has_semantic_anchor(result.caption_problem)
+            or any(
+                token in normalized_problem
+                for token in (
+                    "size",
+                    "shape",
+                    "boundary",
+                    "edge",
+                    "centered",
+                    "shifted",
+                    "overlap",
+                    "shared",
+                    "target-only",
+                    "distractor",
+                )
+            )
+        )
+        if not semantic_anchor_ok:
+            return False, "problem_invalid:lacks_fine_grained_anchor"
         return True, ""
 
     def validate_teacher_correction_direction(self, result):
@@ -1753,14 +1782,33 @@ class Sa2VAOPSDModelV2(BaseModel):
             return False, "direction_invalid:missing_direction"
         if len(result.correction_direction.split()) < 6:
             return False, "direction_invalid:truncated_or_generic"
-        target_hints = self._build_difference_field_phrase_hints(result.primary_target_cue)
-        if target_hints and not any(hint.lower() in result.correction_direction.lower() for hint in target_hints):
-            return False, "direction_invalid:missing_target_cue"
-        if self._teacher_field_is_effective(result.primary_distractor_cue) and not any(
-            token in result.correction_direction.lower()
-            for token in ("suppress", "avoid", "separate", "stop matching")
+        normalized_direction = result.correction_direction.lower()
+        if not any(
+            token in normalized_direction
+            for token in (
+                "strengthen",
+                "add",
+                "highlight",
+                "specify",
+                "make explicit",
+                "focus on",
+                "narrow to",
+            )
+        ):
+            return False, "direction_invalid:missing_target_strengthening"
+        if self._teacher_field_is_effective(result.distractor_only_evidence) and not any(
+            token in normalized_direction
+            for token in ("suppress", "avoid", "separate", "stop matching", "downplay", "remove")
         ):
             return False, "direction_invalid:missing_distractor_suppression"
+        semantic_anchor_ok = (
+            self._difference_text_has_semantic_anchor(result.correction_direction)
+            or "target-only" in normalized_direction
+            or "distractor" in normalized_direction
+            or "shared" in normalized_direction
+        )
+        if not semantic_anchor_ok:
+            return False, "direction_invalid:lacks_difference_anchor"
         return True, ""
 
     def validate_teacher_reason_explanation(self, result):
@@ -1770,17 +1818,22 @@ class Sa2VAOPSDModelV2(BaseModel):
             return False, "reason_invalid:too_short"
         if self._teacher_reason_is_coarse(result.reason):
             return False, "reason_invalid:too_coarse"
-        target_hints = self._build_difference_field_phrase_hints(result.primary_target_cue)
-        distractor_hints = self._build_difference_field_phrase_hints(result.primary_distractor_cue)
-        if target_hints and not any(hint.lower() in result.reason.lower() for hint in target_hints):
-            return False, "reason_invalid:missing_primary_cue_pair"
-        if distractor_hints and not any(hint.lower() in result.reason.lower() for hint in distractor_hints):
-            return False, "reason_invalid:missing_primary_cue_pair"
+        normalized_reason = result.reason.lower()
         if not any(
-            token in result.reason.lower()
+            token in normalized_reason
             for token in ("misses", "still fits", "still matches", "pulls reconstruction", "drifts toward")
         ):
             return False, "reason_invalid:missing_failure_mechanism"
+        if self._teacher_field_is_effective(result.target_only_evidence) and not any(
+            token in normalized_reason
+            for token in ("target-only", "shared", "overlap", "missing", "under-describes")
+        ) and not self._difference_text_has_semantic_anchor(result.reason):
+            return False, "reason_invalid:missing_target_difference_anchor"
+        if self._teacher_field_is_effective(result.distractor_only_evidence) and not any(
+            token in normalized_reason
+            for token in ("distractor", "extra region", "still fits", "still matches", "drifts toward")
+        ):
+            return False, "reason_invalid:missing_distractor_difference_anchor"
         return True, ""
 
     def _parse_teacher_light_diagnosis(self, raw_prediction, base_result=None):
@@ -1799,44 +1852,25 @@ class Sa2VAOPSDModelV2(BaseModel):
                 result.reason = self._normalize_teacher_field_text(split_match.group(2))
         if (
             not result.reason
-            and self._teacher_field_is_effective(result.cue_conflict_summary, invalid_markers=("",))
-        ):
-            result.reason = self._normalize_teacher_field_text(result.cue_conflict_summary)
-        if (
-            not result.reason
             and self._teacher_field_is_effective(result.likely_drift_reason, invalid_markers=("",))
         ):
             result.reason = self._normalize_teacher_field_text(result.likely_drift_reason)
-        if (
-            result.caption_problem
-            and any(
-                token in result.caption_problem.lower()
-                for token in ("too generic", "lacks specific details", "lacks details", "does not specify")
-            )
-            and self._teacher_field_is_effective(result.primary_target_cue)
-            and self._normalize_teacher_field_text(result.primary_target_cue).lower()
-            not in result.caption_problem.lower()
-        ):
-            result.caption_problem = (
-                f"{result.caption_problem.rstrip('.')} The missing target cue is {result.primary_target_cue}."
-            )
         if not self._teacher_field_is_effective(result.correction_direction, invalid_markers=("",)):
             if (
-                self._teacher_field_is_effective(result.primary_target_cue)
-                and self._teacher_field_is_effective(result.primary_distractor_cue)
+                self._teacher_field_is_effective(result.target_only_evidence)
+                and self._teacher_field_is_effective(result.distractor_only_evidence)
             ):
                 result.correction_direction = (
-                    "Strengthen the target-only cue and suppress the distractor-only cue by "
-                    f"separating {result.primary_target_cue} from {result.primary_distractor_cue}."
+                    "Strengthen the target-only evidence and suppress the distractor-only evidence "
+                    "so the caption separates the gtmask from the reconstructed distractor."
                 )
-            elif self._teacher_field_is_effective(result.primary_target_cue):
+            elif self._teacher_field_is_effective(result.target_only_evidence):
                 result.correction_direction = (
-                    f"Strengthen the target-only cue by making {result.primary_target_cue} explicit."
+                    "Strengthen the target-only evidence by making the missing target detail explicit."
                 )
-            elif self._teacher_field_is_effective(result.primary_distractor_cue):
+            elif self._teacher_field_is_effective(result.distractor_only_evidence):
                 result.correction_direction = (
-                    "Suppress the distractor-only cue by avoiding language that still fits "
-                    f"{result.primary_distractor_cue}."
+                    "Suppress the distractor-only evidence by avoiding wording that still fits the distractor region."
                 )
         result.reason_is_coarse = self._teacher_reason_is_coarse(result.reason)
         return result
@@ -1852,52 +1886,26 @@ class Sa2VAOPSDModelV2(BaseModel):
             return False, "diagnosis_invalid:missing_reason"
         if self._teacher_reason_is_coarse(result.reason):
             return False, "diagnosis_invalid:reason_too_coarse"
-        key_evidence = []
-        if self._teacher_field_is_effective(result.target_only_evidence):
-            key_evidence.extend(self._build_difference_field_phrase_hints(result.target_only_evidence))
-        if self._teacher_field_is_effective(result.distractor_only_evidence):
-            key_evidence.extend(self._build_difference_field_phrase_hints(result.distractor_only_evidence))
-        primary_target_hints = self._build_difference_field_phrase_hints(result.primary_target_cue)
-        primary_distractor_hints = self._build_difference_field_phrase_hints(result.primary_distractor_cue)
-        primary_target_hit = bool(
-            primary_target_hints
-            and any(hint.lower() in result.reason.lower() for hint in primary_target_hints)
+        semantic_anchor_ok = (
+            self._difference_text_has_semantic_anchor(result.caption_problem)
+            or self._difference_text_has_semantic_anchor(result.reason)
+            or self._difference_text_has_semantic_anchor(result.correction_direction)
         )
-        primary_distractor_required = self._teacher_field_is_effective(result.primary_distractor_cue)
-        primary_distractor_hit = bool(
-            primary_distractor_hints
-            and any(hint.lower() in result.reason.lower() for hint in primary_distractor_hints)
+        phrase_level_problem_ok = any(
+            token in result.caption_problem.lower()
+            for token in (
+                "too generic",
+                "underspecified",
+                "wrong anchor",
+                "pulled toward",
+                "missing target",
+                "target-only",
+                "distractor-only",
+                "shared overlap",
+            )
         )
-        if primary_target_hints and not primary_target_hit:
-            return False, "diagnosis_invalid:missing_primary_cue_pair"
-        if primary_distractor_required and not primary_distractor_hit:
-            return False, "diagnosis_invalid:missing_primary_cue_pair"
-        if key_evidence:
-            matched_hint = any(
-                hint.lower() in result.reason.lower()
-                or hint.lower() in result.correction_direction.lower()
-                or hint.lower() in result.caption_problem.lower()
-                for hint in key_evidence
-            )
-            semantic_anchor_ok = (
-                self._difference_text_has_semantic_anchor(result.caption_problem)
-                or self._difference_text_has_semantic_anchor(result.reason)
-                or self._difference_text_has_semantic_anchor(result.correction_direction)
-            )
-            phrase_level_problem_ok = any(
-                token in result.caption_problem.lower()
-                for token in (
-                    "target-only cue",
-                    "distractor cue",
-                    "too generic",
-                    "underspecified",
-                    "wrong anchor",
-                    "pulled toward",
-                    "missing target",
-                )
-            )
-            if not matched_hint and not semantic_anchor_ok and not phrase_level_problem_ok:
-                return False, "diagnosis_invalid:missing_difference_evidence"
+        if not semantic_anchor_ok and not phrase_level_problem_ok:
+            return False, "diagnosis_invalid:missing_difference_evidence"
         if len(result.caption_problem.split()) < 6:
             return False, "diagnosis_invalid:caption_problem_too_short"
         if len(result.reason.split()) < 6:
@@ -1921,16 +1929,14 @@ class Sa2VAOPSDModelV2(BaseModel):
                 token in result.caption_problem.lower()
                 for token in ("too generic", "lacks specific details", "lacks details", "does not specify")
             )
-            and self._teacher_field_is_effective(result.primary_target_cue)
-            and self._normalize_teacher_field_text(result.primary_target_cue).lower()
-            not in result.caption_problem.lower()
+            and not self._difference_text_has_semantic_anchor(result.caption_problem)
         ):
             return False, "diagnosis_invalid:generic_caption_problem"
         if any(
             result.reason.lower().strip() == generic
             for generic in (
-                "the target-only cue matters because",
-                "the distractor-only cue matters because",
+                "the target-only evidence matters because",
+                "the distractor-only evidence matters because",
             )
         ):
             return False, "diagnosis_invalid:generic_reason"
@@ -2132,17 +2138,29 @@ class Sa2VAOPSDModelV2(BaseModel):
     def _validate_teacher_dlc(self, result):
         if not self._teacher_field_is_effective(result.detailed_caption, invalid_markers=("",)):
             return "teacher_dlc_invalid:empty"
+        detailed_caption_lower = result.detailed_caption.lower()
         if (
             self._teacher_text_overlap_ratio(result.detailed_caption, result.distractor_summary) >= 0.75
             and self._teacher_field_is_effective(result.target_only_evidence)
-            and not any(
-                hint.lower() in result.detailed_caption.lower()
-                for hint in self._build_difference_field_phrase_hints(result.target_only_evidence)
-            )
+            and not self._difference_text_has_semantic_anchor(result.detailed_caption)
         ):
             return "teacher_dlc_invalid:distractor_overlap"
-        target_hints = self._build_difference_field_phrase_hints(result.target_only_evidence)
-        if target_hints and not any(hint.lower() in result.detailed_caption.lower() for hint in target_hints):
+        if self._teacher_field_is_effective(result.target_only_evidence) and not (
+            self._difference_text_has_semantic_anchor(result.detailed_caption)
+            or any(
+                token in detailed_caption_lower
+                for token in (
+                    "target-only",
+                    "shared overlap",
+                    "boundary",
+                    "edge",
+                    "centered",
+                    "shifted",
+                    "size",
+                    "shape",
+                )
+            )
+        ):
             return "teacher_dlc_invalid:missing_target_only_evidence"
         return ""
 
@@ -2155,8 +2173,22 @@ class Sa2VAOPSDModelV2(BaseModel):
             return "verification_invalid:not_shorter_than_dlc"
         if self._is_overly_generic_caption(result.verification_caption):
             return "verification_invalid:too_generic"
-        target_hints = self._build_difference_field_phrase_hints(result.target_only_evidence)
-        if target_hints and not any(hint.lower() in result.verification_caption.lower() for hint in target_hints):
+        verification_caption_lower = result.verification_caption.lower()
+        if self._teacher_field_is_effective(result.target_only_evidence) and not (
+            self._difference_text_has_semantic_anchor(result.verification_caption)
+            or any(
+                token in verification_caption_lower
+                for token in (
+                    "target-only",
+                    "boundary",
+                    "edge",
+                    "centered",
+                    "shifted",
+                    "size",
+                    "shape",
+                )
+            )
+        ):
             return "verification_invalid:lost_target_only_evidence"
         if self._teacher_text_overlap_ratio(result.verification_caption, result.distractor_summary) >= 0.75:
             return "verification_invalid:distractor_overlap"
@@ -2438,13 +2470,9 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "teacher_dlc={teacher_dlc} "
                 "target_summary={target_summary} "
                 "distractor_summary={distractor_summary} "
+                "shared_evidence={shared_evidence} "
                 "target_only_evidence={target_only_evidence} "
                 "distractor_only_evidence={distractor_only_evidence} "
-                "primary_target_cue={primary_target_cue} "
-                "primary_distractor_cue={primary_distractor_cue} "
-                "secondary_target_cue={secondary_target_cue} "
-                "secondary_distractor_cue={secondary_distractor_cue} "
-                "cue_conflict_summary={cue_conflict_summary} "
                 "likely_drift_reason={likely_drift_reason} "
                 "caption_problem={caption_problem} "
                 "correction_direction={correction_direction} "
@@ -2473,13 +2501,9 @@ class Sa2VAOPSDModelV2(BaseModel):
                     teacher_dlc=repr(record.get("teacher_dlc", "")),
                     target_summary=repr(record.get("target_summary", "")),
                     distractor_summary=repr(record.get("distractor_summary", "")),
+                    shared_evidence=repr(record.get("shared_evidence", "")),
                     target_only_evidence=repr(record.get("target_only_evidence", "")),
                     distractor_only_evidence=repr(record.get("distractor_only_evidence", "")),
-                    primary_target_cue=repr(record.get("primary_target_cue", "")),
-                    primary_distractor_cue=repr(record.get("primary_distractor_cue", "")),
-                    secondary_target_cue=repr(record.get("secondary_target_cue", "")),
-                    secondary_distractor_cue=repr(record.get("secondary_distractor_cue", "")),
-                    cue_conflict_summary=repr(record.get("cue_conflict_summary", "")),
                     likely_drift_reason=repr(record.get("likely_drift_reason", "")),
                     caption_problem=repr(record.get("caption_problem", "")),
                     correction_direction=repr(record.get("correction_direction", "")),
@@ -3361,16 +3385,14 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"Shared evidence: {teacher_fields.get('shared_evidence', '')}\n"
                 f"Target-only evidence: {teacher_fields.get('target_only_evidence', '')}\n"
                 f"Distractor-only evidence: {teacher_fields.get('distractor_only_evidence', '')}\n"
-                f"Primary target cue: {teacher_fields.get('primary_target_cue', '')}\n"
-                f"Primary distractor cue: {teacher_fields.get('primary_distractor_cue', '')}\n"
-                f"Secondary target cue: {teacher_fields.get('secondary_target_cue', '')}\n"
-                f"Secondary distractor cue: {teacher_fields.get('secondary_distractor_cue', '')}\n"
-                f"Cue conflict summary: {teacher_fields.get('cue_conflict_summary', '')}\n"
+                f"Target localization hint: {teacher_fields.get('target_localization_hint', '')}\n"
+                f"Distractor localization hint: {teacher_fields.get('distractor_localization_hint', '')}\n"
                 "Identify only the concrete caption problem. Do not generate a fix or a reason.\n"
                 "Output exactly one natural-language sentence and nothing else.\n"
                 "Rules:\n"
-                "- The sentence must say which target-specific feature, local cue, or target-vs-distractor distinction the failed caption does not express.\n"
-                "- The sentence must prioritize Primary target cue and may also use Secondary target cue.\n"
+                "- The sentence must say which target-specific feature, overlap-vs-only difference, or local distinction the failed caption does not express.\n"
+                "- Use the target summary, distractor summary, and shared evidence to ground the statement in visible content.\n"
+                "- Use target-only evidence and distractor-only evidence to point to the specific missing distinction.\n"
                 "- The sentence must not give a fix and must not explain why.\n"
                 "- The sentence must not stop at broad area, left, right, top, or bottom alone.\n"
                 "- Do not output bullets, markdown, extra labels, analysis preambles, or [SEG]."
@@ -3382,17 +3404,17 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"CAPTION_PROBLEM: {teacher_fields.get('caption_problem', '')}\n"
                 f"Target summary: {teacher_fields.get('target_summary', '')}\n"
                 f"Distractor summary: {teacher_fields.get('distractor_summary', '')}\n"
+                f"Shared evidence: {teacher_fields.get('shared_evidence', '')}\n"
                 f"Target-only evidence: {teacher_fields.get('target_only_evidence', '')}\n"
                 f"Distractor-only evidence: {teacher_fields.get('distractor_only_evidence', '')}\n"
-                f"Primary target cue: {teacher_fields.get('primary_target_cue', '')}\n"
-                f"Primary distractor cue: {teacher_fields.get('primary_distractor_cue', '')}\n"
-                f"Cue conflict summary: {teacher_fields.get('cue_conflict_summary', '')}\n"
+                f"Target localization hint: {teacher_fields.get('target_localization_hint', '')}\n"
+                f"Distractor localization hint: {teacher_fields.get('distractor_localization_hint', '')}\n"
                 "Generate only the correction direction. Do not restate the problem and do not explain why.\n"
                 "Output exactly one natural-language sentence and nothing else.\n"
                 "Rules:\n"
-                "- The sentence must say what target cue should be strengthened.\n"
-                "- If a distractor cue exists, the sentence must also say what distractor-compatible wording should be avoided, suppressed, or separated.\n"
-                "- The sentence must not stop at Strengthen target-only evidence.\n"
+                "- The sentence must say what target-side detail should be strengthened using the target summary and target-only evidence.\n"
+                "- If distractor-only evidence exists, the sentence must also say what distractor-compatible wording should be avoided, suppressed, or separated.\n"
+                "- The sentence must not stop at a generic instruction like strengthen target-only evidence.\n"
                 "- Do not output bullets, markdown, extra labels, analysis preambles, or [SEG]."
             )
         elif generation_mode == "teacher_reason_explanation":
@@ -3401,20 +3423,20 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"Failed student caption: {student_caption}\n"
                 f"CAPTION_PROBLEM: {teacher_fields.get('caption_problem', '')}\n"
                 f"CORRECTION_DIRECTION: {teacher_fields.get('correction_direction', '')}\n"
+                f"Target summary: {teacher_fields.get('target_summary', '')}\n"
+                f"Distractor summary: {teacher_fields.get('distractor_summary', '')}\n"
+                f"Shared evidence: {teacher_fields.get('shared_evidence', '')}\n"
                 f"Target-only evidence: {teacher_fields.get('target_only_evidence', '')}\n"
                 f"Distractor-only evidence: {teacher_fields.get('distractor_only_evidence', '')}\n"
-                f"Primary target cue: {teacher_fields.get('primary_target_cue', '')}\n"
-                f"Primary distractor cue: {teacher_fields.get('primary_distractor_cue', '')}\n"
-                f"Secondary target cue: {teacher_fields.get('secondary_target_cue', '')}\n"
-                f"Secondary distractor cue: {teacher_fields.get('secondary_distractor_cue', '')}\n"
-                f"Cue conflict summary: {teacher_fields.get('cue_conflict_summary', '')}\n"
+                f"Target localization hint: {teacher_fields.get('target_localization_hint', '')}\n"
+                f"Distractor localization hint: {teacher_fields.get('distractor_localization_hint', '')}\n"
                 f"Likely drift reason: {teacher_fields.get('likely_drift_reason', '')}\n"
                 "Explain only why the failed caption drifts and why the correction direction is needed.\n"
                 "Output exactly one natural-language sentence and nothing else.\n"
                 "Rules:\n"
-                "- The sentence must explain why the failed caption misses the Primary target cue.\n"
-                "- The sentence must explain why the failed caption still fits the Primary distractor cue when it exists.\n"
-                "- The sentence must use finer-grained cues and must not stop at broad area, left, right, top, or bottom alone.\n"
+                "- The sentence must explain why the failed caption misses target-only evidence relative to the shared overlap.\n"
+                "- When distractor-only evidence exists, the sentence must also explain why the failed caption still fits that distractor-side evidence.\n"
+                "- The sentence must use finer-grained visible differences and must not stop at broad area, left, right, top, or bottom alone.\n"
                 "- Prefer the sentence shape: The caption misses ... so it does not isolate the target; it still fits ... which pulls reconstruction toward the distractor.\n"
                 "- Do not output bullets, markdown, extra labels, analysis preambles, or [SEG]."
             )
@@ -3452,7 +3474,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "VERIFICATION_CAPTION: <one shorter verifier-friendly caption>\n"
                 "Rules:\n"
                 "- It must be shorter than the DLC.\n"
-                "- It must keep at least one target-only cue when target-only evidence exists.\n"
+                "- It must keep at least one target-only difference detail when target-only evidence exists.\n"
                 "- It must not repeat the distractor-only evidence as the main anchor.\n"
                 "- It must not collapse into a generic category phrase and must not output [SEG]."
             )
@@ -3754,11 +3776,6 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "shared_evidence": pipeline_result.shared_evidence,
                 "target_only_evidence": pipeline_result.target_only_evidence,
                 "distractor_only_evidence": pipeline_result.distractor_only_evidence,
-                "primary_target_cue": pipeline_result.primary_target_cue,
-                "primary_distractor_cue": pipeline_result.primary_distractor_cue,
-                "secondary_target_cue": pipeline_result.secondary_target_cue,
-                "secondary_distractor_cue": pipeline_result.secondary_distractor_cue,
-                "cue_conflict_summary": pipeline_result.cue_conflict_summary,
                 "target_localization_hint": pipeline_result.target_localization_hint,
                 "distractor_localization_hint": pipeline_result.distractor_localization_hint,
                 "likely_drift_reason": pipeline_result.likely_drift_reason,
@@ -3805,13 +3822,11 @@ class Sa2VAOPSDModelV2(BaseModel):
             {
                 "target_summary": pipeline_result.target_summary,
                 "distractor_summary": pipeline_result.distractor_summary,
+                "shared_evidence": pipeline_result.shared_evidence,
                 "target_only_evidence": pipeline_result.target_only_evidence,
                 "distractor_only_evidence": pipeline_result.distractor_only_evidence,
-                "primary_target_cue": pipeline_result.primary_target_cue,
-                "primary_distractor_cue": pipeline_result.primary_distractor_cue,
-                "secondary_target_cue": pipeline_result.secondary_target_cue,
-                "secondary_distractor_cue": pipeline_result.secondary_distractor_cue,
-                "cue_conflict_summary": pipeline_result.cue_conflict_summary,
+                "target_localization_hint": pipeline_result.target_localization_hint,
+                "distractor_localization_hint": pipeline_result.distractor_localization_hint,
                 "caption_problem": pipeline_result.caption_problem,
             }
         )
@@ -3856,13 +3871,11 @@ class Sa2VAOPSDModelV2(BaseModel):
             {
                 "target_summary": pipeline_result.target_summary,
                 "distractor_summary": pipeline_result.distractor_summary,
+                "shared_evidence": pipeline_result.shared_evidence,
                 "target_only_evidence": pipeline_result.target_only_evidence,
                 "distractor_only_evidence": pipeline_result.distractor_only_evidence,
-                "primary_target_cue": pipeline_result.primary_target_cue,
-                "primary_distractor_cue": pipeline_result.primary_distractor_cue,
-                "secondary_target_cue": pipeline_result.secondary_target_cue,
-                "secondary_distractor_cue": pipeline_result.secondary_distractor_cue,
-                "cue_conflict_summary": pipeline_result.cue_conflict_summary,
+                "target_localization_hint": pipeline_result.target_localization_hint,
+                "distractor_localization_hint": pipeline_result.distractor_localization_hint,
                 "likely_drift_reason": pipeline_result.likely_drift_reason,
                 "caption_problem": pipeline_result.caption_problem,
                 "correction_direction": pipeline_result.correction_direction,
@@ -4140,6 +4153,9 @@ class Sa2VAOPSDModelV2(BaseModel):
             model=self,
             gt_mask=gt_mask,
             ref_mask=ref_mask,
+            image=image,
+            student_question=student_question,
+            region_model=self.require_teacher_model("Teacher regenerate difference summarization"),
         )
         pipeline_result = self._build_empty_teacher_regenerate_pipeline_result()
         pipeline_result.target_summary = difference_context["target_summary"]
@@ -4147,11 +4163,6 @@ class Sa2VAOPSDModelV2(BaseModel):
         pipeline_result.shared_evidence = difference_context["shared_evidence"]
         pipeline_result.target_only_evidence = difference_context["target_only_evidence"]
         pipeline_result.distractor_only_evidence = difference_context["distractor_only_evidence"]
-        pipeline_result.primary_target_cue = difference_context.get("primary_target_cue", "")
-        pipeline_result.primary_distractor_cue = difference_context.get("primary_distractor_cue", "")
-        pipeline_result.secondary_target_cue = difference_context.get("secondary_target_cue", "")
-        pipeline_result.secondary_distractor_cue = difference_context.get("secondary_distractor_cue", "")
-        pipeline_result.cue_conflict_summary = difference_context.get("cue_conflict_summary", "")
         pipeline_result.target_localization_hint = difference_context["target_localization_hint"]
         pipeline_result.distractor_localization_hint = difference_context["distractor_localization_hint"]
         pipeline_result.likely_drift_reason = difference_context["likely_drift_reason"]
@@ -4567,14 +4578,10 @@ class Sa2VAOPSDModelV2(BaseModel):
             "teacher_dlc_valid": False,
             "teacher_target_summary": "",
             "teacher_distractor_summary": "",
+            "teacher_shared_evidence": "",
             "teacher_target_only_evidence": "",
             "teacher_distractor_only_evidence": "",
             "teacher_likely_drift_reason": "",
-            "teacher_primary_target_cue": "",
-            "teacher_primary_distractor_cue": "",
-            "teacher_secondary_target_cue": "",
-            "teacher_secondary_distractor_cue": "",
-            "teacher_cue_conflict_summary": "",
             "teacher_caption_problem": "",
             "teacher_correction_direction": "",
             "teacher_reason": "",
@@ -4621,14 +4628,10 @@ class Sa2VAOPSDModelV2(BaseModel):
         )
         result["teacher_target_summary"] = teacher_regenerate.target_summary
         result["teacher_distractor_summary"] = teacher_regenerate.distractor_summary
+        result["teacher_shared_evidence"] = teacher_regenerate.shared_evidence
         result["teacher_target_only_evidence"] = teacher_regenerate.target_only_evidence
         result["teacher_distractor_only_evidence"] = teacher_regenerate.distractor_only_evidence
         result["teacher_likely_drift_reason"] = teacher_regenerate.likely_drift_reason
-        result["teacher_primary_target_cue"] = teacher_regenerate.primary_target_cue
-        result["teacher_primary_distractor_cue"] = teacher_regenerate.primary_distractor_cue
-        result["teacher_secondary_target_cue"] = teacher_regenerate.secondary_target_cue
-        result["teacher_secondary_distractor_cue"] = teacher_regenerate.secondary_distractor_cue
-        result["teacher_cue_conflict_summary"] = teacher_regenerate.cue_conflict_summary
         result["teacher_caption_problem"] = teacher_regenerate.caption_problem
         result["teacher_correction_direction"] = teacher_regenerate.correction_direction
         result["teacher_reason"] = teacher_regenerate.reason
@@ -5493,9 +5496,6 @@ class Sa2VAOPSDModelV2(BaseModel):
         teacher_problem_valid_count = 0
         teacher_direction_valid_count = 0
         teacher_reason_valid_count = 0
-        teacher_problem_primary_target_hit_count = 0
-        teacher_reason_primary_target_hit_count = 0
-        teacher_reason_primary_distractor_hit_count = 0
         teacher_reason_coarse_count = 0
         teacher_diagnosis_valid_count = 0
         teacher_dlc_valid_count = 0
@@ -5683,11 +5683,6 @@ class Sa2VAOPSDModelV2(BaseModel):
             teacher_target_only_evidence = str(teacher_analysis.get("teacher_target_only_evidence", ""))
             teacher_distractor_only_evidence = str(teacher_analysis.get("teacher_distractor_only_evidence", ""))
             teacher_likely_drift_reason = str(teacher_analysis.get("teacher_likely_drift_reason", ""))
-            teacher_primary_target_cue = str(teacher_analysis.get("teacher_primary_target_cue", ""))
-            teacher_primary_distractor_cue = str(teacher_analysis.get("teacher_primary_distractor_cue", ""))
-            teacher_secondary_target_cue = str(teacher_analysis.get("teacher_secondary_target_cue", ""))
-            teacher_secondary_distractor_cue = str(teacher_analysis.get("teacher_secondary_distractor_cue", ""))
-            teacher_cue_conflict_summary = str(teacher_analysis.get("teacher_cue_conflict_summary", ""))
             teacher_caption_problem = str(teacher_analysis.get("teacher_caption_problem", ""))
             teacher_correction_direction = str(teacher_analysis.get("teacher_correction_direction", ""))
             teacher_reason = str(teacher_analysis.get("teacher_reason", ""))
@@ -5717,23 +5712,6 @@ class Sa2VAOPSDModelV2(BaseModel):
             if teacher_verification_caption_status == "ok":
                 teacher_regenerate_verification_valid_count += 1
             teacher_regenerate_verification_iou_sum += teacher_verification_iou
-            teacher_problem_hints = self._build_difference_field_phrase_hints(teacher_primary_target_cue)
-            if teacher_problem_hints and any(
-                hint.lower() in teacher_caption_problem.lower() for hint in teacher_problem_hints
-            ):
-                teacher_problem_primary_target_hit_count += 1
-            teacher_reason_target_hints = self._build_difference_field_phrase_hints(teacher_primary_target_cue)
-            if teacher_reason_target_hints and any(
-                hint.lower() in teacher_reason.lower() for hint in teacher_reason_target_hints
-            ):
-                teacher_reason_primary_target_hit_count += 1
-            teacher_reason_distractor_hints = self._build_difference_field_phrase_hints(
-                teacher_primary_distractor_cue
-            )
-            if teacher_reason_distractor_hints and any(
-                hint.lower() in teacher_reason.lower() for hint in teacher_reason_distractor_hints
-            ):
-                teacher_reason_primary_distractor_hit_count += 1
             if teacher_reason_is_coarse:
                 teacher_reason_coarse_count += 1
             caption_mode_failure = bool(teacher_analysis.get("caption_mode_failure", False))
@@ -5788,13 +5766,9 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "teacher_dlc": teacher_dlc,
                 "target_summary": teacher_target_summary,
                 "distractor_summary": teacher_distractor_summary,
+                "shared_evidence": str(teacher_analysis.get("teacher_shared_evidence", "")),
                 "target_only_evidence": teacher_target_only_evidence,
                 "distractor_only_evidence": teacher_distractor_only_evidence,
-                "primary_target_cue": teacher_primary_target_cue,
-                "primary_distractor_cue": teacher_primary_distractor_cue,
-                "secondary_target_cue": teacher_secondary_target_cue,
-                "secondary_distractor_cue": teacher_secondary_distractor_cue,
-                "cue_conflict_summary": teacher_cue_conflict_summary,
                 "likely_drift_reason": teacher_likely_drift_reason,
                 "caption_problem": teacher_caption_problem,
                 "correction_direction": teacher_correction_direction,
@@ -6046,15 +6020,6 @@ class Sa2VAOPSDModelV2(BaseModel):
         self._cumulative_teacher_problem_valid_count += teacher_problem_valid_count
         self._cumulative_teacher_direction_valid_count += teacher_direction_valid_count
         self._cumulative_teacher_reason_valid_count += teacher_reason_valid_count
-        self._cumulative_teacher_problem_primary_target_hit_count += (
-            teacher_problem_primary_target_hit_count
-        )
-        self._cumulative_teacher_reason_primary_target_hit_count += (
-            teacher_reason_primary_target_hit_count
-        )
-        self._cumulative_teacher_reason_primary_distractor_hit_count += (
-            teacher_reason_primary_distractor_hit_count
-        )
         self._cumulative_teacher_reason_coarse_count += teacher_reason_coarse_count
         self._cumulative_teacher_regenerate_verification_valid_count += teacher_regenerate_verification_valid_count
         self._cumulative_teacher_regenerate_verification_iou_sum += teacher_regenerate_verification_iou_sum
@@ -6117,9 +6082,6 @@ class Sa2VAOPSDModelV2(BaseModel):
             "teacher_problem_valid_count": teacher_problem_valid_count,
             "teacher_direction_valid_count": teacher_direction_valid_count,
             "teacher_reason_valid_count": teacher_reason_valid_count,
-            "teacher_problem_primary_target_hit_count": teacher_problem_primary_target_hit_count,
-            "teacher_reason_primary_target_hit_count": teacher_reason_primary_target_hit_count,
-            "teacher_reason_primary_distractor_hit_count": teacher_reason_primary_distractor_hit_count,
             "teacher_reason_coarse_count": teacher_reason_coarse_count,
             "teacher_regenerate_verification_valid_count": teacher_regenerate_verification_valid_count,
             "teacher_diagnosis_valid_count": teacher_diagnosis_valid_count,
@@ -6219,18 +6181,6 @@ class Sa2VAOPSDModelV2(BaseModel):
         )
         window_teacher_reason_valid_rate = (
             window_totals["teacher_reason_valid_count"]
-            / max(window_totals["teacher_regenerate_analysis_count"], 1)
-        )
-        window_teacher_problem_primary_target_hit_rate = (
-            window_totals["teacher_problem_primary_target_hit_count"]
-            / max(window_totals["teacher_regenerate_analysis_count"], 1)
-        )
-        window_teacher_reason_primary_target_hit_rate = (
-            window_totals["teacher_reason_primary_target_hit_count"]
-            / max(window_totals["teacher_regenerate_analysis_count"], 1)
-        )
-        window_teacher_reason_primary_distractor_hit_rate = (
-            window_totals["teacher_reason_primary_distractor_hit_count"]
             / max(window_totals["teacher_regenerate_analysis_count"], 1)
         )
         window_teacher_reason_coarse_rate = (
@@ -6449,15 +6399,6 @@ class Sa2VAOPSDModelV2(BaseModel):
                 ),
                 "teacher_reason_valid_rate": self._metric_tensor(
                     window_teacher_reason_valid_rate, zero.dtype
-                ),
-                "teacher_problem_primary_target_hit_rate": self._metric_tensor(
-                    window_teacher_problem_primary_target_hit_rate, zero.dtype
-                ),
-                "teacher_reason_primary_target_hit_rate": self._metric_tensor(
-                    window_teacher_reason_primary_target_hit_rate, zero.dtype
-                ),
-                "teacher_reason_primary_distractor_hit_rate": self._metric_tensor(
-                    window_teacher_reason_primary_distractor_hit_rate, zero.dtype
                 ),
                 "teacher_reason_coarse_rate": self._metric_tensor(
                     window_teacher_reason_coarse_rate, zero.dtype
@@ -6733,15 +6674,6 @@ class Sa2VAOPSDModelV2(BaseModel):
             ),
             "teacher_reason_valid_rate": self._metric_tensor(
                 window_teacher_reason_valid_rate, avg_total_loss.dtype
-            ),
-            "teacher_problem_primary_target_hit_rate": self._metric_tensor(
-                window_teacher_problem_primary_target_hit_rate, avg_total_loss.dtype
-            ),
-            "teacher_reason_primary_target_hit_rate": self._metric_tensor(
-                window_teacher_reason_primary_target_hit_rate, avg_total_loss.dtype
-            ),
-            "teacher_reason_primary_distractor_hit_rate": self._metric_tensor(
-                window_teacher_reason_primary_distractor_hit_rate, avg_total_loss.dtype
             ),
             "teacher_reason_coarse_rate": self._metric_tensor(
                 window_teacher_reason_coarse_rate, avg_total_loss.dtype

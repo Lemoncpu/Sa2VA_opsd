@@ -257,73 +257,96 @@ def _build_problem_focus(target_bullets, distractor_bullets):
     return "The caption does not separate the target from the distractor precisely enough."
 
 
-def _cue_priority_score(text):
-    lowered = _normalize_relation_text(text).lower()
-    if lowered in {"", "none", "unknown"}:
-        return -1
-    score = 0
-    if "shifted away" in lowered or "not centered near" in lowered:
-        score += 40
-    if "while the competing region is" in lowered:
-        score += 30
-    if any(token in lowered for token in ("more to the", "higher toward", "lower toward", "closer to the")):
-        score += 20
-    if any(token in lowered for token in ("small", "tiny", "medium", "large")):
-        score += 10
-    if "broad area" in lowered:
-        score -= 10
-    return score
-
-
-def _select_primary_difference_cues(target_only_bullets, distractor_only_bullets):
-    target_ranked = sorted(
-        [bullet for bullet in target_only_bullets if _is_effective_relation_text(bullet)],
-        key=lambda item: (_cue_priority_score(item), len(item)),
-        reverse=True,
-    )
-    distractor_ranked = sorted(
-        [bullet for bullet in distractor_only_bullets if _is_effective_relation_text(bullet)],
-        key=lambda item: (_cue_priority_score(item), len(item)),
-        reverse=True,
-    )
-    primary_target = target_ranked[0] if target_ranked else "none"
-    secondary_target = target_ranked[1] if len(target_ranked) > 1 else "none"
-    primary_distractor = distractor_ranked[0] if distractor_ranked else "none"
-    secondary_distractor = distractor_ranked[1] if len(distractor_ranked) > 1 else "none"
-    if _is_effective_relation_text(primary_target) and _is_effective_relation_text(primary_distractor):
-        cue_conflict_summary = (
-            f"The caption most likely misses {primary_target} and stays compatible with {primary_distractor}."
+def _describe_mask_region_naturally(
+    *,
+    model,
+    region_model,
+    image,
+    mask,
+    student_question,
+    role_name,
+    paired_region_text="",
+    iou=None,
+):
+    mask = np.asarray(mask).astype(np.uint8)
+    if int(mask.sum()) == 0:
+        return "none"
+    if image is not None and region_model is not None and student_question:
+        desc_result = describe_region_with_retries(
+            model=model,
+            region_model=region_model,
+            image=image,
+            mask=mask,
+            student_question=student_question,
         )
-    elif _is_effective_relation_text(primary_target):
-        cue_conflict_summary = f"The caption most likely misses {primary_target}."
-    elif _is_effective_relation_text(primary_distractor):
-        cue_conflict_summary = f"The caption most likely stays compatible with {primary_distractor}."
-    else:
-        cue_conflict_summary = "No non-trivial target versus distractor cue pair was found."
-    return {
-        "primary_target_cue": primary_target,
-        "primary_distractor_cue": primary_distractor,
-        "secondary_target_cue": secondary_target,
-        "secondary_distractor_cue": secondary_distractor,
-        "cue_conflict_summary": cue_conflict_summary,
-    }
+        desc_text = (desc_result.clean_caption or "").strip()
+        if _is_region_description_usable(model, desc_result):
+            return desc_text
+    return build_region_description_fallback(
+        model=model,
+        mask=mask,
+        role_name=role_name,
+        paired_region_text=paired_region_text,
+        iou=iou,
+    )
 
 
-def build_teacher_regenerate_difference_context(*, model, gt_mask, ref_mask):
+def build_teacher_regenerate_difference_context(
+    *,
+    model,
+    gt_mask,
+    ref_mask,
+    image=None,
+    student_question="",
+    region_model=None,
+):
     relation_context = build_mask_relation_context(
         model=model,
         gt_mask=gt_mask,
         ref_mask=ref_mask,
     )
-    target_summary = _normalize_relation_text(relation_context.get("gt_summary", ""))
-    distractor_summary = _normalize_relation_text(relation_context.get("ref_summary", ""))
-    shared_evidence = _normalize_relation_text(relation_context.get("overlap_summary", ""))
+    gt_mask = np.asarray(gt_mask).astype(np.uint8)
+    ref_mask = np.asarray(ref_mask).astype(np.uint8)
+    overlap_mask = np.logical_and(gt_mask > 0, ref_mask > 0).astype(np.uint8)
+
+    target_summary = _normalize_relation_text(
+        _describe_mask_region_naturally(
+            model=model,
+            region_model=region_model,
+            image=image,
+            mask=gt_mask,
+            student_question=student_question,
+            role_name="gtmask",
+        )
+    )
+    distractor_summary = _normalize_relation_text(
+        _describe_mask_region_naturally(
+            model=model,
+            region_model=region_model,
+            image=image,
+            mask=ref_mask,
+            student_question=student_question,
+            role_name="refmask",
+            paired_region_text=target_summary,
+            iou=float(model._compute_iou(gt_mask, ref_mask)),
+        )
+    )
+    shared_evidence = _normalize_relation_text(
+        _describe_mask_region_naturally(
+            model=model,
+            region_model=region_model,
+            image=image,
+            mask=overlap_mask,
+            student_question=student_question,
+            role_name="overlap",
+        )
+        if int(overlap_mask.sum()) > 0
+        else "none"
+    )
     target_only_raw = _normalize_relation_text(relation_context.get("gt_only_summary", ""))
     distractor_only_raw = _normalize_relation_text(relation_context.get("ref_only_summary", ""))
     target_localization_hint = _normalize_relation_text(model._coarse_spatial_hint(gt_mask))
     distractor_localization_hint = _normalize_relation_text(model._coarse_spatial_hint(ref_mask))
-    gt_mask = np.asarray(gt_mask).astype(np.uint8)
-    ref_mask = np.asarray(ref_mask).astype(np.uint8)
     gt_only = np.logical_and(gt_mask > 0, ref_mask == 0).astype(np.uint8)
     ref_only = np.logical_and(ref_mask > 0, gt_mask == 0).astype(np.uint8)
     target_only_bullets = (
@@ -337,47 +360,42 @@ def build_teacher_regenerate_difference_context(*, model, gt_mask, ref_mask):
         else []
     )
     target_only_evidence = (
-        _format_difference_evidence(target_only_bullets, prefix="T")
+        "Target-only difference from the shared region: "
+        + _format_difference_evidence(target_only_bullets, prefix="T")
         if target_only_bullets
         else "none"
     )
     distractor_only_evidence = (
-        _format_difference_evidence(distractor_only_bullets, prefix="D")
+        "Distractor-only difference from the shared region: "
+        + _format_difference_evidence(distractor_only_bullets, prefix="D")
         if distractor_only_bullets
         else "none"
     )
-    selected_cues = _select_primary_difference_cues(target_only_bullets, distractor_only_bullets)
-
     if target_summary.lower() == distractor_summary.lower():
-        if _is_effective_relation_text(target_only_evidence):
-            target_summary = f"{target_summary}; target-only cue: {target_only_bullets[0]}"
-        if _is_effective_relation_text(distractor_only_evidence):
-            distractor_summary = f"{distractor_summary}; distractor cue: {distractor_only_bullets[0]}"
+        if target_only_bullets:
+            target_summary = f"{target_summary} Target-only detail: {target_only_bullets[0]}."
+        if distractor_only_bullets:
+            distractor_summary = f"{distractor_summary} Distractor-only detail: {distractor_only_bullets[0]}."
 
     has_target_only = _is_effective_relation_text(target_only_evidence)
     has_distractor_only = _is_effective_relation_text(distractor_only_evidence)
-    primary_target_cue = selected_cues["primary_target_cue"]
-    primary_distractor_cue = selected_cues["primary_distractor_cue"]
-    cue_conflict_summary = selected_cues["cue_conflict_summary"]
     if has_target_only and has_distractor_only:
         likely_drift_reason = (
-            f"The caption misses {primary_target_cue} and still matches {primary_distractor_cue}, "
-            "so reconstruction drifts toward the distractor."
+            "The caption does not separate the target-only summary from the distractor-only summary, "
+            "so reconstruction still drifts toward the distractor."
         )
     elif has_target_only:
         likely_drift_reason = (
-            f"The caption misses {primary_target_cue}, so it does not isolate the target precisely enough."
+            "The caption misses target-only evidence that is needed to isolate the gtmask precisely enough."
         )
     elif has_distractor_only:
         likely_drift_reason = (
-            f"The caption remains compatible with {primary_distractor_cue}, so it still drifts toward the distractor."
+            "The caption remains compatible with distractor-only evidence, so it still drifts toward the distractor."
         )
     elif _is_effective_relation_text(shared_evidence):
-        likely_drift_reason = "Shared evidence dominates, so the target-specific cue is missing."
+        likely_drift_reason = "Shared evidence dominates, so the target-specific cue is still missing."
     else:
-        likely_drift_reason = (
-            "The student caption does not separate the target from the reconstructed distractor precisely enough."
-        )
+        likely_drift_reason = "The student caption does not separate the target from the reconstructed distractor precisely enough."
 
     return {
         "target_summary": target_summary,
@@ -385,11 +403,6 @@ def build_teacher_regenerate_difference_context(*, model, gt_mask, ref_mask):
         "shared_evidence": shared_evidence,
         "target_only_evidence": target_only_evidence,
         "distractor_only_evidence": distractor_only_evidence,
-        "primary_target_cue": primary_target_cue,
-        "primary_distractor_cue": primary_distractor_cue,
-        "secondary_target_cue": selected_cues["secondary_target_cue"],
-        "secondary_distractor_cue": selected_cues["secondary_distractor_cue"],
-        "cue_conflict_summary": cue_conflict_summary,
         "target_localization_hint": target_localization_hint,
         "distractor_localization_hint": distractor_localization_hint,
         "likely_drift_reason": likely_drift_reason,

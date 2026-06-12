@@ -218,6 +218,55 @@
 - Do not mix caption-quality reward or reconstruction-IoU reward into this change. Keep the dense reward local to the confuser MCQ path so its effect is interpretable.
 - Do not only penalize the chosen wrong option; use the full distribution so reward stays dense even when argmax is correct but confuser mass is high.
 
+## 2026-06-12 Teacher Regenerate Difference Context Switched To Natural-Language Summaries
+
+### Problem
+- The active teacher regenerate diagnosis pipeline was partially migrated away from cue-based fields, but `projects/sa2va/models/sa2va_opsd_v2.py` still required `primary_target_cue` and related fields in prompts, validators, and metrics.
+- As a result, the teacher diagnosis flow became internally inconsistent: the difference-context builder returned natural-language summaries for `gtmask`, `refmask`, and overlap, while the downstream validation path still rejected outputs for not matching now-empty cue placeholders.
+
+### Root Cause Notes
+- `projects/sa2va/evaluation/teacher_diagnosis_common.py` had already started generating natural-language summaries for the target, distractor, and overlap regions, but still exposed cue compatibility placeholders.
+- `projects/sa2va/models/sa2va_opsd_v2.py` continued to:
+  - build prompts around `primary_target_cue` and `cue_conflict_summary`
+  - validate diagnosis stages by requiring cue hits
+  - log and aggregate cue-hit metrics that no longer reflected real training behavior
+- The teacher regenerate pipeline also failed to pass `image`, `student_question`, and a teacher region model into the new summary builder, so the intended region-level natural-language descriptions were not actually being used.
+
+### Chosen Fix Direction
+- Remove cue-based fields from the active teacher regenerate path instead of keeping dead compatibility logic in the main loop.
+- Make the teacher diagnose from:
+  - natural-language target summary (`gtmask`)
+  - natural-language distractor summary (`refmask`)
+  - natural-language shared overlap summary
+  - program-built target-only and distractor-only difference evidence
+- Update prompts, validators, and logging to judge whether teacher outputs consume these summaries and difference-evidence fields rather than deprecated cue fields.
+
+### Rejected Direction
+- Do not keep empty cue placeholders as a first-class interface in the active training path. That makes metrics misleading and keeps diagnosis blocked for the wrong reason.
+- Do not ask the program side to over-compress all differences into a single primary cue before teacher analysis. The new direction is to let teacher reason over richer natural-language summaries and then analyze only-difference evidence.
+
+### Implemented Changes
+- Updated `projects/sa2va/evaluation/teacher_diagnosis_common.py`:
+  - removed the now-unused cue selection helper from the active difference-context path
+  - kept `target_summary`, `distractor_summary`, and `shared_evidence` as natural-language region analyses
+  - kept `target_only_evidence` and `distractor_only_evidence` as the structured only-difference evidence used downstream
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py`:
+  - removed cue fields from `TeacherRegeneratePipelineResult`
+  - passed `image`, `student_question`, and the teacher model into `build_teacher_regenerate_difference_context(...)` so the natural-language summary path is actually exercised
+  - rewrote the three diagnosis-stage prompts to consume `target_summary`, `distractor_summary`, `shared_evidence`, and the two only-difference evidence fields
+  - relaxed stage validators so they now require fine-grained semantic anchors and failure-mechanism wording instead of cue-string hits
+  - removed cue-hit counters and surfaced metrics from the active training metrics path
+  - added `shared_evidence` to debug logging so the new summary-driven diagnosis can be inspected directly from logs
+
+### Follow-up Adjustment
+- A remaining layer of cue-style validation still survived in the post-diagnosis stages: DLC and verification-caption validation were checking whether outputs literally reused phrase fragments split from `target_only_evidence`.
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py` again so these later stages no longer require phrase-level evidence hits.
+- The active validation now checks for:
+  - semantic difference anchors
+  - target-only / distractor-only / overlap-style distinction language
+  - coarse-vs-fine failure quality
+  rather than requiring the model to copy specific cue-like substrings from the program-generated evidence text.
+
 ## 2026-06-12 Teacher Diagnosis Specificity Upgrade
 
 ### Problem
