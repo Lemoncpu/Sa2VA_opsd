@@ -267,6 +267,22 @@
   - coarse-vs-fine failure quality
   rather than requiring the model to copy specific cue-like substrings from the program-generated evidence text.
 
+### Follow-up Adjustment For Asymmetric Difference Compression And Direction Actions
+- New logs showed the diagnosis flow had moved slightly forward, but two bottlenecks remained:
+  - the difference context still produced too many symmetric `target_only_evidence` / `distractor_only_evidence` bullets
+  - `teacher_correction_direction` often repeated the target summary instead of producing an explicit `add/avoid` edit instruction
+- Updated `projects/sa2va/evaluation/teacher_diagnosis_common.py` to:
+  - normalize and de-duplicate target/distractor bullets across sides
+  - drop weak symmetric bullets from the main evidence path when stronger asymmetric ones exist
+  - cap the active only-difference evidence to at most 3 bullets per side
+  - add a new `difference_focus` summary sentence that names the leading target-side vs distractor-side difference
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py` to:
+  - carry `difference_focus` through the teacher regenerate pipeline and debug logs
+  - rewrite the `teacher_correction_direction` prompt so it asks only for an edit instruction, not an object restatement
+  - require explicit target-side add action words and distractor-side avoid action words in `validate_teacher_correction_direction(...)`
+  - reject direction outputs that are mostly summary repetition or problem restatement
+- The goal of this patch is to raise `teacher_direction_valid_rate` from zero by making the upstream difference context less symmetric and the direction stage more action-oriented.
+
 ## 2026-06-12 Teacher Diagnosis Specificity Upgrade
 
 ### Problem

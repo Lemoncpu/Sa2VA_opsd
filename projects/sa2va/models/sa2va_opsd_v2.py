@@ -88,6 +88,7 @@ class TeacherRegeneratePipelineResult:
     shared_evidence: str = ""
     target_only_evidence: str = ""
     distractor_only_evidence: str = ""
+    difference_focus: str = ""
     target_localization_hint: str = ""
     distractor_localization_hint: str = ""
     likely_drift_reason: str = ""
@@ -1780,35 +1781,50 @@ class Sa2VAOPSDModelV2(BaseModel):
     def validate_teacher_correction_direction(self, result):
         if not self._teacher_field_is_effective(result.correction_direction, invalid_markers=("",)):
             return False, "direction_invalid:missing_direction"
-        if len(result.correction_direction.split()) < 6:
-            return False, "direction_invalid:truncated_or_generic"
+        if len(result.correction_direction.split()) < 8:
+            return False, "direction_invalid:too_short"
         normalized_direction = result.correction_direction.lower()
-        if not any(
+        has_add_action = any(
             token in normalized_direction
             for token in (
-                "strengthen",
                 "add",
+                "strengthen",
                 "highlight",
                 "specify",
-                "make explicit",
                 "focus on",
-                "narrow to",
+                "make explicit",
             )
-        ):
-            return False, "direction_invalid:missing_target_strengthening"
-        if self._teacher_field_is_effective(result.distractor_only_evidence) and not any(
-            token in normalized_direction
-            for token in ("suppress", "avoid", "separate", "stop matching", "downplay", "remove")
-        ):
-            return False, "direction_invalid:missing_distractor_suppression"
-        semantic_anchor_ok = (
-            self._difference_text_has_semantic_anchor(result.correction_direction)
-            or "target-only" in normalized_direction
-            or "distractor" in normalized_direction
-            or "shared" in normalized_direction
         )
-        if not semantic_anchor_ok:
-            return False, "direction_invalid:lacks_difference_anchor"
+        has_avoid_action = any(
+            token in normalized_direction
+            for token in (
+                "avoid",
+                "suppress",
+                "separate",
+                "stop matching",
+                "not fit",
+                "not match",
+                "downplay",
+                "remove",
+            )
+        )
+        if not has_add_action:
+            return False, "direction_invalid:missing_add_action"
+        if self._teacher_field_is_effective(result.distractor_only_evidence) and not has_avoid_action:
+            return False, "direction_invalid:missing_avoid_action"
+        if (
+            self._teacher_text_overlap_ratio(result.correction_direction, result.target_summary) >= 0.75
+            and not (has_add_action and (has_avoid_action or not self._teacher_field_is_effective(result.distractor_only_evidence)))
+        ):
+            return False, "direction_invalid:summary_repetition"
+        if (
+            any(
+                token in normalized_direction
+                for token in ("does not accurately describe", "missing details", "fails to describe")
+            )
+            and not (has_add_action or has_avoid_action)
+        ):
+            return False, "direction_invalid:problem_restatement"
         return True, ""
 
     def validate_teacher_reason_explanation(self, result):
@@ -2473,6 +2489,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "shared_evidence={shared_evidence} "
                 "target_only_evidence={target_only_evidence} "
                 "distractor_only_evidence={distractor_only_evidence} "
+                "difference_focus={difference_focus} "
                 "likely_drift_reason={likely_drift_reason} "
                 "caption_problem={caption_problem} "
                 "correction_direction={correction_direction} "
@@ -2504,6 +2521,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                     shared_evidence=repr(record.get("shared_evidence", "")),
                     target_only_evidence=repr(record.get("target_only_evidence", "")),
                     distractor_only_evidence=repr(record.get("distractor_only_evidence", "")),
+                    difference_focus=repr(record.get("difference_focus", "")),
                     likely_drift_reason=repr(record.get("likely_drift_reason", "")),
                     caption_problem=repr(record.get("caption_problem", "")),
                     correction_direction=repr(record.get("correction_direction", "")),
@@ -3407,14 +3425,17 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"Shared evidence: {teacher_fields.get('shared_evidence', '')}\n"
                 f"Target-only evidence: {teacher_fields.get('target_only_evidence', '')}\n"
                 f"Distractor-only evidence: {teacher_fields.get('distractor_only_evidence', '')}\n"
-                f"Target localization hint: {teacher_fields.get('target_localization_hint', '')}\n"
-                f"Distractor localization hint: {teacher_fields.get('distractor_localization_hint', '')}\n"
-                "Generate only the correction direction. Do not restate the problem and do not explain why.\n"
+                f"Difference focus: {teacher_fields.get('difference_focus', '')}\n"
+                "Write only an edit instruction for the caption. Do not restate the problem and do not explain why.\n"
                 "Output exactly one natural-language sentence and nothing else.\n"
                 "Rules:\n"
-                "- The sentence must say what target-side detail should be strengthened using the target summary and target-only evidence.\n"
-                "- If distractor-only evidence exists, the sentence must also say what distractor-compatible wording should be avoided, suppressed, or separated.\n"
-                "- The sentence must not stop at a generic instruction like strengthen target-only evidence.\n"
+                "- Do not restate the target summary or distractor summary.\n"
+                "- Do not describe the object again from scratch.\n"
+                "- The sentence must say what target-side detail should be added, strengthened, specified, or made explicit.\n"
+                "- If distractor-only evidence exists, the sentence must also say what distractor-compatible wording should be avoided, suppressed, separated, or removed.\n"
+                "- When both target-only and distractor-only differences exist, the sentence must contain one add action and one avoid action.\n"
+                "- Use the difference focus as the main edit target.\n"
+                "- Prefer sentence shapes like: Add the target-side detail about ..., and avoid wording that still fits ... .\n"
                 "- Do not output bullets, markdown, extra labels, analysis preambles, or [SEG]."
             )
         elif generation_mode == "teacher_reason_explanation":
@@ -3825,8 +3846,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "shared_evidence": pipeline_result.shared_evidence,
                 "target_only_evidence": pipeline_result.target_only_evidence,
                 "distractor_only_evidence": pipeline_result.distractor_only_evidence,
-                "target_localization_hint": pipeline_result.target_localization_hint,
-                "distractor_localization_hint": pipeline_result.distractor_localization_hint,
+                "difference_focus": pipeline_result.difference_focus,
                 "caption_problem": pipeline_result.caption_problem,
             }
         )
@@ -4163,6 +4183,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         pipeline_result.shared_evidence = difference_context["shared_evidence"]
         pipeline_result.target_only_evidence = difference_context["target_only_evidence"]
         pipeline_result.distractor_only_evidence = difference_context["distractor_only_evidence"]
+        pipeline_result.difference_focus = difference_context.get("difference_focus", "")
         pipeline_result.target_localization_hint = difference_context["target_localization_hint"]
         pipeline_result.distractor_localization_hint = difference_context["distractor_localization_hint"]
         pipeline_result.likely_drift_reason = difference_context["likely_drift_reason"]
@@ -4581,6 +4602,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             "teacher_shared_evidence": "",
             "teacher_target_only_evidence": "",
             "teacher_distractor_only_evidence": "",
+            "teacher_difference_focus": "",
             "teacher_likely_drift_reason": "",
             "teacher_caption_problem": "",
             "teacher_correction_direction": "",
@@ -4631,6 +4653,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         result["teacher_shared_evidence"] = teacher_regenerate.shared_evidence
         result["teacher_target_only_evidence"] = teacher_regenerate.target_only_evidence
         result["teacher_distractor_only_evidence"] = teacher_regenerate.distractor_only_evidence
+        result["teacher_difference_focus"] = teacher_regenerate.difference_focus
         result["teacher_likely_drift_reason"] = teacher_regenerate.likely_drift_reason
         result["teacher_caption_problem"] = teacher_regenerate.caption_problem
         result["teacher_correction_direction"] = teacher_regenerate.correction_direction
@@ -5682,6 +5705,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             teacher_distractor_summary = str(teacher_analysis.get("teacher_distractor_summary", ""))
             teacher_target_only_evidence = str(teacher_analysis.get("teacher_target_only_evidence", ""))
             teacher_distractor_only_evidence = str(teacher_analysis.get("teacher_distractor_only_evidence", ""))
+            teacher_difference_focus = str(teacher_analysis.get("teacher_difference_focus", ""))
             teacher_likely_drift_reason = str(teacher_analysis.get("teacher_likely_drift_reason", ""))
             teacher_caption_problem = str(teacher_analysis.get("teacher_caption_problem", ""))
             teacher_correction_direction = str(teacher_analysis.get("teacher_correction_direction", ""))
@@ -5769,6 +5793,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "shared_evidence": str(teacher_analysis.get("teacher_shared_evidence", "")),
                 "target_only_evidence": teacher_target_only_evidence,
                 "distractor_only_evidence": teacher_distractor_only_evidence,
+                "difference_focus": str(teacher_analysis.get("teacher_difference_focus", "")),
                 "likely_drift_reason": teacher_likely_drift_reason,
                 "caption_problem": teacher_caption_problem,
                 "correction_direction": teacher_correction_direction,
@@ -6495,6 +6520,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                     f"teacher_caption_problem={teacher_caption_problem!r} "
                     f"teacher_correction_direction={teacher_correction_direction!r} "
                     f"teacher_reason={teacher_reason!r} "
+                    f"teacher_difference_focus={teacher_difference_focus!r} "
                     f"teacher_problem_raw={teacher_problem_raw!r} "
                     f"teacher_direction_raw={teacher_direction_raw!r} "
                     f"teacher_reason_raw={teacher_reason_raw!r} "
@@ -6563,6 +6589,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                     f"teacher_caption_problem={teacher_caption_problem!r} "
                     f"teacher_correction_direction={teacher_correction_direction!r} "
                     f"teacher_reason={teacher_reason!r} "
+                    f"teacher_difference_focus={teacher_difference_focus!r} "
                     f"teacher_problem_raw={teacher_problem_raw!r} "
                     f"teacher_direction_raw={teacher_direction_raw!r} "
                     f"teacher_reason_raw={teacher_reason_raw!r} "

@@ -245,16 +245,89 @@ def _format_difference_evidence(bullets, *, prefix):
     return " | ".join(numbered)
 
 
-def _build_problem_focus(target_bullets, distractor_bullets):
-    if target_bullets and distractor_bullets:
-        return (
-            f"The caption under-describes {target_bullets[0]} but overmatches {distractor_bullets[0]}."
-        )
-    if target_bullets:
-        return f"The caption misses the target-specific cue {target_bullets[0]}."
-    if distractor_bullets:
-        return f"The caption drifts toward the distractor cue {distractor_bullets[0]}."
-    return "The caption does not separate the target from the distractor precisely enough."
+def _normalize_difference_bullet_for_dedup(text):
+    normalized = _normalize_relation_text(text).lower()
+    normalized = re.sub(r"^[td]\d+\)\s*", "", normalized)
+    normalized = normalized.replace("the target-only region", "")
+    normalized = normalized.replace("the distractor-only region", "")
+    normalized = normalized.replace("target-only region", "")
+    normalized = normalized.replace("distractor-only region", "")
+    normalized = re.sub(r"\s+", " ", normalized).strip(" .")
+    return normalized
+
+
+def _is_weak_symmetric_difference_bullet(text):
+    normalized = _normalize_difference_bullet_for_dedup(text)
+    if not normalized:
+        return True
+    weak_prefixes = (
+        "a broad area on the",
+        "the target is small and located",
+        "the target is medium-sized and located",
+        "the target is large and located",
+        "the target is tiny and located",
+    )
+    weak_fragments = (
+        "keeps a similar overall size but changes a local part",
+        "differs by a subtle local offset",
+    )
+    return normalized.startswith(weak_prefixes) or any(fragment in normalized for fragment in weak_fragments)
+
+
+def _difference_bullet_priority(text):
+    normalized = _normalize_difference_bullet_for_dedup(text)
+    if not normalized:
+        return -1
+    if "shifted away" in normalized or "not centered near" in normalized:
+        return 4
+    if any(token in normalized for token in ("more to the", "higher toward", "lower toward", "closer to the")):
+        return 3
+    if (
+        "while the competing region is" in normalized
+        or any(token in normalized for token in ("small", "tiny", "medium", "large"))
+    ):
+        return 2
+    if "broad area" in normalized or any(
+        token in normalized for token in ("left side", "right side", "middle height", "middle width")
+    ):
+        return 1
+    return 0
+
+
+def _select_non_symmetric_difference_bullets(primary_bullets, competing_bullets, limit=3):
+    competing_normalized = {
+        _normalize_difference_bullet_for_dedup(bullet)
+        for bullet in competing_bullets
+        if _normalize_difference_bullet_for_dedup(bullet)
+    }
+    filtered = []
+    seen = set()
+    for bullet in primary_bullets:
+        normalized = _normalize_difference_bullet_for_dedup(bullet)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        if normalized in competing_normalized:
+            continue
+        if _is_weak_symmetric_difference_bullet(bullet):
+            continue
+        filtered.append(bullet)
+    if not filtered:
+        for bullet in primary_bullets:
+            normalized = _normalize_difference_bullet_for_dedup(bullet)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            if normalized in competing_normalized:
+                continue
+            filtered.append(bullet)
+            if len(filtered) >= limit:
+                break
+    filtered.sort(
+        key=lambda item: (_difference_bullet_priority(item), len(_normalize_difference_bullet_for_dedup(item))),
+        reverse=True,
+    )
+    return filtered[:limit]
 
 
 def _describe_mask_region_naturally(
@@ -349,15 +422,25 @@ def build_teacher_regenerate_difference_context(
     distractor_localization_hint = _normalize_relation_text(model._coarse_spatial_hint(ref_mask))
     gt_only = np.logical_and(gt_mask > 0, ref_mask == 0).astype(np.uint8)
     ref_only = np.logical_and(ref_mask > 0, gt_mask == 0).astype(np.uint8)
-    target_only_bullets = (
+    raw_target_only_bullets = (
         _build_evidence_bullets(gt_only, ref_only, target_localization_hint, "the target-only region")
         if _is_effective_relation_text(target_only_raw)
         else []
     )
-    distractor_only_bullets = (
+    raw_distractor_only_bullets = (
         _build_evidence_bullets(ref_only, gt_only, distractor_localization_hint, "the distractor-only region")
         if _is_effective_relation_text(distractor_only_raw)
         else []
+    )
+    target_only_bullets = _select_non_symmetric_difference_bullets(
+        raw_target_only_bullets,
+        raw_distractor_only_bullets,
+        limit=3,
+    )
+    distractor_only_bullets = _select_non_symmetric_difference_bullets(
+        raw_distractor_only_bullets,
+        raw_target_only_bullets,
+        limit=3,
     )
     target_only_evidence = (
         "Target-only difference from the shared region: "
@@ -371,26 +454,30 @@ def build_teacher_regenerate_difference_context(
         if distractor_only_bullets
         else "none"
     )
-    if target_summary.lower() == distractor_summary.lower():
-        if target_only_bullets:
-            target_summary = f"{target_summary} Target-only detail: {target_only_bullets[0]}."
-        if distractor_only_bullets:
-            distractor_summary = f"{distractor_summary} Distractor-only detail: {distractor_only_bullets[0]}."
+    if target_only_bullets and distractor_only_bullets:
+        difference_focus = (
+            f"The target differs mainly by {target_only_bullets[0]}, "
+            f"while the reconstructed distractor still matches {distractor_only_bullets[0]}."
+        )
+    elif target_only_bullets:
+        difference_focus = f"The target is mainly distinguished by {target_only_bullets[0]}."
+    elif distractor_only_bullets:
+        difference_focus = f"The reconstruction is mainly pulled by {distractor_only_bullets[0]}."
+    else:
+        difference_focus = "The target and distractor are still not separated by a strong local difference."
 
     has_target_only = _is_effective_relation_text(target_only_evidence)
     has_distractor_only = _is_effective_relation_text(distractor_only_evidence)
     if has_target_only and has_distractor_only:
         likely_drift_reason = (
-            "The caption does not separate the target-only summary from the distractor-only summary, "
+            "The caption misses the target-side difference and remains compatible with the distractor-side difference, "
             "so reconstruction still drifts toward the distractor."
         )
     elif has_target_only:
-        likely_drift_reason = (
-            "The caption misses target-only evidence that is needed to isolate the gtmask precisely enough."
-        )
+        likely_drift_reason = "The caption misses the target-side difference needed to isolate the gtmask."
     elif has_distractor_only:
         likely_drift_reason = (
-            "The caption remains compatible with distractor-only evidence, so it still drifts toward the distractor."
+            "The caption remains compatible with the distractor-side difference, so it still drifts toward the distractor."
         )
     elif _is_effective_relation_text(shared_evidence):
         likely_drift_reason = "Shared evidence dominates, so the target-specific cue is still missing."
@@ -403,6 +490,7 @@ def build_teacher_regenerate_difference_context(
         "shared_evidence": shared_evidence,
         "target_only_evidence": target_only_evidence,
         "distractor_only_evidence": distractor_only_evidence,
+        "difference_focus": difference_focus,
         "target_localization_hint": target_localization_hint,
         "distractor_localization_hint": distractor_localization_hint,
         "likely_drift_reason": likely_drift_reason,
