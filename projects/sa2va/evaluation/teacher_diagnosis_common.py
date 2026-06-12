@@ -191,6 +191,72 @@ def _describe_difference_evidence(mask, spatial_hint):
     return f"{extent_text}; {spatial_hint.lower()}"
 
 
+def _difference_anchor_phrase(mask, other_mask, role_name):
+    mask = np.asarray(mask).astype(np.uint8)
+    other_mask = np.asarray(other_mask).astype(np.uint8)
+    area_label = _mask_area_label(mask)
+    horiz, vert = _mask_axis_label(mask)
+    other_horiz, other_vert = _mask_axis_label(other_mask)
+    pieces = []
+    if area_label not in {"unknown", ""}:
+        pieces.append(f"{area_label} region")
+    if horiz != "unknown":
+        pieces.append(f"on the {horiz}")
+    if vert != "unknown":
+        pieces.append(f"toward the {vert}")
+    if horiz != "unknown" and other_horiz != "unknown" and horiz != other_horiz:
+        pieces.append(f"shifted away from the {other_horiz}")
+    if vert != "unknown" and other_vert != "unknown" and vert != other_vert:
+        pieces.append(f"not centered near the {other_vert}")
+    if not pieces:
+        return f"{role_name} local cue"
+    return " ".join(pieces)
+
+
+def _build_evidence_bullets(mask, other_mask, localization_hint, role_name):
+    mask = np.asarray(mask).astype(np.uint8)
+    other_mask = np.asarray(other_mask).astype(np.uint8)
+    extent = _mask_extent_text(mask)
+    area_contrast = _contrast_area_text(mask, other_mask, role_name)
+    location_contrast = _contrast_location_text(mask, other_mask, role_name)
+    anchor_phrase = _difference_anchor_phrase(mask, other_mask, role_name)
+    localization_hint = _normalize_relation_text(localization_hint)
+    bullets = [extent, anchor_phrase, area_contrast, location_contrast]
+    if localization_hint.lower() not in {"", "none", "unknown"}:
+        bullets.append(localization_hint.rstrip("."))
+    deduped = []
+    seen = set()
+    for bullet in bullets:
+        bullet = re.sub(r"\s+", " ", str(bullet or "").strip(" ."))
+        if not bullet:
+            continue
+        lowered = bullet.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        deduped.append(bullet)
+    return deduped[:5]
+
+
+def _format_difference_evidence(bullets, *, prefix):
+    if not bullets:
+        return "none"
+    numbered = [f"{prefix}{idx + 1}) {item}" for idx, item in enumerate(bullets)]
+    return " | ".join(numbered)
+
+
+def _build_problem_focus(target_bullets, distractor_bullets):
+    if target_bullets and distractor_bullets:
+        return (
+            f"The caption under-describes {target_bullets[0]} but overmatches {distractor_bullets[0]}."
+        )
+    if target_bullets:
+        return f"The caption misses the target-specific cue {target_bullets[0]}."
+    if distractor_bullets:
+        return f"The caption drifts toward the distractor cue {distractor_bullets[0]}."
+    return "The caption does not separate the target from the distractor precisely enough."
+
+
 def build_teacher_regenerate_difference_context(*, model, gt_mask, ref_mask):
     relation_context = build_mask_relation_context(
         model=model,
@@ -208,45 +274,50 @@ def build_teacher_regenerate_difference_context(*, model, gt_mask, ref_mask):
     ref_mask = np.asarray(ref_mask).astype(np.uint8)
     gt_only = np.logical_and(gt_mask > 0, ref_mask == 0).astype(np.uint8)
     ref_only = np.logical_and(ref_mask > 0, gt_mask == 0).astype(np.uint8)
-    target_only_evidence = (
-        (
-            f"{_describe_difference_evidence(gt_only, target_localization_hint)}; "
-            f"{_contrast_area_text(gt_only, ref_only, 'the target-only region')}; "
-            f"{_contrast_location_text(gt_only, ref_only, 'the target-only region')}"
-        )
+    target_only_bullets = (
+        _build_evidence_bullets(gt_only, ref_only, target_localization_hint, "the target-only region")
         if _is_effective_relation_text(target_only_raw)
+        else []
+    )
+    distractor_only_bullets = (
+        _build_evidence_bullets(ref_only, gt_only, distractor_localization_hint, "the distractor-only region")
+        if _is_effective_relation_text(distractor_only_raw)
+        else []
+    )
+    target_only_evidence = (
+        _format_difference_evidence(target_only_bullets, prefix="T")
+        if target_only_bullets
         else "none"
     )
     distractor_only_evidence = (
-        (
-            f"{_describe_difference_evidence(ref_only, distractor_localization_hint)}; "
-            f"{_contrast_area_text(ref_only, gt_only, 'the distractor-only region')}; "
-            f"{_contrast_location_text(ref_only, gt_only, 'the distractor-only region')}"
-        )
-        if _is_effective_relation_text(distractor_only_raw)
+        _format_difference_evidence(distractor_only_bullets, prefix="D")
+        if distractor_only_bullets
         else "none"
     )
 
     if target_summary.lower() == distractor_summary.lower():
         if _is_effective_relation_text(target_only_evidence):
-            target_summary = f"{target_summary}; target-only cue: {target_only_evidence}"
+            target_summary = f"{target_summary}; target-only cue: {target_only_bullets[0]}"
         if _is_effective_relation_text(distractor_only_evidence):
-            distractor_summary = f"{distractor_summary}; distractor cue: {distractor_only_evidence}"
+            distractor_summary = f"{distractor_summary}; distractor cue: {distractor_only_bullets[0]}"
 
     has_target_only = _is_effective_relation_text(target_only_evidence)
     has_distractor_only = _is_effective_relation_text(distractor_only_evidence)
     if has_target_only and has_distractor_only:
         likely_drift_reason = (
-            f"The student caption likely misses {target_only_evidence} and is pulled toward "
-            f"{distractor_only_evidence}."
+            f"{_build_problem_focus(target_only_bullets, distractor_only_bullets)} "
+            f"Target-only evidence: {target_only_bullets[0]}. "
+            f"Distractor-only evidence: {distractor_only_bullets[0]}."
         )
     elif has_target_only:
         likely_drift_reason = (
-            f"The student caption likely underspecifies the target because it misses {target_only_evidence}."
+            f"{_build_problem_focus(target_only_bullets, distractor_only_bullets)} "
+            f"Target-only evidence: {target_only_bullets[0]}."
         )
     elif has_distractor_only:
         likely_drift_reason = (
-            f"The student caption likely drifts because it overmatches {distractor_only_evidence}."
+            f"{_build_problem_focus(target_only_bullets, distractor_only_bullets)} "
+            f"Distractor-only evidence: {distractor_only_bullets[0]}."
         )
     elif _is_effective_relation_text(shared_evidence):
         likely_drift_reason = "Shared evidence dominates, so the target-specific cue is missing."

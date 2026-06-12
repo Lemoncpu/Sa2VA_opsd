@@ -1667,6 +1667,22 @@ class Sa2VAOPSDModelV2(BaseModel):
             if split_match:
                 result.correction_direction = self._normalize_teacher_field_text(split_match.group(1))
                 result.reason = self._normalize_teacher_field_text(split_match.group(2))
+        if (
+            not result.reason
+            and self._teacher_field_is_effective(result.likely_drift_reason, invalid_markers=("",))
+        ):
+            result.reason = self._normalize_teacher_field_text(result.likely_drift_reason)
+        if (
+            result.caption_problem
+            and self._teacher_field_is_effective(result.target_only_evidence)
+            and "misses a broad area" in result.caption_problem.lower()
+            and "target-only cue" not in result.caption_problem.lower()
+        ):
+            first_target_hint = self._build_difference_field_phrase_hints(result.target_only_evidence)
+            if first_target_hint:
+                result.caption_problem = (
+                    f"{result.caption_problem.rstrip('.')} The missing target-only cue is {first_target_hint[0]}."
+                )
         return result
 
     def validate_teacher_light_diagnosis(self, result):
@@ -1685,15 +1701,51 @@ class Sa2VAOPSDModelV2(BaseModel):
             key_evidence.extend(self._build_difference_field_phrase_hints(result.distractor_only_evidence))
         if key_evidence:
             matched_hint = any(
-                hint.lower() in result.reason.lower() or hint.lower() in result.correction_direction.lower()
+                hint.lower() in result.reason.lower()
+                or hint.lower() in result.correction_direction.lower()
+                or hint.lower() in result.caption_problem.lower()
                 for hint in key_evidence
             )
             semantic_anchor_ok = (
-                self._difference_text_has_semantic_anchor(result.reason)
+                self._difference_text_has_semantic_anchor(result.caption_problem)
+                or self._difference_text_has_semantic_anchor(result.reason)
                 or self._difference_text_has_semantic_anchor(result.correction_direction)
             )
-            if not matched_hint and not semantic_anchor_ok:
+            phrase_level_problem_ok = any(
+                token in result.caption_problem.lower()
+                for token in (
+                    "target-only cue",
+                    "distractor cue",
+                    "too generic",
+                    "underspecified",
+                    "wrong anchor",
+                    "pulled toward",
+                    "missing target",
+                )
+            )
+            if not matched_hint and not semantic_anchor_ok and not phrase_level_problem_ok:
                 return False, "diagnosis_invalid:missing_difference_evidence"
+        if len(result.caption_problem.split()) < 6:
+            return False, "diagnosis_invalid:caption_problem_too_short"
+        if len(result.reason.split()) < 6:
+            return False, "diagnosis_invalid:reason_too_short"
+        if any(
+            result.caption_problem.lower().strip() == generic
+            for generic in (
+                "the caption is vague",
+                "the caption is too generic",
+                "the caption is wrong",
+            )
+        ):
+            return False, "diagnosis_invalid:generic_caption_problem"
+        if any(
+            result.reason.lower().strip() == generic
+            for generic in (
+                "the target-only cue matters because",
+                "the distractor-only cue matters because",
+            )
+        ):
+            return False, "diagnosis_invalid:generic_reason"
         return True, ""
 
     @staticmethod
@@ -3105,13 +3157,17 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "CORRECTION_DIRECTION:\n"
                 "REASON:\n"
                 "Rules:\n"
-                "- CAPTION_PROBLEM must state the main way the student caption drifts away from the target.\n"
+                "- CAPTION_PROBLEM must name the concrete missing target cue or wrong distractor cue, not just say misses a broad area.\n"
+                "- CAPTION_PROBLEM should mention which phrase type in the failed student caption is too generic, underspecified, or pulled toward the distractor.\n"
                 "- CORRECTION_DIRECTION must say whether to strengthen target-only evidence, suppress distractor-only evidence, or both.\n"
+                "- CORRECTION_DIRECTION must include one concrete cue family such as left/right/top/bottom, size contrast, local offset, or target-only cue.\n"
                 "- REASON must be exactly one complete sentence, not a fragment.\n"
                 "- REASON must explicitly mention target-only evidence or distractor-only evidence from the provided context.\n"
+                "- REASON must cite at least one specific evidence bullet like T1), T2), D1), or D2), or restate one of those cues in natural language.\n"
                 "- REASON must include at least one concrete cue such as left, right, top, bottom, center, small patch, broad area, local offset, or size contrast.\n"
                 "- If target-only evidence matters more, start REASON with: REASON: The target-only cue matters because ...\n"
                 "- If distractor-only evidence matters more, start REASON with: REASON: The distractor-only cue matters because ...\n"
+                "- Do not copy the likely drift reason verbatim. Convert it into a diagnosis of why the failed student caption points to the wrong region.\n"
                 "- Never leave REASON blank. Never output just the label word REASON inside another field.\n"
                 "- Do not output bullets, markdown, extra labels, analysis preambles, or [SEG]."
             )

@@ -218,6 +218,38 @@
 - Do not mix caption-quality reward or reconstruction-IoU reward into this change. Keep the dense reward local to the confuser MCQ path so its effect is interpretable.
 - Do not only penalize the chosen wrong option; use the full distribution so reward stays dense even when argmax is correct but confuser mass is high.
 
+## 2026-06-12 Teacher Diagnosis Specificity Upgrade
+
+### Problem
+- Teacher regenerate diagnosis often produced structurally present but semantically weak fields, especially `teacher_caption_problem`, which frequently collapsed into generic geometry restatements such as "misses a broad area".
+- Even when diagnosis fields were logged, they were not specific enough to explain which target-only cue was missing or which distractor-only cue was pulling reconstruction away from the target.
+
+### Root Cause Notes
+- The upstream difference compression layer exposed mostly symmetric geometric summaries, so teacher could safely paraphrase them without producing phrase-level or cue-level diagnosis.
+- The diagnosis prompt emphasized field format more than failure localization, encouraging generic restatements instead of concrete target-vs-distractor error attribution.
+- The parser and validator treated any non-empty diagnosis text as potentially acceptable, but they did not push the model toward cue-grounded problem descriptions.
+- Empty or malformed `REASON` fields caused hard failures, while weak `CAPTION_PROBLEM` fields still slipped through when present.
+
+### Chosen Fix Direction
+- Upgrade the program-side difference context into finer, asymmetric evidence bullets that expose target-only and distractor-only anchor cues separately.
+- Strengthen the diagnosis prompt so `CAPTION_PROBLEM` must name a concrete missing target cue or wrong distractor cue rather than only paraphrasing broad spatial differences.
+- Tighten diagnosis validation to require cue-grounded wording and minimum semantic content, while adding a parser-side fallback that backfills `REASON` from `likely_drift_reason` when needed.
+
+### Rejected Direction
+- Do not revert to the older heavy multi-stage fault-report pipeline just to get more structured text. The current issue is specificity and robustness of the light diagnosis path, not lack of available labels.
+- Do not loosen validation into accepting any generic diagnosis sentence, because that would reintroduce low-value teacher supervision into regenerate.
+
+### Implemented Changes
+- Updated `projects/sa2va/evaluation/teacher_diagnosis_common.py`:
+  - Added finer asymmetric evidence construction helpers for target-only and distractor-only regions.
+  - Reformatted `target_only_evidence` and `distractor_only_evidence` into bullet-like cue lists with explicit target-vs-distractor anchors.
+  - Rebuilt `likely_drift_reason` so it summarizes missing target cues versus distractor pull in more diagnosis-friendly natural language.
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py`:
+  - Strengthened the `teacher_light_diagnosis` prompt to require concrete cue-level problem statements instead of generic broad-area paraphrases.
+  - Added parser-side fallback that fills empty `REASON` from `likely_drift_reason`.
+  - Added normalization that enriches overly generic `CAPTION_PROBLEM` with the first target-only cue when necessary.
+  - Tightened diagnosis validation with cue-grounding, semantic-anchor, and minimum-length checks so successful diagnoses better reflect actual target/distractor differences.
+
 ## 2026-06-12 Teacher Regenerate Cumulative Rate Fix And Verification Caption Logging
 
 ### Problem
