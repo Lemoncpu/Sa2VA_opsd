@@ -250,6 +250,52 @@
   - Added normalization that enriches overly generic `CAPTION_PROBLEM` with the first target-only cue when necessary.
   - Tightened diagnosis validation with cue-grounding, semantic-anchor, and minimum-length checks so successful diagnoses better reflect actual target/distractor differences.
 
+## 2026-06-12 Teacher Reason Primary-Cue Grounding
+
+### Problem
+- Teacher diagnosis started passing structurally, but `teacher_reason` still consumed only coarse spatial summaries and largely ignored finer target-vs-distractor differences.
+- Logs showed `teacher_reason` repeatedly collapsing to broad-area wording even when program-side evidence already exposed more asymmetric local cues.
+
+### Root Cause Notes
+- The difference context exposed multiple bullets, but there was no program-side notion of which cue pair mattered most, so fallback text and prompt conditioning kept drifting back to the first coarse cue.
+- `REASON` prompt requirements still allowed generic spatial summaries as long as they referenced target/distractor evidence.
+- Validator logic did not force `REASON` to consume the highest-value cue pair or reject coarse-only explanations.
+
+### Chosen Fix Direction
+- Add explicit primary and secondary cue selection in the difference compression layer, then drive `cue_conflict_summary` and `likely_drift_reason` from the primary cue pair.
+- Feed those primary cues directly into the teacher light-diagnosis prompt and require `REASON` to explain why the caption misses the target cue but still fits the distractor cue.
+- Strengthen parser fallback and validation so coarse-only `REASON` text is rejected and primary-cue grounding becomes mandatory.
+
+### Rejected Direction
+- Do not keep relying on the first bullet as the implicit primary cue; that was the main source of broad-area collapse.
+- Do not only add more evidence bullets without selecting a primary cue pair, because that increases verbosity without changing what the teacher actually uses.
+
+### Implemented Changes
+- Updated `projects/sa2va/evaluation/teacher_diagnosis_common.py`:
+  - Added primary/secondary cue selection and cue-conflict summarization on top of the existing bullet evidence.
+  - Rewrote `likely_drift_reason` to be driven by the selected primary cue pair instead of the first coarse bullet.
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py`:
+  - Extended `TeacherRegeneratePipelineResult` and teacher analysis/debug payloads with primary/secondary cue fields and a coarse-reason flag.
+  - Strengthened teacher light-diagnosis prompting, parser fallback, and validation so `REASON` must ground on the selected primary cues and is rejected when it stays coarse.
+  - Extended debug logging so future runs can directly inspect primary cues, cue-conflict summary, and whether the resulting `REASON` was still coarse.
+
+## 2026-06-12 Teacher DLC Log Visibility
+
+### Problem
+- Logs printed teacher verification caption and diagnosis fields, but they did not print the actual teacher-regenerated DLC text in the main training log line or pre-return debug summary.
+- This made it harder to tell whether regenerate failed because DLC generation was empty, malformed, or simply later rejected by validation.
+
+### Root Cause Notes
+- `teacher_dlc` was already carried through teacher analysis and sample debug records, but it was omitted from the formatted log strings.
+
+### Chosen Fix Direction
+- Surface `teacher_dlc` alongside `teacher_verification_caption` in both the main `[Sa2VA_OPSD_V2]` log line and the detailed pre-return debug record output.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py` so:
+  - pre-return debug record formatting includes `teacher_dlc=...`
+  - the main training log line prints `teacher_dlc=...` next to `teacher_verification_caption=...`
+
 ## 2026-06-12 Teacher Regenerate Cumulative Rate Fix And Verification Caption Logging
 
 ### Problem
