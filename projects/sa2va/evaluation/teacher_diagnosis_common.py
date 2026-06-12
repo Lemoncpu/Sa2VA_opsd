@@ -106,6 +106,70 @@ def build_mask_relation_context(*, model, gt_mask, ref_mask):
     }
 
 
+def _normalize_relation_text(value):
+    normalized = re.sub(r"\s+", " ", str(value or "").strip())
+    return normalized if normalized else "none"
+
+
+def _is_effective_relation_text(value):
+    normalized = _normalize_relation_text(value).lower()
+    return normalized not in {"", "none", "unknown", "empty mask"}
+
+
+def build_teacher_regenerate_difference_context(*, model, gt_mask, ref_mask):
+    relation_context = build_mask_relation_context(
+        model=model,
+        gt_mask=gt_mask,
+        ref_mask=ref_mask,
+    )
+    target_summary = _normalize_relation_text(relation_context.get("gt_summary", ""))
+    distractor_summary = _normalize_relation_text(relation_context.get("ref_summary", ""))
+    shared_evidence = _normalize_relation_text(relation_context.get("overlap_summary", ""))
+    target_only_evidence = _normalize_relation_text(relation_context.get("gt_only_summary", ""))
+    distractor_only_evidence = _normalize_relation_text(relation_context.get("ref_only_summary", ""))
+    target_localization_hint = _normalize_relation_text(model._coarse_spatial_hint(gt_mask))
+    distractor_localization_hint = _normalize_relation_text(model._coarse_spatial_hint(ref_mask))
+
+    if target_summary.lower() == distractor_summary.lower():
+        if _is_effective_relation_text(target_only_evidence):
+            target_summary = f"{target_summary}; target-only cue: {target_only_evidence}"
+        if _is_effective_relation_text(distractor_only_evidence):
+            distractor_summary = f"{distractor_summary}; distractor cue: {distractor_only_evidence}"
+
+    has_target_only = _is_effective_relation_text(target_only_evidence)
+    has_distractor_only = _is_effective_relation_text(distractor_only_evidence)
+    if has_target_only and has_distractor_only:
+        likely_drift_reason = (
+            f"The student caption likely misses {target_only_evidence} and is pulled toward "
+            f"{distractor_only_evidence}."
+        )
+    elif has_target_only:
+        likely_drift_reason = (
+            f"The student caption likely underspecifies the target because it misses {target_only_evidence}."
+        )
+    elif has_distractor_only:
+        likely_drift_reason = (
+            f"The student caption likely drifts because it overmatches {distractor_only_evidence}."
+        )
+    elif _is_effective_relation_text(shared_evidence):
+        likely_drift_reason = "Shared evidence dominates, so the target-specific cue is missing."
+    else:
+        likely_drift_reason = (
+            "The student caption does not separate the target from the reconstructed distractor precisely enough."
+        )
+
+    return {
+        "target_summary": target_summary,
+        "distractor_summary": distractor_summary,
+        "shared_evidence": shared_evidence,
+        "target_only_evidence": target_only_evidence,
+        "distractor_only_evidence": distractor_only_evidence,
+        "target_localization_hint": target_localization_hint,
+        "distractor_localization_hint": distractor_localization_hint,
+        "likely_drift_reason": likely_drift_reason,
+    }
+
+
 def build_region_description_fallback(*, model, mask, role_name, paired_region_text="", iou=None):
     mask = np.asarray(mask).astype(np.uint8)
     area = int(mask.sum())

@@ -22,6 +22,7 @@ from projects.sa2va.evaluation.teacher_diagnosis_common import (
     ON_POLICY_DISTILL_ROUTE,
     TEACHER_REGENERATE_ROUTE,
     build_mask_relation_context,
+    build_teacher_regenerate_difference_context,
     classify_teacher_route,
 )
 
@@ -76,42 +77,34 @@ class ConfuserSelectionResult:
 
 @dataclass
 class TeacherRegeneratePipelineResult:
-    fault_report_raw: str = ""
-    repair_plan_raw: str = ""
+    diagnosis_raw: str = ""
     dlc_raw: str = ""
     verification_raw: str = ""
-    primary_failure_type: str = ""
-    secondary_failure_types: tuple = ()
-    failure_confidence: str = ""
     target_summary: str = ""
-    ref_summary: str = ""
-    missing_evidence: str = ""
-    distractor_evidence: str = ""
-    bad_phrases_in_student: str = ""
-    missing_phrases_needed: str = ""
-    keepable_phrases: str = ""
-    evidence_for_failure: str = ""
-    remove_phrases: str = ""
-    add_phrases: str = ""
-    emphasize_phrases: str = ""
-    deemphasize_phrases: str = ""
-    localize_with: str = ""
-    avoid_phrases: str = ""
-    rewrite_strategy: str = ""
+    distractor_summary: str = ""
+    shared_evidence: str = ""
+    target_only_evidence: str = ""
+    distractor_only_evidence: str = ""
+    target_localization_hint: str = ""
+    distractor_localization_hint: str = ""
+    likely_drift_reason: str = ""
+    caption_problem: str = ""
+    correction_direction: str = ""
+    reason: str = ""
     detailed_caption: str = ""
     verification_caption: str = ""
     detailed_completion_ids: torch.Tensor = None
-    fault_report_valid: bool = False
-    repair_plan_valid: bool = False
+    difference_context_nontrivial: bool = False
+    diagnosis_valid: bool = False
     detailed_status: str = "empty"
     verification_status: str = "empty"
     verification_iou: float = 0.0
     gate_passed: bool = False
-    fault_report_failure_reason: str = ""
-    repair_plan_failure_reason: str = ""
+    difference_context_failure_reason: str = ""
+    diagnosis_failure_reason: str = ""
     detailed_failure_reason: str = ""
     verification_failure_reason: str = ""
-    stop_stage: str = "fault_report"
+    stop_stage: str = "difference_context"
 
 
 class Sa2VAOPSDModelV2(BaseModel):
@@ -315,16 +308,11 @@ class Sa2VAOPSDModelV2(BaseModel):
         self._cumulative_teacher_regenerate_rejected_count = 0
         self._cumulative_teacher_regenerate_verified_iou_sum = 0.0
         self._cumulative_teacher_regenerate_analysis_count = 0
-        self._cumulative_teacher_regenerate_dual_output_count = 0
+        self._cumulative_teacher_difference_context_nontrivial_count = 0
+        self._cumulative_teacher_diagnosis_valid_count = 0
+        self._cumulative_teacher_dlc_valid_count = 0
         self._cumulative_teacher_regenerate_verification_valid_count = 0
         self._cumulative_teacher_regenerate_verification_iou_sum = 0.0
-        self._cumulative_teacher_fault_report_valid_count = 0
-        self._cumulative_teacher_repair_plan_valid_count = 0
-        self._cumulative_teacher_dlc_valid_count = 0
-        self._cumulative_teacher_fault_unknown_count = 0
-        self._cumulative_teacher_fault_low_confidence_count = 0
-        self._cumulative_teacher_fault_missing_evidence_nonempty_count = 0
-        self._cumulative_teacher_fault_distractor_evidence_nonempty_count = 0
         self._cumulative_recovery_ce_applied_count = 0
         self._cumulative_recovery_suppressed_count = 0
         self._cumulative_scene_spill_caption_count = 0
@@ -1334,15 +1322,10 @@ class Sa2VAOPSDModelV2(BaseModel):
             "grpo_blocked_by_seg_style_count",
             "teacher_recovery_seg_style_count",
             "teacher_recovery_seg_style_success_count",
-            "teacher_regenerate_dual_output_count",
+            "teacher_difference_context_nontrivial_count",
             "teacher_regenerate_verification_valid_count",
-            "teacher_fault_report_valid_count",
-            "teacher_repair_plan_valid_count",
+            "teacher_diagnosis_valid_count",
             "teacher_dlc_valid_count",
-            "teacher_fault_unknown_count",
-            "teacher_fault_low_confidence_count",
-            "teacher_fault_missing_evidence_nonempty_count",
-            "teacher_fault_distractor_evidence_nonempty_count",
             "grpo_zero_reward_variance_count",
             "grpo_nonzero_reward_count",
             "grpo_missing_confuser_count",
@@ -1605,6 +1588,26 @@ class Sa2VAOPSDModelV2(BaseModel):
             return ""
         return ", ".join(items)
 
+    def _teacher_text_overlap_ratio(self, text_a, text_b):
+        tokens_a = set(re.findall(r"[a-z0-9']+", self._normalize_teacher_field_text(text_a).lower()))
+        tokens_b = set(re.findall(r"[a-z0-9']+", self._normalize_teacher_field_text(text_b).lower()))
+        if not tokens_a or not tokens_b:
+            return 0.0
+        return float(len(tokens_a & tokens_b)) / float(max(min(len(tokens_a), len(tokens_b)), 1))
+
+    def _build_difference_field_phrase_hints(self, text):
+        if not self._teacher_field_is_effective(text):
+            return []
+        normalized = self._normalize_teacher_field_text(text)
+        fragments = []
+        for piece in re.split(r"[;,]", normalized):
+            piece = re.sub(r"\s+", " ", piece).strip(" .")
+            if len(piece.split()) >= 2:
+                fragments.append(piece)
+        if not fragments and normalized:
+            fragments.append(normalized)
+        return fragments[:4]
+
     @staticmethod
     def _teacher_failure_type_set():
         return {
@@ -1623,15 +1626,81 @@ class Sa2VAOPSDModelV2(BaseModel):
         completion_ids = torch.empty((1, 0), dtype=torch.long, device=self.device)
         return TeacherRegeneratePipelineResult(detailed_completion_ids=completion_ids)
 
+    @staticmethod
+    def _teacher_diagnosis_labels():
+        return ("CAPTION_PROBLEM", "CORRECTION_DIRECTION", "REASON")
+
+    def _parse_teacher_light_diagnosis(self, raw_prediction, base_result=None):
+        result = base_result or self._build_empty_teacher_regenerate_pipeline_result()
+        result.diagnosis_raw = "" if raw_prediction is None else str(raw_prediction)
+        sections = self._parse_teacher_labeled_sections(raw_prediction, self._teacher_diagnosis_labels())
+        result.caption_problem = self._normalize_teacher_field_text(sections.get("CAPTION_PROBLEM", ""))
+        result.correction_direction = self._normalize_teacher_field_text(
+            sections.get("CORRECTION_DIRECTION", "")
+        )
+        result.reason = self._normalize_teacher_field_text(sections.get("REASON", ""))
+        return result
+
+    def validate_teacher_light_diagnosis(self, result):
+        if not result.difference_context_nontrivial:
+            return False, "difference_context_invalid:trivial"
+        if not self._teacher_field_is_effective(result.caption_problem, invalid_markers=("",)):
+            return False, "diagnosis_invalid:missing_caption_problem"
+        if not self._teacher_field_is_effective(result.correction_direction, invalid_markers=("",)):
+            return False, "diagnosis_invalid:missing_correction_direction"
+        if not self._teacher_field_is_effective(result.reason, invalid_markers=("",)):
+            return False, "diagnosis_invalid:missing_reason"
+        key_evidence = []
+        if self._teacher_field_is_effective(result.target_only_evidence):
+            key_evidence.extend(self._build_difference_field_phrase_hints(result.target_only_evidence))
+        if self._teacher_field_is_effective(result.distractor_only_evidence):
+            key_evidence.extend(self._build_difference_field_phrase_hints(result.distractor_only_evidence))
+        if key_evidence and not any(
+            hint.lower() in result.reason.lower() or hint.lower() in result.correction_direction.lower()
+            for hint in key_evidence
+        ):
+            return False, "diagnosis_invalid:missing_difference_evidence"
+        return True, ""
+
+    @staticmethod
+    def _teacher_fault_report_labels():
+        return (
+            "PRIMARY_FAILURE_TYPE",
+            "SECONDARY_FAILURE_TYPES",
+            "FAILURE_CONFIDENCE",
+            "TARGET_SUMMARY",
+            "REF_SUMMARY",
+            "MISSING_EVIDENCE",
+            "DISTRACTOR_EVIDENCE",
+            "BAD_PHRASES_IN_STUDENT",
+            "MISSING_PHRASES_NEEDED",
+            "KEEPABLE_PHRASES",
+            "EVIDENCE_FOR_FAILURE",
+        )
+
+    def _parse_teacher_labeled_sections(self, raw_prediction, labels):
+        text = "" if raw_prediction is None else str(raw_prediction)
+        if not text:
+            return {label: "" for label in labels}
+        label_pattern = "|".join(re.escape(label) for label in labels)
+        pattern = re.compile(rf"(?is)\b({label_pattern})\s*:\s*")
+        matches = list(pattern.finditer(text))
+        values = {label: "" for label in labels}
+        for idx, match in enumerate(matches):
+            label = match.group(1)
+            start = match.end()
+            end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+            values[label] = text[start:end].strip()
+        return values
+
     def _parse_teacher_fault_report(self, raw_prediction):
         result = self._build_empty_teacher_regenerate_pipeline_result()
         result.fault_report_raw = "" if raw_prediction is None else str(raw_prediction)
+        sections = self._parse_teacher_labeled_sections(raw_prediction, self._teacher_fault_report_labels())
         result.primary_failure_type = self._normalize_teacher_field_text(
-            self._extract_labeled_teacher_text(raw_prediction, "PRIMARY_FAILURE_TYPE")
+            sections.get("PRIMARY_FAILURE_TYPE", "")
         ).lower()
-        secondary_raw = self._normalize_teacher_field_text(
-            self._extract_labeled_teacher_text(raw_prediction, "SECONDARY_FAILURE_TYPES")
-        )
+        secondary_raw = self._normalize_teacher_field_text(sections.get("SECONDARY_FAILURE_TYPES", ""))
         secondary_items = []
         for item in self._split_teacher_field_list(secondary_raw):
             item_lower = item.lower()
@@ -1639,32 +1708,64 @@ class Sa2VAOPSDModelV2(BaseModel):
                 secondary_items.append(item_lower)
         result.secondary_failure_types = tuple(secondary_items)
         result.failure_confidence = self._normalize_teacher_field_text(
-            self._extract_labeled_teacher_text(raw_prediction, "FAILURE_CONFIDENCE")
+            sections.get("FAILURE_CONFIDENCE", "")
         ).lower()
-        result.target_summary = self._normalize_teacher_field_text(
-            self._extract_labeled_teacher_text(raw_prediction, "TARGET_SUMMARY")
-        )
-        result.ref_summary = self._normalize_teacher_field_text(
-            self._extract_labeled_teacher_text(raw_prediction, "REF_SUMMARY")
-        )
-        result.missing_evidence = self._normalize_teacher_field_text(
-            self._extract_labeled_teacher_text(raw_prediction, "MISSING_EVIDENCE")
-        )
-        result.distractor_evidence = self._normalize_teacher_field_text(
-            self._extract_labeled_teacher_text(raw_prediction, "DISTRACTOR_EVIDENCE")
-        )
+        result.target_summary = self._normalize_teacher_field_text(sections.get("TARGET_SUMMARY", ""))
+        result.ref_summary = self._normalize_teacher_field_text(sections.get("REF_SUMMARY", ""))
+        result.missing_evidence = self._normalize_teacher_field_text(sections.get("MISSING_EVIDENCE", ""))
+        result.distractor_evidence = self._normalize_teacher_field_text(sections.get("DISTRACTOR_EVIDENCE", ""))
         result.bad_phrases_in_student = self._clean_teacher_phrase_list_text(
-            self._extract_labeled_teacher_text(raw_prediction, "BAD_PHRASES_IN_STUDENT")
+            sections.get("BAD_PHRASES_IN_STUDENT", "")
         )
         result.missing_phrases_needed = self._clean_teacher_phrase_list_text(
-            self._extract_labeled_teacher_text(raw_prediction, "MISSING_PHRASES_NEEDED")
+            sections.get("MISSING_PHRASES_NEEDED", "")
         )
         result.keepable_phrases = self._clean_teacher_phrase_list_text(
-            self._extract_labeled_teacher_text(raw_prediction, "KEEPABLE_PHRASES")
+            sections.get("KEEPABLE_PHRASES", "")
         )
         result.evidence_for_failure = self._normalize_teacher_field_text(
-            self._extract_labeled_teacher_text(raw_prediction, "EVIDENCE_FOR_FAILURE")
+            sections.get("EVIDENCE_FOR_FAILURE", "")
         )
+        return result
+
+    def _backfill_teacher_fault_report(
+        self,
+        result,
+        *,
+        relation_context,
+        student_caption,
+    ):
+        if result.primary_failure_type not in self._teacher_failure_type_set():
+            result.primary_failure_type = "unknown"
+        if result.failure_confidence not in {"high", "medium", "low"}:
+            result.failure_confidence = "medium"
+        if not self._teacher_field_is_effective(result.target_summary, invalid_markers=("",)):
+            result.target_summary = self._normalize_teacher_field_text(relation_context.get("gt_summary", ""))
+        if not self._teacher_field_is_effective(result.ref_summary, invalid_markers=("",)):
+            result.ref_summary = self._normalize_teacher_field_text(relation_context.get("ref_summary", ""))
+        if not self._teacher_field_is_effective(result.missing_evidence):
+            result.missing_evidence = self._normalize_teacher_field_text(relation_context.get("gt_only_summary", ""))
+        if not self._teacher_field_is_effective(result.distractor_evidence):
+            result.distractor_evidence = self._normalize_teacher_field_text(relation_context.get("ref_only_summary", ""))
+        if not self._teacher_field_is_effective(result.bad_phrases_in_student):
+            trimmed_caption = self._clean_caption_text(student_caption)
+            result.bad_phrases_in_student = trimmed_caption if trimmed_caption else "unknown"
+        if not self._teacher_field_is_effective(result.missing_phrases_needed):
+            if self._teacher_field_is_effective(result.missing_evidence):
+                result.missing_phrases_needed = result.missing_evidence
+            else:
+                result.missing_phrases_needed = "none"
+        if not self._teacher_field_is_effective(result.keepable_phrases):
+            result.keepable_phrases = "none"
+        if not self._teacher_field_is_effective(result.evidence_for_failure, invalid_markers=("",)):
+            missing_text = result.missing_evidence if self._teacher_field_is_effective(result.missing_evidence) else "no clear missing target evidence"
+            distractor_text = (
+                result.distractor_evidence if self._teacher_field_is_effective(result.distractor_evidence) else "no clear distractor evidence"
+            )
+            result.evidence_for_failure = (
+                f"The student caption drifts because the reconstruction misses {missing_text} "
+                f"and instead includes {distractor_text}."
+            )
         return result
 
     def validate_teacher_fault_report(self, result):
@@ -1757,14 +1858,18 @@ class Sa2VAOPSDModelV2(BaseModel):
     def _validate_teacher_dlc(self, result):
         if not self._teacher_field_is_effective(result.detailed_caption, invalid_markers=("",)):
             return "teacher_dlc_invalid:empty"
-        if self._contains_any_phrase(result.detailed_caption, result.remove_phrases):
-            return "teacher_dlc_invalid:contains_removed_phrase"
-        if self._contains_any_phrase(result.detailed_caption, result.avoid_phrases):
-            return "teacher_dlc_invalid:contains_avoid_phrase"
-        if self._teacher_field_is_effective(result.add_phrases) and not self._contains_any_phrase(
-            result.detailed_caption, result.add_phrases
+        if (
+            self._teacher_text_overlap_ratio(result.detailed_caption, result.distractor_summary) >= 0.75
+            and self._teacher_field_is_effective(result.target_only_evidence)
+            and not any(
+                hint.lower() in result.detailed_caption.lower()
+                for hint in self._build_difference_field_phrase_hints(result.target_only_evidence)
+            )
         ):
-            return "teacher_dlc_invalid:missing_required_addition"
+            return "teacher_dlc_invalid:distractor_overlap"
+        target_hints = self._build_difference_field_phrase_hints(result.target_only_evidence)
+        if target_hints and not any(hint.lower() in result.detailed_caption.lower() for hint in target_hints):
+            return "teacher_dlc_invalid:missing_target_only_evidence"
         return ""
 
     def _validate_teacher_verification_caption(self, result):
@@ -1776,11 +1881,11 @@ class Sa2VAOPSDModelV2(BaseModel):
             return "verification_invalid:not_shorter_than_dlc"
         if self._is_overly_generic_caption(result.verification_caption):
             return "verification_invalid:too_generic"
-        key_signal_text = result.emphasize_phrases if self._teacher_field_is_effective(result.emphasize_phrases) else result.add_phrases
-        if self._teacher_field_is_effective(key_signal_text) and not self._contains_any_phrase(
-            result.verification_caption, key_signal_text
-        ):
-            return "verification_invalid:lost_distinguishing_trait"
+        target_hints = self._build_difference_field_phrase_hints(result.target_only_evidence)
+        if target_hints and not any(hint.lower() in result.verification_caption.lower() for hint in target_hints):
+            return "verification_invalid:lost_target_only_evidence"
+        if self._teacher_text_overlap_ratio(result.verification_caption, result.distractor_summary) >= 0.75:
+            return "verification_invalid:distractor_overlap"
         return ""
 
     def _truncate_caption_completion(self, caption, completion_ids, *, max_tokens):
@@ -2056,16 +2161,14 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "scored_confuser_count={scored_confuser_count} "
                 "teacher_verification_caption_status={teacher_verification_caption_status} "
                 "teacher_verification_caption={teacher_verification_caption} "
-                "primary_failure_type={primary_failure_type} "
-                "secondary_failure_types={secondary_failure_types} "
-                "failure_confidence={failure_confidence} "
-                "missing_evidence={missing_evidence} "
-                "distractor_evidence={distractor_evidence} "
-                "bad_phrases_in_student={bad_phrases_in_student} "
-                "missing_phrases_needed={missing_phrases_needed} "
-                "remove_phrases={remove_phrases} "
-                "add_phrases={add_phrases} "
-                "rewrite_strategy={rewrite_strategy} "
+                "target_summary={target_summary} "
+                "distractor_summary={distractor_summary} "
+                "target_only_evidence={target_only_evidence} "
+                "distractor_only_evidence={distractor_only_evidence} "
+                "likely_drift_reason={likely_drift_reason} "
+                "caption_problem={caption_problem} "
+                "correction_direction={correction_direction} "
+                "reason={reason} "
                 "teacher_pipeline_stop_stage={teacher_pipeline_stop_stage} "
                 "teacher_pipeline_failure_reason={teacher_pipeline_failure_reason}".format(
                     sample_key=record.get("sample_key"),
@@ -2080,16 +2183,14 @@ class Sa2VAOPSDModelV2(BaseModel):
                     scored_confuser_count=record.get("scored_confuser_count"),
                     teacher_verification_caption_status=record.get("teacher_verification_caption_status"),
                     teacher_verification_caption=repr(record.get("teacher_verification_caption", "")),
-                    primary_failure_type=record.get("primary_failure_type"),
-                    secondary_failure_types=record.get("secondary_failure_types"),
-                    failure_confidence=record.get("failure_confidence"),
-                    missing_evidence=repr(record.get("missing_evidence", "")),
-                    distractor_evidence=repr(record.get("distractor_evidence", "")),
-                    bad_phrases_in_student=repr(record.get("bad_phrases_in_student", "")),
-                    missing_phrases_needed=repr(record.get("missing_phrases_needed", "")),
-                    remove_phrases=repr(record.get("remove_phrases", "")),
-                    add_phrases=repr(record.get("add_phrases", "")),
-                    rewrite_strategy=repr(record.get("rewrite_strategy", "")),
+                    target_summary=repr(record.get("target_summary", "")),
+                    distractor_summary=repr(record.get("distractor_summary", "")),
+                    target_only_evidence=repr(record.get("target_only_evidence", "")),
+                    distractor_only_evidence=repr(record.get("distractor_only_evidence", "")),
+                    likely_drift_reason=repr(record.get("likely_drift_reason", "")),
+                    caption_problem=repr(record.get("caption_problem", "")),
+                    correction_direction=repr(record.get("correction_direction", "")),
+                    reason=repr(record.get("reason", "")),
                     teacher_pipeline_stop_stage=record.get("teacher_pipeline_stop_stage"),
                     teacher_pipeline_failure_reason=record.get("teacher_pipeline_failure_reason"),
                 )
@@ -2950,6 +3051,69 @@ class Sa2VAOPSDModelV2(BaseModel):
             f"{route_guidance}\n"
             "Do not rely on any pre-labeled failure category beyond the route. Base your supervision on the actual visual content of region1 and region2, their pixel-level differences, and the failure mode implied by the student caption."
         )
+        if generation_mode == "teacher_light_diagnosis":
+            prompt = prompt_intro + (
+                f"Student prompt: {clean_question}\n"
+                f"Failed student caption: {student_caption}\n"
+                f"Current IoU between region1 and region2: {iou:.4f}\n"
+                f"Target summary: {teacher_fields.get('target_summary', '')}\n"
+                f"Distractor summary: {teacher_fields.get('distractor_summary', '')}\n"
+                f"Shared evidence: {teacher_fields.get('shared_evidence', '')}\n"
+                f"Target-only evidence: {teacher_fields.get('target_only_evidence', '')}\n"
+                f"Distractor-only evidence: {teacher_fields.get('distractor_only_evidence', '')}\n"
+                f"Target localization hint: {teacher_fields.get('target_localization_hint', '')}\n"
+                f"Distractor localization hint: {teacher_fields.get('distractor_localization_hint', '')}\n"
+                f"Likely drift reason: {teacher_fields.get('likely_drift_reason', '')}\n"
+                "Read the difference context and diagnose the failure in a lightweight way. "
+                "Do not generate the corrected caption yet.\n"
+                "Output exactly 3 lines and nothing else:\n"
+                "CAPTION_PROBLEM:\n"
+                "CORRECTION_DIRECTION:\n"
+                "REASON:\n"
+                "Rules:\n"
+                "- CAPTION_PROBLEM must state the main way the student caption drifts away from the target.\n"
+                "- CORRECTION_DIRECTION must say whether to strengthen target-only evidence, suppress distractor-only evidence, or both.\n"
+                "- REASON must explicitly use target-only evidence or distractor-only evidence from the provided context.\n"
+                "- Do not output bullets, markdown, extra labels, analysis preambles, or [SEG]."
+            )
+        elif generation_mode == "teacher_dlc_from_diagnosis":
+            prompt = prompt_intro + (
+                f"Student prompt: {clean_question}\n"
+                f"Failed student caption: {student_caption}\n"
+                f"Target summary: {teacher_fields.get('target_summary', '')}\n"
+                f"Distractor summary: {teacher_fields.get('distractor_summary', '')}\n"
+                f"Target-only evidence: {teacher_fields.get('target_only_evidence', '')}\n"
+                f"Distractor-only evidence: {teacher_fields.get('distractor_only_evidence', '')}\n"
+                f"Target localization hint: {teacher_fields.get('target_localization_hint', '')}\n"
+                f"CAPTION_PROBLEM: {teacher_fields.get('caption_problem', '')}\n"
+                f"CORRECTION_DIRECTION: {teacher_fields.get('correction_direction', '')}\n"
+                f"REASON: {teacher_fields.get('reason', '')}\n"
+                "Write one corrected detailed localized caption for the target mask.\n"
+                "Output exactly one line:\n"
+                "DLC: <one natural and complete detailed localized caption>\n"
+                "Rules:\n"
+                "- The DLC must target the target summary, not the distractor summary.\n"
+                "- It must absorb the target-only evidence when that evidence is available.\n"
+                "- It must avoid turning distractor-only evidence into the main anchor.\n"
+                "- It must stay natural and specific, and must not output [SEG], bullets, or extra labels."
+            )
+        elif generation_mode == "teacher_verification_caption_from_diagnosis":
+            prompt = prompt_intro + (
+                f"Student prompt: {clean_question}\n"
+                f"DLC: {teacher_fields.get('detailed_caption', '')}\n"
+                f"Target-only evidence: {teacher_fields.get('target_only_evidence', '')}\n"
+                f"Distractor-only evidence: {teacher_fields.get('distractor_only_evidence', '')}\n"
+                f"Target localization hint: {teacher_fields.get('target_localization_hint', '')}\n"
+                f"CORRECTION_DIRECTION: {teacher_fields.get('correction_direction', '')}\n"
+                "Write a shorter verification caption for reconstruction gating.\n"
+                "Output exactly one line:\n"
+                "VERIFICATION_CAPTION: <one shorter verifier-friendly caption>\n"
+                "Rules:\n"
+                "- It must be shorter than the DLC.\n"
+                "- It must keep at least one target-only cue when target-only evidence exists.\n"
+                "- It must not repeat the distractor-only evidence as the main anchor.\n"
+                "- It must not collapse into a generic category phrase and must not output [SEG]."
+            )
         if generation_mode == "teacher_fault_report":
             prompt = prompt_intro + (
                 f"Student prompt: {clean_question}\n"
@@ -2957,12 +3121,14 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"Description status: {description_status}\n"
                 f"Reconstruction status: {reconstruction.status}\n"
                 f"Current IoU between region1 and region2: {iou:.4f}\n"
+                f"Target mask summary: {relation_context['gt_summary']}\n"
+                f"Reconstructed mask summary: {relation_context['ref_summary']}\n"
                 f"Shared overlap summary: {relation_context['overlap_summary']}\n"
                 f"Region1-only summary (missing target pixels): {relation_context['gt_only_summary']}\n"
                 f"Region2-only summary (distractor pixels wrongly predicted): {relation_context['ref_only_summary']}\n"
                 f"{route_guidance}\n"
                 "You must diagnose the failure before any rewrite. Do not generate a caption.\n"
-                "Output exactly the following fields in this exact order:\n"
+                "Output exactly these 11 lines. Use one line per field. Never leave a field blank. If unsure, use unknown or none.\n"
                 "PRIMARY_FAILURE_TYPE:\n"
                 "SECONDARY_FAILURE_TYPES:\n"
                 "FAILURE_CONFIDENCE:\n"
@@ -2985,7 +3151,8 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "- MISSING_PHRASES_NEEDED must name the missing caption phrases needed to recover gtmask, comma separated, or none.\n"
                 "- KEEPABLE_PHRASES must name student phrases that are still correct, comma separated, or none.\n"
                 "- EVIDENCE_FOR_FAILURE must explain why the student caption leads to region2 instead of region1 and must reference the missing and distractor evidence.\n"
-                "- Do not output a caption, explanation preamble, bullets, [SEG], or any labels beyond the required field names."
+                "- Write every field on its own single line in LABEL: value format.\n"
+                "- Do not output a caption, explanation preamble, bullets, [SEG], markdown, or any labels beyond the required field names."
             )
         elif generation_mode == "teacher_repair_plan":
             prompt = prompt_intro + (
@@ -3146,6 +3313,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         gt_mask,
         ref_mask,
         teacher_fields,
+        relation_context,
     ):
         prompt = self.build_teacher_privileged_prompt_v3(
             student_question=student_question,
@@ -3164,7 +3332,12 @@ class Sa2VAOPSDModelV2(BaseModel):
             teacher_prompt_masks=teacher_prompt_masks,
             teacher_prompt=prompt,
         )
-        return self._parse_teacher_fault_report(raw_prediction)
+        result = self._parse_teacher_fault_report(raw_prediction)
+        return self._backfill_teacher_fault_report(
+            result,
+            relation_context=relation_context,
+            student_caption=student_caption,
+        )
 
     def generate_teacher_repair_plan(
         self,
@@ -3215,6 +3388,119 @@ class Sa2VAOPSDModelV2(BaseModel):
             teacher_prompt=prompt,
         )
         return self._parse_teacher_repair_plan(raw_prediction, pipeline_result)
+
+    def generate_teacher_light_diagnosis(
+        self,
+        *,
+        image,
+        teacher_prompt_masks,
+        student_question,
+        student_caption,
+        description_status,
+        reconstruction,
+        iou,
+        gt_mask,
+        ref_mask,
+        teacher_fields,
+        pipeline_result,
+    ):
+        teacher_fields = dict(teacher_fields)
+        teacher_fields.update(
+            {
+                "target_summary": pipeline_result.target_summary,
+                "distractor_summary": pipeline_result.distractor_summary,
+                "shared_evidence": pipeline_result.shared_evidence,
+                "target_only_evidence": pipeline_result.target_only_evidence,
+                "distractor_only_evidence": pipeline_result.distractor_only_evidence,
+                "target_localization_hint": pipeline_result.target_localization_hint,
+                "distractor_localization_hint": pipeline_result.distractor_localization_hint,
+                "likely_drift_reason": pipeline_result.likely_drift_reason,
+            }
+        )
+        prompt = self.build_teacher_privileged_prompt_v3(
+            student_question=student_question,
+            student_caption=student_caption,
+            description_status=description_status,
+            reconstruction=reconstruction,
+            iou=iou,
+            gt_mask=gt_mask,
+            ref_mask=ref_mask,
+            teacher_fields=teacher_fields,
+            generation_mode="teacher_light_diagnosis",
+        )
+        teacher_fields["teacher_light_diagnosis_prompt"] = prompt
+        raw_prediction = self._predict_teacher_privileged_text(
+            image=image,
+            teacher_prompt_masks=teacher_prompt_masks,
+            teacher_prompt=prompt,
+        )
+        return self._parse_teacher_light_diagnosis(raw_prediction, pipeline_result)
+
+    def generate_teacher_dlc_from_diagnosis(
+        self,
+        *,
+        image,
+        teacher_prompt_masks,
+        student_question,
+        student_caption,
+        description_status,
+        reconstruction,
+        iou,
+        gt_mask,
+        ref_mask,
+        teacher_fields,
+        pipeline_result,
+    ):
+        teacher_fields = dict(teacher_fields)
+        teacher_fields.update(
+            {
+                "target_summary": pipeline_result.target_summary,
+                "distractor_summary": pipeline_result.distractor_summary,
+                "target_only_evidence": pipeline_result.target_only_evidence,
+                "distractor_only_evidence": pipeline_result.distractor_only_evidence,
+                "target_localization_hint": pipeline_result.target_localization_hint,
+                "caption_problem": pipeline_result.caption_problem,
+                "correction_direction": pipeline_result.correction_direction,
+                "reason": pipeline_result.reason,
+            }
+        )
+        prompt = self.build_teacher_privileged_prompt_v3(
+            student_question=student_question,
+            student_caption=student_caption,
+            description_status=description_status,
+            reconstruction=reconstruction,
+            iou=iou,
+            gt_mask=gt_mask,
+            ref_mask=ref_mask,
+            teacher_fields=teacher_fields,
+            generation_mode="teacher_dlc_from_diagnosis",
+        )
+        teacher_fields["teacher_dlc_prompt"] = prompt
+        raw_prediction = self._predict_teacher_privileged_text(
+            image=image,
+            teacher_prompt_masks=teacher_prompt_masks,
+            teacher_prompt=prompt,
+        )
+        pipeline_result.dlc_raw = raw_prediction
+        detailed_caption = self._clean_caption_text(self._extract_labeled_teacher_text(raw_prediction, "DLC"))
+        detailed_completion_ids = self._encode_completion_from_caption(detailed_caption)
+        detailed_caption, detailed_completion_ids, detailed_was_truncated = self._truncate_caption_completion(
+            detailed_caption,
+            detailed_completion_ids,
+            max_tokens=self.description_max_new_tokens,
+        )
+        detailed_status = self._infer_description_status(detailed_caption)
+        if detailed_status == "ok" and not self._is_caption_content_sufficient(detailed_caption):
+            detailed_status = "truncated_caption"
+        if detailed_status != "seg_style_answer" and detailed_was_truncated:
+            detailed_status = "truncated_caption"
+        pipeline_result.detailed_caption = detailed_caption
+        pipeline_result.detailed_completion_ids = detailed_completion_ids
+        pipeline_result.detailed_status = detailed_status
+        failure_reason = self._validate_teacher_dlc(pipeline_result)
+        if failure_reason:
+            pipeline_result.detailed_failure_reason = failure_reason
+        return pipeline_result
 
     def generate_teacher_dlc_from_plan(
         self,
@@ -3305,13 +3591,11 @@ class Sa2VAOPSDModelV2(BaseModel):
         teacher_fields = dict(teacher_fields)
         teacher_fields.update(
             {
-                "primary_failure_type": pipeline_result.primary_failure_type,
-                "missing_evidence": pipeline_result.missing_evidence,
-                "emphasize_phrases": pipeline_result.emphasize_phrases,
-                "add_phrases": pipeline_result.add_phrases,
-                "localize_with": pipeline_result.localize_with,
-                "avoid_phrases": pipeline_result.avoid_phrases,
                 "detailed_caption": pipeline_result.detailed_caption,
+                "target_only_evidence": pipeline_result.target_only_evidence,
+                "distractor_only_evidence": pipeline_result.distractor_only_evidence,
+                "target_localization_hint": pipeline_result.target_localization_hint,
+                "correction_direction": pipeline_result.correction_direction,
             }
         )
         prompt = self.build_teacher_privileged_prompt_v3(
@@ -3323,7 +3607,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             gt_mask=gt_mask,
             ref_mask=ref_mask,
             teacher_fields=teacher_fields,
-            generation_mode="teacher_verification_caption",
+            generation_mode="teacher_verification_caption_from_diagnosis",
         )
         teacher_fields["teacher_verification_prompt"] = prompt
         raw_prediction = self._predict_teacher_privileged_text(
@@ -3369,26 +3653,30 @@ class Sa2VAOPSDModelV2(BaseModel):
             ],
             axis=0,
         )
-        pipeline_result = self.generate_teacher_fault_report(
-            image=image,
-            teacher_prompt_masks=teacher_prompt_masks,
-            student_question=student_question,
-            student_caption=student_caption,
-            description_status=description_status,
-            reconstruction=reconstruction,
-            iou=iou,
+        difference_context = build_teacher_regenerate_difference_context(
+            model=self,
             gt_mask=gt_mask,
             ref_mask=ref_mask,
-            teacher_fields=teacher_fields,
         )
-        pipeline_result.stop_stage = "fault_report"
-        pipeline_result.fault_report_valid, pipeline_result.fault_report_failure_reason = self.validate_teacher_fault_report(
-            pipeline_result
+        pipeline_result = self._build_empty_teacher_regenerate_pipeline_result()
+        pipeline_result.target_summary = difference_context["target_summary"]
+        pipeline_result.distractor_summary = difference_context["distractor_summary"]
+        pipeline_result.shared_evidence = difference_context["shared_evidence"]
+        pipeline_result.target_only_evidence = difference_context["target_only_evidence"]
+        pipeline_result.distractor_only_evidence = difference_context["distractor_only_evidence"]
+        pipeline_result.target_localization_hint = difference_context["target_localization_hint"]
+        pipeline_result.distractor_localization_hint = difference_context["distractor_localization_hint"]
+        pipeline_result.likely_drift_reason = difference_context["likely_drift_reason"]
+        pipeline_result.difference_context_nontrivial = bool(
+            self._teacher_field_is_effective(pipeline_result.target_only_evidence)
+            or self._teacher_field_is_effective(pipeline_result.distractor_only_evidence)
         )
-        if not pipeline_result.fault_report_valid:
+        pipeline_result.stop_stage = "difference_context"
+        if not pipeline_result.difference_context_nontrivial:
+            pipeline_result.difference_context_failure_reason = "difference_context_invalid:trivial"
             return pipeline_result
 
-        pipeline_result = self.generate_teacher_repair_plan(
+        pipeline_result = self.generate_teacher_light_diagnosis(
             image=image,
             teacher_prompt_masks=teacher_prompt_masks,
             student_question=student_question,
@@ -3401,14 +3689,14 @@ class Sa2VAOPSDModelV2(BaseModel):
             teacher_fields=teacher_fields,
             pipeline_result=pipeline_result,
         )
-        pipeline_result.stop_stage = "repair_plan"
-        pipeline_result.repair_plan_valid, pipeline_result.repair_plan_failure_reason = self.validate_teacher_repair_plan(
+        pipeline_result.stop_stage = "diagnosis"
+        pipeline_result.diagnosis_valid, pipeline_result.diagnosis_failure_reason = self.validate_teacher_light_diagnosis(
             pipeline_result
         )
-        if not pipeline_result.repair_plan_valid:
+        if not pipeline_result.diagnosis_valid:
             return pipeline_result
 
-        pipeline_result = self.generate_teacher_dlc_from_plan(
+        pipeline_result = self.generate_teacher_dlc_from_diagnosis(
             image=image,
             teacher_prompt_masks=teacher_prompt_masks,
             student_question=student_question,
@@ -3727,25 +4015,22 @@ class Sa2VAOPSDModelV2(BaseModel):
             "teacher_iou_plain": None,
             "teacher_completion_len": None,
             "caption_mode_failure": False,
-            "teacher_dual_output_parsed": False,
+            "teacher_difference_context_nontrivial": False,
+            "teacher_diagnosis_valid": False,
             "teacher_verification_caption_status": "empty",
             "teacher_verification_caption": "",
             "teacher_dlc": "",
             "teacher_verification_iou": 0.0,
-            "teacher_fault_report_valid": False,
-            "teacher_repair_plan_valid": False,
             "teacher_dlc_valid": False,
-            "teacher_primary_failure_type": "",
-            "teacher_secondary_failure_types": "",
-            "teacher_failure_confidence": "",
-            "teacher_missing_evidence": "",
-            "teacher_distractor_evidence": "",
-            "teacher_bad_phrases_in_student": "",
-            "teacher_missing_phrases_needed": "",
-            "teacher_remove_phrases": "",
-            "teacher_add_phrases": "",
-            "teacher_rewrite_strategy": "",
-            "teacher_pipeline_stop_stage": "fault_report",
+            "teacher_target_summary": "",
+            "teacher_distractor_summary": "",
+            "teacher_target_only_evidence": "",
+            "teacher_distractor_only_evidence": "",
+            "teacher_likely_drift_reason": "",
+            "teacher_caption_problem": "",
+            "teacher_correction_direction": "",
+            "teacher_reason": "",
+            "teacher_pipeline_stop_stage": "difference_context",
             "teacher_pipeline_failure_reason": "",
         }
         if not allow_teacher_ce:
@@ -3771,34 +4056,26 @@ class Sa2VAOPSDModelV2(BaseModel):
         )
         result["teacher_regenerate"] = teacher_regenerate
         result["teacher_completion_len"] = int(teacher_regenerate.detailed_completion_ids.shape[1])
-        result["teacher_dual_output_parsed"] = bool(
-            teacher_regenerate.fault_report_valid
-            and teacher_regenerate.repair_plan_valid
-            and self._teacher_field_is_effective(teacher_regenerate.detailed_caption, invalid_markers=("",))
-            and self._teacher_field_is_effective(teacher_regenerate.verification_caption, invalid_markers=("",))
-        )
+        result["teacher_difference_context_nontrivial"] = bool(teacher_regenerate.difference_context_nontrivial)
+        result["teacher_diagnosis_valid"] = bool(teacher_regenerate.diagnosis_valid)
         result["teacher_verification_caption_status"] = str(teacher_regenerate.verification_status)
         result["teacher_verification_caption"] = teacher_regenerate.verification_caption
         result["teacher_dlc"] = teacher_regenerate.detailed_caption
-        result["teacher_fault_report_valid"] = bool(teacher_regenerate.fault_report_valid)
-        result["teacher_repair_plan_valid"] = bool(teacher_regenerate.repair_plan_valid)
         result["teacher_dlc_valid"] = bool(
             teacher_regenerate.detailed_status == "ok" and not teacher_regenerate.detailed_failure_reason
         )
-        result["teacher_primary_failure_type"] = teacher_regenerate.primary_failure_type
-        result["teacher_secondary_failure_types"] = ", ".join(teacher_regenerate.secondary_failure_types)
-        result["teacher_failure_confidence"] = teacher_regenerate.failure_confidence
-        result["teacher_missing_evidence"] = teacher_regenerate.missing_evidence
-        result["teacher_distractor_evidence"] = teacher_regenerate.distractor_evidence
-        result["teacher_bad_phrases_in_student"] = teacher_regenerate.bad_phrases_in_student
-        result["teacher_missing_phrases_needed"] = teacher_regenerate.missing_phrases_needed
-        result["teacher_remove_phrases"] = teacher_regenerate.remove_phrases
-        result["teacher_add_phrases"] = teacher_regenerate.add_phrases
-        result["teacher_rewrite_strategy"] = teacher_regenerate.rewrite_strategy
+        result["teacher_target_summary"] = teacher_regenerate.target_summary
+        result["teacher_distractor_summary"] = teacher_regenerate.distractor_summary
+        result["teacher_target_only_evidence"] = teacher_regenerate.target_only_evidence
+        result["teacher_distractor_only_evidence"] = teacher_regenerate.distractor_only_evidence
+        result["teacher_likely_drift_reason"] = teacher_regenerate.likely_drift_reason
+        result["teacher_caption_problem"] = teacher_regenerate.caption_problem
+        result["teacher_correction_direction"] = teacher_regenerate.correction_direction
+        result["teacher_reason"] = teacher_regenerate.reason
         result["teacher_pipeline_stop_stage"] = teacher_regenerate.stop_stage
         result["teacher_pipeline_failure_reason"] = (
-            teacher_regenerate.fault_report_failure_reason
-            or teacher_regenerate.repair_plan_failure_reason
+            teacher_regenerate.difference_context_failure_reason
+            or teacher_regenerate.diagnosis_failure_reason
             or teacher_regenerate.detailed_failure_reason
             or teacher_regenerate.verification_failure_reason
             or ("" if teacher_regenerate.gate_passed else "teacher_gate_failed")
@@ -4640,16 +4917,11 @@ class Sa2VAOPSDModelV2(BaseModel):
         teacher_positive_gain_count = 0
         teacher_iou_gain_sum = 0.0
         teacher_regenerate_analysis_count = 0
-        teacher_regenerate_dual_output_count = 0
+        teacher_difference_context_nontrivial_count = 0
         teacher_regenerate_verification_valid_count = 0
         teacher_regenerate_verification_iou_sum = 0.0
-        teacher_fault_report_valid_count = 0
-        teacher_repair_plan_valid_count = 0
+        teacher_diagnosis_valid_count = 0
         teacher_dlc_valid_count = 0
-        teacher_fault_unknown_count = 0
-        teacher_fault_low_confidence_count = 0
-        teacher_fault_missing_evidence_nonempty_count = 0
-        teacher_fault_distractor_evidence_nonempty_count = 0
         caption_mode_failure_count = 0
         onpolicy_blocked_by_seg_style_count = 0
         grpo_blocked_by_seg_style_count = 0
@@ -4820,44 +5092,33 @@ class Sa2VAOPSDModelV2(BaseModel):
             teacher_iou_plain = teacher_analysis["teacher_iou_plain"]
             teacher_completion_len = teacher_analysis["teacher_completion_len"]
             teacher_regenerate = teacher_analysis["teacher_regenerate"]
-            teacher_dual_output_parsed = bool(teacher_analysis.get("teacher_dual_output_parsed", False))
+            teacher_difference_context_nontrivial = bool(
+                teacher_analysis.get("teacher_difference_context_nontrivial", False)
+            )
+            teacher_diagnosis_valid = bool(teacher_analysis.get("teacher_diagnosis_valid", False))
             teacher_verification_caption_status = str(teacher_analysis.get("teacher_verification_caption_status", "empty"))
             teacher_verification_caption = str(teacher_analysis.get("teacher_verification_caption", ""))
             teacher_dlc = str(teacher_analysis.get("teacher_dlc", ""))
             teacher_verification_iou = float(teacher_analysis.get("teacher_verification_iou", 0.0))
-            teacher_fault_report_valid = bool(teacher_analysis.get("teacher_fault_report_valid", False))
-            teacher_repair_plan_valid = bool(teacher_analysis.get("teacher_repair_plan_valid", False))
             teacher_dlc_valid = bool(teacher_analysis.get("teacher_dlc_valid", False))
-            teacher_primary_failure_type = str(teacher_analysis.get("teacher_primary_failure_type", ""))
-            teacher_secondary_failure_types = str(teacher_analysis.get("teacher_secondary_failure_types", ""))
-            teacher_failure_confidence = str(teacher_analysis.get("teacher_failure_confidence", ""))
-            teacher_missing_evidence = str(teacher_analysis.get("teacher_missing_evidence", ""))
-            teacher_distractor_evidence = str(teacher_analysis.get("teacher_distractor_evidence", ""))
-            teacher_bad_phrases_in_student = str(teacher_analysis.get("teacher_bad_phrases_in_student", ""))
-            teacher_missing_phrases_needed = str(teacher_analysis.get("teacher_missing_phrases_needed", ""))
-            teacher_remove_phrases = str(teacher_analysis.get("teacher_remove_phrases", ""))
-            teacher_add_phrases = str(teacher_analysis.get("teacher_add_phrases", ""))
-            teacher_rewrite_strategy = str(teacher_analysis.get("teacher_rewrite_strategy", ""))
-            teacher_pipeline_stop_stage = str(teacher_analysis.get("teacher_pipeline_stop_stage", "fault_report"))
+            teacher_target_summary = str(teacher_analysis.get("teacher_target_summary", ""))
+            teacher_distractor_summary = str(teacher_analysis.get("teacher_distractor_summary", ""))
+            teacher_target_only_evidence = str(teacher_analysis.get("teacher_target_only_evidence", ""))
+            teacher_distractor_only_evidence = str(teacher_analysis.get("teacher_distractor_only_evidence", ""))
+            teacher_likely_drift_reason = str(teacher_analysis.get("teacher_likely_drift_reason", ""))
+            teacher_caption_problem = str(teacher_analysis.get("teacher_caption_problem", ""))
+            teacher_correction_direction = str(teacher_analysis.get("teacher_correction_direction", ""))
+            teacher_reason = str(teacher_analysis.get("teacher_reason", ""))
+            teacher_pipeline_stop_stage = str(teacher_analysis.get("teacher_pipeline_stop_stage", "difference_context"))
             teacher_pipeline_failure_reason = str(teacher_analysis.get("teacher_pipeline_failure_reason", ""))
             if allow_teacher_ce:
                 teacher_regenerate_analysis_count += 1
-            if teacher_fault_report_valid:
-                teacher_fault_report_valid_count += 1
-            if teacher_repair_plan_valid:
-                teacher_repair_plan_valid_count += 1
+            if teacher_difference_context_nontrivial:
+                teacher_difference_context_nontrivial_count += 1
+            if teacher_diagnosis_valid:
+                teacher_diagnosis_valid_count += 1
             if teacher_dlc_valid:
                 teacher_dlc_valid_count += 1
-            if teacher_primary_failure_type == "unknown":
-                teacher_fault_unknown_count += 1
-            if teacher_failure_confidence == "low":
-                teacher_fault_low_confidence_count += 1
-            if self._teacher_field_is_effective(teacher_missing_evidence):
-                teacher_fault_missing_evidence_nonempty_count += 1
-            if self._teacher_field_is_effective(teacher_distractor_evidence):
-                teacher_fault_distractor_evidence_nonempty_count += 1
-            if teacher_dual_output_parsed:
-                teacher_regenerate_dual_output_count += 1
             if teacher_verification_caption_status == "ok":
                 teacher_regenerate_verification_valid_count += 1
             teacher_regenerate_verification_iou_sum += teacher_verification_iou
@@ -4905,21 +5166,20 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "teacher_gate_passed": teacher_gate_passed,
                 "teacher_iou_plain": teacher_iou_plain,
                 "teacher_completion_len": teacher_completion_len,
-                "teacher_dual_output_parsed": teacher_dual_output_parsed,
+                "teacher_difference_context_nontrivial": teacher_difference_context_nontrivial,
+                "teacher_diagnosis_valid": teacher_diagnosis_valid,
                 "teacher_verification_caption_status": teacher_verification_caption_status,
                 "teacher_verification_caption": teacher_verification_caption,
                 "teacher_verification_iou": teacher_verification_iou,
                 "teacher_dlc": teacher_dlc,
-                "primary_failure_type": teacher_primary_failure_type,
-                "secondary_failure_types": teacher_secondary_failure_types,
-                "failure_confidence": teacher_failure_confidence,
-                "missing_evidence": teacher_missing_evidence,
-                "distractor_evidence": teacher_distractor_evidence,
-                "bad_phrases_in_student": teacher_bad_phrases_in_student,
-                "missing_phrases_needed": teacher_missing_phrases_needed,
-                "remove_phrases": teacher_remove_phrases,
-                "add_phrases": teacher_add_phrases,
-                "rewrite_strategy": teacher_rewrite_strategy,
+                "target_summary": teacher_target_summary,
+                "distractor_summary": teacher_distractor_summary,
+                "target_only_evidence": teacher_target_only_evidence,
+                "distractor_only_evidence": teacher_distractor_only_evidence,
+                "likely_drift_reason": teacher_likely_drift_reason,
+                "caption_problem": teacher_caption_problem,
+                "correction_direction": teacher_correction_direction,
+                "reason": teacher_reason,
                 "teacher_pipeline_stop_stage": teacher_pipeline_stop_stage,
                 "teacher_pipeline_failure_reason": teacher_pipeline_failure_reason,
                 "raw_caption_failure_mode": description.raw_failure_mode,
@@ -5154,20 +5414,13 @@ class Sa2VAOPSDModelV2(BaseModel):
         self._cumulative_teacher_regenerate_rejected_count += teacher_regenerate_rejected_count
         self._cumulative_teacher_regenerate_verified_iou_sum += teacher_regenerate_verified_iou_sum
         self._cumulative_teacher_regenerate_analysis_count += teacher_regenerate_analysis_count
-        self._cumulative_teacher_regenerate_dual_output_count += teacher_regenerate_dual_output_count
+        self._cumulative_teacher_difference_context_nontrivial_count += (
+            teacher_difference_context_nontrivial_count
+        )
         self._cumulative_teacher_regenerate_verification_valid_count += teacher_regenerate_verification_valid_count
         self._cumulative_teacher_regenerate_verification_iou_sum += teacher_regenerate_verification_iou_sum
-        self._cumulative_teacher_fault_report_valid_count += teacher_fault_report_valid_count
-        self._cumulative_teacher_repair_plan_valid_count += teacher_repair_plan_valid_count
+        self._cumulative_teacher_diagnosis_valid_count += teacher_diagnosis_valid_count
         self._cumulative_teacher_dlc_valid_count += teacher_dlc_valid_count
-        self._cumulative_teacher_fault_unknown_count += teacher_fault_unknown_count
-        self._cumulative_teacher_fault_low_confidence_count += teacher_fault_low_confidence_count
-        self._cumulative_teacher_fault_missing_evidence_nonempty_count += (
-            teacher_fault_missing_evidence_nonempty_count
-        )
-        self._cumulative_teacher_fault_distractor_evidence_nonempty_count += (
-            teacher_fault_distractor_evidence_nonempty_count
-        )
         self._cumulative_recovery_ce_applied_count += recovery_ce_applied_count
         self._cumulative_recovery_suppressed_count += recovery_suppressed_count
         self._cumulative_scene_spill_caption_count += scene_spill_caption_count
@@ -5221,15 +5474,10 @@ class Sa2VAOPSDModelV2(BaseModel):
             "teacher_reconstruct_ok_count": teacher_reconstruct_ok_count,
             "teacher_positive_gain_count": teacher_positive_gain_count,
             "teacher_regenerate_analysis_count": teacher_regenerate_analysis_count,
-            "teacher_regenerate_dual_output_count": teacher_regenerate_dual_output_count,
+            "teacher_difference_context_nontrivial_count": teacher_difference_context_nontrivial_count,
             "teacher_regenerate_verification_valid_count": teacher_regenerate_verification_valid_count,
-            "teacher_fault_report_valid_count": teacher_fault_report_valid_count,
-            "teacher_repair_plan_valid_count": teacher_repair_plan_valid_count,
+            "teacher_diagnosis_valid_count": teacher_diagnosis_valid_count,
             "teacher_dlc_valid_count": teacher_dlc_valid_count,
-            "teacher_fault_unknown_count": teacher_fault_unknown_count,
-            "teacher_fault_low_confidence_count": teacher_fault_low_confidence_count,
-            "teacher_fault_missing_evidence_nonempty_count": teacher_fault_missing_evidence_nonempty_count,
-            "teacher_fault_distractor_evidence_nonempty_count": teacher_fault_distractor_evidence_nonempty_count,
             "caption_mode_failure_count": caption_mode_failure_count,
             "onpolicy_blocked_by_seg_style_count": onpolicy_blocked_by_seg_style_count,
             "grpo_blocked_by_seg_style_count": grpo_blocked_by_seg_style_count,
@@ -5311,8 +5559,8 @@ class Sa2VAOPSDModelV2(BaseModel):
         window_teacher_regenerate_verified_iou_mean = (
             window_totals["teacher_regenerate_verified_iou_sum"] / max(window_totals["teacher_regenerate_verified_count"], 1)
         )
-        window_teacher_regenerate_dual_output_rate = (
-            window_totals["teacher_regenerate_dual_output_count"]
+        window_teacher_difference_context_nontrivial_rate = (
+            window_totals["teacher_difference_context_nontrivial_count"]
             / max(window_totals["teacher_regenerate_analysis_count"], 1)
         )
         window_teacher_regenerate_verification_caption_valid_rate = (
@@ -5323,30 +5571,13 @@ class Sa2VAOPSDModelV2(BaseModel):
             window_totals["teacher_regenerate_verification_iou_sum"]
             / max(window_totals["teacher_regenerate_analysis_count"], 1)
         )
-        window_teacher_fault_report_valid_rate = (
-            window_totals["teacher_fault_report_valid_count"] / max(window_totals["teacher_regenerate_analysis_count"], 1)
-        )
-        window_teacher_repair_plan_valid_rate = (
-            window_totals["teacher_repair_plan_valid_count"] / max(window_totals["teacher_regenerate_analysis_count"], 1)
+        window_teacher_diagnosis_valid_rate = (
+            window_totals["teacher_diagnosis_valid_count"] / max(window_totals["teacher_regenerate_analysis_count"], 1)
         )
         window_teacher_dlc_valid_rate = (
             window_totals["teacher_dlc_valid_count"] / max(window_totals["teacher_regenerate_analysis_count"], 1)
         )
         window_teacher_verification_gate_pass_rate = window_teacher_regenerate_gate_pass_rate
-        window_teacher_fault_unknown_rate = (
-            window_totals["teacher_fault_unknown_count"] / max(window_totals["teacher_regenerate_analysis_count"], 1)
-        )
-        window_teacher_fault_low_confidence_rate = (
-            window_totals["teacher_fault_low_confidence_count"] / max(window_totals["teacher_regenerate_analysis_count"], 1)
-        )
-        window_teacher_fault_missing_evidence_nonempty_rate = (
-            window_totals["teacher_fault_missing_evidence_nonempty_count"]
-            / max(window_totals["teacher_regenerate_analysis_count"], 1)
-        )
-        window_teacher_fault_distractor_evidence_nonempty_rate = (
-            window_totals["teacher_fault_distractor_evidence_nonempty_count"]
-            / max(window_totals["teacher_regenerate_analysis_count"], 1)
-        )
         window_loss_opsd_total = window_totals["total_loss_sum"] / window_loss_count
         window_regen_ce = window_totals["regen_ce_sum"] / max(window_totals["regen_loss_count"], 1)
         window_onpolicy_jsd = window_totals["onpolicy_jsd_sum"] / max(window_totals["onpolicy_loss_count"], 1)
@@ -5434,8 +5665,8 @@ class Sa2VAOPSDModelV2(BaseModel):
             self._cumulative_teacher_regenerate_verified_iou_sum
             / max(self._cumulative_teacher_regenerate_verified_count, 1)
         )
-        cumulative_teacher_regenerate_dual_output_rate = (
-            self._cumulative_teacher_regenerate_dual_output_count
+        cumulative_teacher_difference_context_nontrivial_rate = (
+            self._cumulative_teacher_difference_context_nontrivial_count
             / max(self._cumulative_teacher_regenerate_analysis_count, 1)
         )
         cumulative_teacher_regenerate_verification_caption_valid_rate = (
@@ -5446,12 +5677,8 @@ class Sa2VAOPSDModelV2(BaseModel):
             self._cumulative_teacher_regenerate_verification_iou_sum
             / max(self._cumulative_teacher_regenerate_analysis_count, 1)
         )
-        cumulative_teacher_fault_report_valid_rate = (
-            self._cumulative_teacher_fault_report_valid_count
-            / max(self._cumulative_teacher_regenerate_analysis_count, 1)
-        )
-        cumulative_teacher_repair_plan_valid_rate = (
-            self._cumulative_teacher_repair_plan_valid_count
+        cumulative_teacher_diagnosis_valid_rate = (
+            self._cumulative_teacher_diagnosis_valid_count
             / max(self._cumulative_teacher_regenerate_analysis_count, 1)
         )
         cumulative_teacher_dlc_valid_rate = (
@@ -5521,8 +5748,8 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "teacher_regenerate_verified_iou_mean": self._metric_tensor(
                     window_teacher_regenerate_verified_iou_mean, zero.dtype
                 ),
-                "teacher_regenerate_dual_output_rate": self._metric_tensor(
-                    window_teacher_regenerate_dual_output_rate, zero.dtype
+                "teacher_difference_context_nontrivial_rate": self._metric_tensor(
+                    window_teacher_difference_context_nontrivial_rate, zero.dtype
                 ),
                 "teacher_regenerate_verification_caption_valid_rate": self._metric_tensor(
                     window_teacher_regenerate_verification_caption_valid_rate, zero.dtype
@@ -5530,11 +5757,8 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "teacher_regenerate_verification_iou_mean": self._metric_tensor(
                     window_teacher_regenerate_verification_iou_mean, zero.dtype
                 ),
-                "teacher_fault_report_valid_rate": self._metric_tensor(
-                    window_teacher_fault_report_valid_rate, zero.dtype
-                ),
-                "teacher_repair_plan_valid_rate": self._metric_tensor(
-                    window_teacher_repair_plan_valid_rate, zero.dtype
+                "teacher_diagnosis_valid_rate": self._metric_tensor(
+                    window_teacher_diagnosis_valid_rate, zero.dtype
                 ),
                 "teacher_dlc_valid_rate": self._metric_tensor(window_teacher_dlc_valid_rate, zero.dtype),
                 "teacher_verification_caption_valid_rate": self._metric_tensor(
@@ -5542,16 +5766,6 @@ class Sa2VAOPSDModelV2(BaseModel):
                 ),
                 "teacher_verification_gate_pass_rate": self._metric_tensor(
                     window_teacher_verification_gate_pass_rate, zero.dtype
-                ),
-                "teacher_fault_unknown_rate": self._metric_tensor(window_teacher_fault_unknown_rate, zero.dtype),
-                "teacher_fault_low_confidence_rate": self._metric_tensor(
-                    window_teacher_fault_low_confidence_rate, zero.dtype
-                ),
-                "teacher_fault_missing_evidence_nonempty_rate": self._metric_tensor(
-                    window_teacher_fault_missing_evidence_nonempty_rate, zero.dtype
-                ),
-                "teacher_fault_distractor_evidence_nonempty_rate": self._metric_tensor(
-                    window_teacher_fault_distractor_evidence_nonempty_rate, zero.dtype
                 ),
                 "teacher_regenerate_dlc_ce_applied_count": self._metric_tensor(
                     window_totals["teacher_regenerate_ce_applied_count"], zero.dtype
@@ -5614,17 +5828,16 @@ class Sa2VAOPSDModelV2(BaseModel):
                     f"teacher_regen_verified_iou_mean={batch_teacher_regenerate_verified_iou_mean:.4f} "
                     f"teacher_regenerate_ce_applied={teacher_regenerate_ce_applied_count} "
                     f"teacher_regenerate_suppressed={teacher_regenerate_suppressed_count} "
-                    f"window_teacher_regenerate_dual_output_rate={window_teacher_regenerate_dual_output_rate:.4f} "
+                    f"window_teacher_difference_context_nontrivial_rate={window_teacher_difference_context_nontrivial_rate:.4f} "
                     f"window_teacher_regenerate_verification_caption_valid_rate={window_teacher_regenerate_verification_caption_valid_rate:.4f} "
                     f"window_teacher_regenerate_verification_iou_mean={window_teacher_regenerate_verification_iou_mean:.4f} "
-                    f"window_teacher_fault_report_valid_rate={window_teacher_fault_report_valid_rate:.4f} "
-                    f"window_teacher_repair_plan_valid_rate={window_teacher_repair_plan_valid_rate:.4f} "
+                    f"window_teacher_diagnosis_valid_rate={window_teacher_diagnosis_valid_rate:.4f} "
                     f"window_teacher_dlc_valid_rate={window_teacher_dlc_valid_rate:.4f} "
                     f"window_teacher_verification_gate_pass_rate={window_teacher_verification_gate_pass_rate:.4f} "
-                    f"window_teacher_fault_unknown_rate={window_teacher_fault_unknown_rate:.4f} "
-                    f"window_teacher_fault_low_confidence_rate={window_teacher_fault_low_confidence_rate:.4f} "
-                    f"window_teacher_fault_missing_evidence_nonempty_rate={window_teacher_fault_missing_evidence_nonempty_rate:.4f} "
-                    f"window_teacher_fault_distractor_evidence_nonempty_rate={window_teacher_fault_distractor_evidence_nonempty_rate:.4f} "
+                    f"0.0={0.0:.4f} "
+                    f"0.0={0.0:.4f} "
+                    f"0.0={0.0:.4f} "
+                    f"0.0={0.0:.4f} "
                     f"window_avg_caption_tokens={window_avg_caption_tokens:.2f} "
                     f"window_caption_seg_style_rate_raw={window_caption_seg_style_rate_raw:.4f} "
                     f"window_caption_mode_failure_rate={window_caption_mode_failure_rate:.4f} "
@@ -5632,11 +5845,10 @@ class Sa2VAOPSDModelV2(BaseModel):
                     f"window_grpo_blocked_by_seg_style_count={window_totals['grpo_blocked_by_seg_style_count']} "
                     f"window_teacher_recovery_seg_style_count={window_totals['teacher_recovery_seg_style_count']} "
                     f"window_teacher_recovery_seg_style_success_count={window_totals['teacher_recovery_seg_style_success_count']} "
-                    f"cumulative_teacher_regenerate_dual_output_rate={cumulative_teacher_regenerate_dual_output_rate:.4f} "
+                    f"cumulative_teacher_difference_context_nontrivial_rate={cumulative_teacher_difference_context_nontrivial_rate:.4f} "
                     f"cumulative_teacher_regenerate_verification_caption_valid_rate={cumulative_teacher_regenerate_verification_caption_valid_rate:.4f} "
                     f"cumulative_teacher_regenerate_verification_iou_mean={cumulative_teacher_regenerate_verification_iou_mean:.4f} "
-                    f"cumulative_teacher_fault_report_valid_rate={cumulative_teacher_fault_report_valid_rate:.4f} "
-                    f"cumulative_teacher_repair_plan_valid_rate={cumulative_teacher_repair_plan_valid_rate:.4f} "
+                    f"cumulative_teacher_diagnosis_valid_rate={cumulative_teacher_diagnosis_valid_rate:.4f} "
                     f"cumulative_teacher_dlc_valid_rate={cumulative_teacher_dlc_valid_rate:.4f} "
                     f"cumulative_teacher_verification_caption_valid_rate={cumulative_teacher_verification_caption_valid_rate:.4f} "
                     f"cumulative_teacher_verification_gate_pass_rate={cumulative_teacher_verification_gate_pass_rate:.4f} "
@@ -5669,17 +5881,16 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"teacher_regen_verified_iou_mean={batch_teacher_regenerate_verified_iou_mean:.4f} "
                 f"teacher_regenerate_ce_applied={teacher_regenerate_ce_applied_count} "
                 f"teacher_regenerate_suppressed={teacher_regenerate_suppressed_count} "
-                f"window_teacher_regenerate_dual_output_rate={window_teacher_regenerate_dual_output_rate:.4f} "
+                f"window_teacher_difference_context_nontrivial_rate={window_teacher_difference_context_nontrivial_rate:.4f} "
                 f"window_teacher_regenerate_verification_caption_valid_rate={window_teacher_regenerate_verification_caption_valid_rate:.4f} "
                 f"window_teacher_regenerate_verification_iou_mean={window_teacher_regenerate_verification_iou_mean:.4f} "
-                f"window_teacher_fault_report_valid_rate={window_teacher_fault_report_valid_rate:.4f} "
-                f"window_teacher_repair_plan_valid_rate={window_teacher_repair_plan_valid_rate:.4f} "
+                f"window_teacher_diagnosis_valid_rate={window_teacher_diagnosis_valid_rate:.4f} "
                 f"window_teacher_dlc_valid_rate={window_teacher_dlc_valid_rate:.4f} "
                 f"window_teacher_verification_gate_pass_rate={window_teacher_verification_gate_pass_rate:.4f} "
-                f"window_teacher_fault_unknown_rate={window_teacher_fault_unknown_rate:.4f} "
-                f"window_teacher_fault_low_confidence_rate={window_teacher_fault_low_confidence_rate:.4f} "
-                f"window_teacher_fault_missing_evidence_nonempty_rate={window_teacher_fault_missing_evidence_nonempty_rate:.4f} "
-                f"window_teacher_fault_distractor_evidence_nonempty_rate={window_teacher_fault_distractor_evidence_nonempty_rate:.4f} "
+                f"0.0={0.0:.4f} "
+                f"0.0={0.0:.4f} "
+                f"0.0={0.0:.4f} "
+                f"0.0={0.0:.4f} "
                 f"window_avg_caption_tokens={window_avg_caption_tokens:.2f} "
                 f"window_caption_seg_style_rate_raw={window_caption_seg_style_rate_raw:.4f} "
                 f"window_caption_mode_failure_rate={window_caption_mode_failure_rate:.4f} "
@@ -5687,11 +5898,10 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"window_grpo_blocked_by_seg_style_count={window_totals['grpo_blocked_by_seg_style_count']} "
                 f"window_teacher_recovery_seg_style_count={window_totals['teacher_recovery_seg_style_count']} "
                 f"window_teacher_recovery_seg_style_success_count={window_totals['teacher_recovery_seg_style_success_count']} "
-                f"cumulative_teacher_regenerate_dual_output_rate={cumulative_teacher_regenerate_dual_output_rate:.4f} "
+                f"cumulative_teacher_difference_context_nontrivial_rate={cumulative_teacher_difference_context_nontrivial_rate:.4f} "
                 f"cumulative_teacher_regenerate_verification_caption_valid_rate={cumulative_teacher_regenerate_verification_caption_valid_rate:.4f} "
                 f"cumulative_teacher_regenerate_verification_iou_mean={cumulative_teacher_regenerate_verification_iou_mean:.4f} "
-                f"cumulative_teacher_fault_report_valid_rate={cumulative_teacher_fault_report_valid_rate:.4f} "
-                f"cumulative_teacher_repair_plan_valid_rate={cumulative_teacher_repair_plan_valid_rate:.4f} "
+                f"cumulative_teacher_diagnosis_valid_rate={cumulative_teacher_diagnosis_valid_rate:.4f} "
                 f"cumulative_teacher_dlc_valid_rate={cumulative_teacher_dlc_valid_rate:.4f} "
                 f"cumulative_teacher_verification_caption_valid_rate={cumulative_teacher_verification_caption_valid_rate:.4f} "
                 f"cumulative_teacher_verification_gate_pass_rate={cumulative_teacher_verification_gate_pass_rate:.4f} "
@@ -5771,8 +5981,8 @@ class Sa2VAOPSDModelV2(BaseModel):
             "teacher_regenerate_verified_iou_mean": self._metric_tensor(
                 window_teacher_regenerate_verified_iou_mean, avg_total_loss.dtype
             ),
-            "teacher_regenerate_dual_output_rate": self._metric_tensor(
-                window_teacher_regenerate_dual_output_rate, avg_total_loss.dtype
+            "teacher_difference_context_nontrivial_rate": self._metric_tensor(
+                window_teacher_difference_context_nontrivial_rate, avg_total_loss.dtype
             ),
             "teacher_regenerate_verification_caption_valid_rate": self._metric_tensor(
                 window_teacher_regenerate_verification_caption_valid_rate, avg_total_loss.dtype
@@ -5780,11 +5990,8 @@ class Sa2VAOPSDModelV2(BaseModel):
             "teacher_regenerate_verification_iou_mean": self._metric_tensor(
                 window_teacher_regenerate_verification_iou_mean, avg_total_loss.dtype
             ),
-            "teacher_fault_report_valid_rate": self._metric_tensor(
-                window_teacher_fault_report_valid_rate, avg_total_loss.dtype
-            ),
-            "teacher_repair_plan_valid_rate": self._metric_tensor(
-                window_teacher_repair_plan_valid_rate, avg_total_loss.dtype
+            "teacher_diagnosis_valid_rate": self._metric_tensor(
+                window_teacher_diagnosis_valid_rate, avg_total_loss.dtype
             ),
             "teacher_dlc_valid_rate": self._metric_tensor(window_teacher_dlc_valid_rate, avg_total_loss.dtype),
             "teacher_verification_caption_valid_rate": self._metric_tensor(
@@ -5792,18 +5999,6 @@ class Sa2VAOPSDModelV2(BaseModel):
             ),
             "teacher_verification_gate_pass_rate": self._metric_tensor(
                 window_teacher_verification_gate_pass_rate, avg_total_loss.dtype
-            ),
-            "teacher_fault_unknown_rate": self._metric_tensor(
-                window_teacher_fault_unknown_rate, avg_total_loss.dtype
-            ),
-            "teacher_fault_low_confidence_rate": self._metric_tensor(
-                window_teacher_fault_low_confidence_rate, avg_total_loss.dtype
-            ),
-            "teacher_fault_missing_evidence_nonempty_rate": self._metric_tensor(
-                window_teacher_fault_missing_evidence_nonempty_rate, avg_total_loss.dtype
-            ),
-            "teacher_fault_distractor_evidence_nonempty_rate": self._metric_tensor(
-                window_teacher_fault_distractor_evidence_nonempty_rate, avg_total_loss.dtype
             ),
             "teacher_regenerate_dlc_ce_applied_count": self._metric_tensor(
                 window_totals["teacher_regenerate_ce_applied_count"], avg_total_loss.dtype

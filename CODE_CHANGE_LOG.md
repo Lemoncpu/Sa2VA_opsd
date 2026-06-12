@@ -353,3 +353,55 @@
 - A later cleanup removed `_mask_summary()` from `projects/sa2va/models/sa2va_opsd_v2.py`, but `projects/sa2va/evaluation/teacher_diagnosis_common.py` still calls `model._mask_summary(...)` while building teacher privileged relation context.
 - This caused teacher regenerate to fail immediately at fault-report prompt construction with `AttributeError: 'Sa2VAOPSDModelV3' object has no attribute '_mask_summary'`.
 - Restored `_mask_summary()` as a compatibility helper because it remains part of the active teacher diagnosis call chain.
+
+### Third Follow-up Fix
+- After the four-stage pipeline started running, logs showed every teacher sample stopping at `fault_report`, with common failures `missing_ref_summary` and `missing_evidence_for_failure`.
+- Root cause: the first-stage fault report prompt was too verbose and the parser was too brittle for real model outputs, so labels could bleed into the next field and many required fields came back empty.
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py` to:
+  - parse fault-report fields with a multi-label section parser instead of one-label-at-a-time extraction
+  - shorten and harden the fault-report prompt with explicit single-line field formatting
+  - backfill missing fault-report fields from mask relation context and the student caption so stage 1 does not collapse when the teacher output is partially structured
+
+## 2026-06-12 Teacher Regenerate Difference-Driven Compression Migration
+
+### Problem
+- The four-stage `fault_report -> repair_plan -> DLC -> verification` teacher regenerate pipeline stayed structurally valid in code but failed almost entirely in real training, with the teacher stopping at the first structured stage and never producing useful regenerate CE targets.
+- The main training path still depended on heavy schema fields that the teacher did not follow reliably, so teacher regenerate observability improved while actual teacher utility regressed.
+
+### Root Cause Notes
+- The teacher was being asked to do too much structure induction itself: compare masks, classify failure types, fill phrase-level repair forms, then write captions.
+- Even after parser hardening, the first structured stage remained the bottleneck because the model interface was mismatched to the task.
+- The old historically successful version used a much lighter diagnosis interface, so the current main path had drifted away from the most robust teacher behavior.
+
+### Chosen Fix Direction
+- Keep the long DLC target and separate verification caption gate text, but move mask comparison back to the program side.
+- Introduce a difference-driven natural-language compression layer that summarizes `gtmask` vs `refmask` as `target/distractor/shared/target-only/distractor-only` evidence plus localization hints.
+- Replace the heavy main-path teacher schema with a light three-field diagnosis:
+  - `CAPTION_PROBLEM`
+  - `CORRECTION_DIRECTION`
+  - `REASON`
+
+### Rejected Direction
+- Do not continue expanding the four-stage fault-report and repair-plan schema in the training main path. Logs already showed that more structure was decreasing teacher usability.
+- Do not revert the DLC target back to short RefCOCO expressions. Keep the training target as DLC and only make the gate text verifier-friendly.
+
+### Implemented Changes
+- Updated `projects/sa2va/evaluation/teacher_diagnosis_common.py`:
+  - added `build_teacher_regenerate_difference_context(...)`
+  - compressed mask relation information into `target_summary`, `distractor_summary`, `shared_evidence`, `target_only_evidence`, `distractor_only_evidence`, localization hints, and a template-built `likely_drift_reason`
+  - added a de-homogenization guard so target/distractor summaries are not left identical when unique evidence exists
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py`:
+  - redefined the active `TeacherRegeneratePipelineResult` around difference context, lightweight diagnosis, DLC, and verification caption
+  - added `generate_teacher_light_diagnosis(...)` and `validate_teacher_light_diagnosis(...)`
+  - switched the active regenerate pipeline to:
+    1. program-side difference compression
+    2. teacher lightweight diagnosis
+    3. teacher DLC generation
+    4. teacher verification caption generation
+    5. verification-caption reconstruction gate
+  - changed DLC validation to penalize distractor-heavy overlap and require target-only evidence when available
+  - changed verification validation to require shorter verifier text, preserve target-only evidence, and reject distractor overlap
+  - updated debug sample logging, rolling metrics, and cumulative log-only stats to report the new difference/diagnosis fields instead of the overloaded fault-report/repair-plan counters
+
+### Compatibility Note
+- Legacy heavy fault-report and repair-plan helper functions are still present temporarily for compatibility, but the training main path no longer depends on them.
