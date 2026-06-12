@@ -524,3 +524,37 @@
   - add stronger asymmetric difference descriptors based on relative size and relative location
   - enrich `target_only_evidence` / `distractor_only_evidence` with area contrast and offset wording so the two sides are less likely to collapse into the same sentence template
 - The goal of this patch is to move the regenerate pipeline past `diagnosis_invalid:missing_reason` and reduce near-identical target/distractor evidence text.
+
+## 2026-06-12 Teacher Regenerate Three-Stage Diagnosis Refactor
+
+### Problem
+- The active teacher regenerate path still used a single diagnosis stage in training, even though staged prompts and helpers had already been added.
+- After tightening `REASON` grounding, logs showed diagnosis first failing at `missing_reason`, then collapsing further to `missing_caption_problem`, which meant later constraints were starving the earlier problem-identification behavior.
+
+### Root Cause Notes
+- `run_teacher_regenerate_pipeline(...)` still called the legacy `generate_teacher_light_diagnosis(...)` path, so the real training chain never enforced the intended `problem -> direction -> reason` order.
+- Diagnosis metrics and failure reasons were still aggregated too coarsely, which hid which stage actually failed.
+- Because all diagnosis duties were effectively still coupled, stronger `reason` constraints could suppress `caption_problem` output instead of only affecting the final explanation stage.
+
+### Chosen Fix Direction
+- Rewire the active teacher regenerate pipeline to a strict staged sequence:
+  1. `problem`
+  2. `direction`
+  3. `reason`
+  4. `dlc`
+  5. `verification`
+  6. `gate`
+- Stop immediately when a stage fails and report the stage-specific failure reason in both logs and metrics.
+- Keep DLC target supervision, verification-caption gating, teacher gate formula, student main caption path, on-policy, and GRPO unchanged.
+
+### Rejected Direction
+- Do not keep stretching the old single diagnosis prompt with more constraints or fallback text. That design was exactly what made `caption_problem` and `reason` compete with each other.
+- Do not add permissive fallback-continue behavior across failed diagnosis stages in this patch. The current priority is observability and stage separation.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py`:
+  - switched `run_teacher_regenerate_pipeline(...)` to strict `problem -> direction -> reason` execution before DLC generation
+  - propagated `problem_valid`, `direction_valid`, `reason_valid`, and their failure reasons through `TeacherRegeneratePipelineResult`
+  - updated teacher regenerate analysis export so per-sample records now carry staged validity flags
+  - added rolling and cumulative diagnostics for three-stage diagnosis, including stage valid rates, primary-target cue hit rates, and `teacher_reason_coarse_rate`
+  - updated main logs and pre-return debug output to print staged validity alongside `teacher_caption_problem`, `teacher_correction_direction`, `teacher_reason`, `teacher_dlc`, and `teacher_verification_caption`
