@@ -570,3 +570,13 @@
   - `teacher_direction_raw`
   - `teacher_reason_raw`
 - These raw fields are exported through teacher analysis, included in per-sample debug records, and printed in the main training log so future diagnosis can distinguish generation failure from parsing failure.
+
+### Follow-up Simplification For Three-Stage Natural-Language Outputs
+- The new raw-output logs showed that the teacher was already generating meaningful natural-language diagnosis sentences in stage 1, but not in the strict `CAPTION_PROBLEM:` schema expected by the parser.
+- That meant the actual failure was no longer teacher generation quality, but a format mismatch between staged prompts and parser assumptions.
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py` so the active three-stage prompts no longer require `CAPTION_PROBLEM:`, `CORRECTION_DIRECTION:`, or `REASON:` labels from the teacher.
+- Each stage now asks for exactly one natural-language sentence, and the pipeline stores the raw sentence directly as:
+  - `caption_problem`
+  - `correction_direction`
+  - `reason`
+- The later DLC prompt still receives those three fields as program-side structured context, so regeneration remains explicitly conditioned on the staged diagnosis without requiring the teacher to emit schema-formatted labels.

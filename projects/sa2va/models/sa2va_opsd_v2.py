@@ -3367,13 +3367,12 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"Secondary distractor cue: {teacher_fields.get('secondary_distractor_cue', '')}\n"
                 f"Cue conflict summary: {teacher_fields.get('cue_conflict_summary', '')}\n"
                 "Identify only the concrete caption problem. Do not generate a fix or a reason.\n"
-                "Output exactly 1 line and nothing else:\n"
-                "CAPTION_PROBLEM:\n"
+                "Output exactly one natural-language sentence and nothing else.\n"
                 "Rules:\n"
-                "- CAPTION_PROBLEM must say which target-specific feature, local cue, or target-vs-distractor distinction the failed caption does not express.\n"
-                "- CAPTION_PROBLEM must prioritize Primary target cue and may also use Secondary target cue.\n"
-                "- CAPTION_PROBLEM must not give a fix and must not explain why.\n"
-                "- CAPTION_PROBLEM must not stop at broad area, left, right, top, or bottom alone.\n"
+                "- The sentence must say which target-specific feature, local cue, or target-vs-distractor distinction the failed caption does not express.\n"
+                "- The sentence must prioritize Primary target cue and may also use Secondary target cue.\n"
+                "- The sentence must not give a fix and must not explain why.\n"
+                "- The sentence must not stop at broad area, left, right, top, or bottom alone.\n"
                 "- Do not output bullets, markdown, extra labels, analysis preambles, or [SEG]."
             )
         elif generation_mode == "teacher_correction_direction":
@@ -3389,12 +3388,11 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"Primary distractor cue: {teacher_fields.get('primary_distractor_cue', '')}\n"
                 f"Cue conflict summary: {teacher_fields.get('cue_conflict_summary', '')}\n"
                 "Generate only the correction direction. Do not restate the problem and do not explain why.\n"
-                "Output exactly 1 line and nothing else:\n"
-                "CORRECTION_DIRECTION:\n"
+                "Output exactly one natural-language sentence and nothing else.\n"
                 "Rules:\n"
-                "- CORRECTION_DIRECTION must say what target cue should be strengthened.\n"
-                "- If a distractor cue exists, CORRECTION_DIRECTION must also say what distractor-compatible wording should be avoided, suppressed, or separated.\n"
-                "- CORRECTION_DIRECTION must not stop at Strengthen target-only evidence.\n"
+                "- The sentence must say what target cue should be strengthened.\n"
+                "- If a distractor cue exists, the sentence must also say what distractor-compatible wording should be avoided, suppressed, or separated.\n"
+                "- The sentence must not stop at Strengthen target-only evidence.\n"
                 "- Do not output bullets, markdown, extra labels, analysis preambles, or [SEG]."
             )
         elif generation_mode == "teacher_reason_explanation":
@@ -3412,12 +3410,11 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"Cue conflict summary: {teacher_fields.get('cue_conflict_summary', '')}\n"
                 f"Likely drift reason: {teacher_fields.get('likely_drift_reason', '')}\n"
                 "Explain only why the failed caption drifts and why the correction direction is needed.\n"
-                "Output exactly 1 line and nothing else:\n"
-                "REASON:\n"
+                "Output exactly one natural-language sentence and nothing else.\n"
                 "Rules:\n"
-                "- REASON must explain why the failed caption misses the Primary target cue.\n"
-                "- REASON must explain why the failed caption still fits the Primary distractor cue when it exists.\n"
-                "- REASON must use finer-grained cues and must not stop at broad area, left, right, top, or bottom alone.\n"
+                "- The sentence must explain why the failed caption misses the Primary target cue.\n"
+                "- The sentence must explain why the failed caption still fits the Primary distractor cue when it exists.\n"
+                "- The sentence must use finer-grained cues and must not stop at broad area, left, right, top, or bottom alone.\n"
                 "- Prefer the sentence shape: The caption misses ... so it does not isolate the target; it still fits ... which pulls reconstruction toward the distractor.\n"
                 "- Do not output bullets, markdown, extra labels, analysis preambles, or [SEG]."
             )
@@ -3785,8 +3782,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             teacher_prompt=prompt,
         )
         pipeline_result.problem_raw = raw_prediction
-        sections = self._parse_teacher_labeled_sections(raw_prediction, self._teacher_problem_labels())
-        pipeline_result.caption_problem = self._normalize_teacher_field_text(sections.get("CAPTION_PROBLEM", ""))
+        pipeline_result.caption_problem = self._normalize_teacher_field_text(raw_prediction)
         return pipeline_result
 
     def generate_teacher_correction_direction(
@@ -3837,10 +3833,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             teacher_prompt=prompt,
         )
         pipeline_result.direction_raw = raw_prediction
-        sections = self._parse_teacher_labeled_sections(raw_prediction, self._teacher_direction_labels())
-        pipeline_result.correction_direction = self._normalize_teacher_field_text(
-            sections.get("CORRECTION_DIRECTION", "")
-        )
+        pipeline_result.correction_direction = self._normalize_teacher_field_text(raw_prediction)
         return pipeline_result
 
     def generate_teacher_reason_explanation(
@@ -3893,8 +3886,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             teacher_prompt=prompt,
         )
         pipeline_result.reason_raw = raw_prediction
-        sections = self._parse_teacher_labeled_sections(raw_prediction, self._teacher_reason_labels())
-        pipeline_result.reason = self._normalize_teacher_field_text(sections.get("REASON", ""))
+        pipeline_result.reason = self._normalize_teacher_field_text(raw_prediction)
         pipeline_result.reason_is_coarse = self._teacher_reason_is_coarse(pipeline_result.reason)
         return pipeline_result
 
