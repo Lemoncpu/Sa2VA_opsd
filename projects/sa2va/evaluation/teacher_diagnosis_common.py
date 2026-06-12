@@ -134,6 +134,54 @@ def _mask_extent_text(mask):
     return f"a {size} on the {horiz} in the {vert}"
 
 
+def _mask_area_label(mask):
+    mask = np.asarray(mask).astype(np.uint8)
+    if mask.ndim != 2:
+        return "tiny"
+    area_ratio = float((mask > 0).sum()) / float(max(mask.shape[0] * mask.shape[1], 1))
+    if area_ratio < 0.01:
+        return "tiny"
+    if area_ratio < 0.04:
+        return "small"
+    if area_ratio < 0.12:
+        return "medium-sized"
+    return "large"
+
+
+def _mask_axis_label(mask):
+    mask = np.asarray(mask).astype(np.uint8)
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0 or len(ys) == 0:
+        return ("unknown", "unknown")
+    h, w = mask.shape
+    cx = float(xs.mean()) / max(w, 1)
+    cy = float(ys.mean()) / max(h, 1)
+    horiz = "left" if cx < 0.4 else "right" if cx > 0.6 else "center"
+    vert = "top" if cy < 0.4 else "bottom" if cy > 0.6 else "middle"
+    return horiz, vert
+
+
+def _contrast_location_text(primary_mask, reference_mask, primary_name):
+    primary_h, primary_v = _mask_axis_label(primary_mask)
+    ref_h, ref_v = _mask_axis_label(reference_mask)
+    parts = []
+    if primary_h != "unknown" and ref_h != "unknown" and primary_h != ref_h:
+        parts.append(f"more to the {primary_h} than the competing region")
+    if primary_v != "unknown" and ref_v != "unknown" and primary_v != ref_v:
+        parts.append(f"higher toward the {primary_v}" if primary_v == "top" else f"lower toward the {primary_v}" if primary_v == "bottom" else "closer to the vertical middle")
+    if not parts:
+        return f"{primary_name} differs by a subtle local offset"
+    return f"{primary_name} is " + " and ".join(parts)
+
+
+def _contrast_area_text(primary_mask, reference_mask, primary_name):
+    primary_area = _mask_area_label(primary_mask)
+    ref_area = _mask_area_label(reference_mask)
+    if primary_area == ref_area:
+        return f"{primary_name} keeps a similar overall size but changes a local part"
+    return f"{primary_name} is {primary_area} while the competing region is {ref_area}"
+
+
 def _describe_difference_evidence(mask, spatial_hint):
     spatial_hint = _normalize_relation_text(spatial_hint)
     extent_text = _mask_extent_text(mask)
@@ -161,12 +209,20 @@ def build_teacher_regenerate_difference_context(*, model, gt_mask, ref_mask):
     gt_only = np.logical_and(gt_mask > 0, ref_mask == 0).astype(np.uint8)
     ref_only = np.logical_and(ref_mask > 0, gt_mask == 0).astype(np.uint8)
     target_only_evidence = (
-        _describe_difference_evidence(gt_only, target_localization_hint)
+        (
+            f"{_describe_difference_evidence(gt_only, target_localization_hint)}; "
+            f"{_contrast_area_text(gt_only, ref_only, 'the target-only region')}; "
+            f"{_contrast_location_text(gt_only, ref_only, 'the target-only region')}"
+        )
         if _is_effective_relation_text(target_only_raw)
         else "none"
     )
     distractor_only_evidence = (
-        _describe_difference_evidence(ref_only, distractor_localization_hint)
+        (
+            f"{_describe_difference_evidence(ref_only, distractor_localization_hint)}; "
+            f"{_contrast_area_text(ref_only, gt_only, 'the distractor-only region')}; "
+            f"{_contrast_location_text(ref_only, gt_only, 'the distractor-only region')}"
+        )
         if _is_effective_relation_text(distractor_only_raw)
         else "none"
     )

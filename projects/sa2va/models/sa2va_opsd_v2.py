@@ -1621,6 +1621,10 @@ class Sa2VAOPSDModelV2(BaseModel):
             "middle height",
             "broad area",
             "small patch",
+            "local offset",
+            "size contrast",
+            "target-only cue",
+            "distractor-only cue",
             "target-specific",
             "distractor",
             "target-only",
@@ -1658,6 +1662,11 @@ class Sa2VAOPSDModelV2(BaseModel):
             sections.get("CORRECTION_DIRECTION", "")
         )
         result.reason = self._normalize_teacher_field_text(sections.get("REASON", ""))
+        if not result.reason and "reason" in result.correction_direction.lower():
+            split_match = re.match(r"(?is)(.*?)(?:\bREASON\b[:\s-]+)(.+)", result.correction_direction)
+            if split_match:
+                result.correction_direction = self._normalize_teacher_field_text(split_match.group(1))
+                result.reason = self._normalize_teacher_field_text(split_match.group(2))
         return result
 
     def validate_teacher_light_diagnosis(self, result):
@@ -3098,7 +3107,12 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "Rules:\n"
                 "- CAPTION_PROBLEM must state the main way the student caption drifts away from the target.\n"
                 "- CORRECTION_DIRECTION must say whether to strengthen target-only evidence, suppress distractor-only evidence, or both.\n"
-                "- REASON must explicitly use target-only evidence or distractor-only evidence from the provided context.\n"
+                "- REASON must be exactly one complete sentence, not a fragment.\n"
+                "- REASON must explicitly mention target-only evidence or distractor-only evidence from the provided context.\n"
+                "- REASON must include at least one concrete cue such as left, right, top, bottom, center, small patch, broad area, local offset, or size contrast.\n"
+                "- If target-only evidence matters more, start REASON with: REASON: The target-only cue matters because ...\n"
+                "- If distractor-only evidence matters more, start REASON with: REASON: The distractor-only cue matters because ...\n"
+                "- Never leave REASON blank. Never output just the label word REASON inside another field.\n"
                 "- Do not output bullets, markdown, extra labels, analysis preambles, or [SEG]."
             )
         elif generation_mode == "teacher_dlc_from_diagnosis":

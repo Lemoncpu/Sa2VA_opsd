@@ -433,3 +433,16 @@
   - `teacher_correction_direction`
   - `teacher_reason`
 - If future remote logs still show `0.0=0.0000`, that indicates the server is running an older synced copy rather than the current workspace version.
+
+### Follow-up Fix For Empty / Interleaved REASON And Weak Difference Asymmetry
+- After the first natural-language difference patch, training logs showed two remaining bottlenecks:
+  - `REASON` was still often empty or partially leaked into `CORRECTION_DIRECTION`
+  - `target_only_evidence` and `distractor_only_evidence` were still too symmetric, so the teacher often produced generic diagnosis text even when the validator accepted spatial language
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py` to:
+  - strengthen the `teacher_light_diagnosis` prompt so `REASON` must be exactly one complete sentence
+  - force `REASON` to mention target-only or distractor-only cues with concrete spatial or size language
+  - add a parser-side recovery path that extracts `REASON` text if it was accidentally appended to `CORRECTION_DIRECTION`
+- Updated `projects/sa2va/evaluation/teacher_diagnosis_common.py` to:
+  - add stronger asymmetric difference descriptors based on relative size and relative location
+  - enrich `target_only_evidence` / `distractor_only_evidence` with area contrast and offset wording so the two sides are less likely to collapse into the same sentence template
+- The goal of this patch is to move the regenerate pipeline past `diagnosis_invalid:missing_reason` and reduce near-identical target/distractor evidence text.
