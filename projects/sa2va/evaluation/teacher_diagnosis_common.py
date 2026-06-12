@@ -116,6 +116,33 @@ def _is_effective_relation_text(value):
     return normalized not in {"", "none", "unknown", "empty mask"}
 
 
+def _mask_extent_text(mask):
+    mask = np.asarray(mask).astype(np.uint8)
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0 or len(ys) == 0:
+        return "no visible target-specific region"
+    h, w = mask.shape
+    x_min = float(xs.min()) / max(w, 1)
+    x_max = float(xs.max()) / max(w, 1)
+    y_min = float(ys.min()) / max(h, 1)
+    y_max = float(ys.max()) / max(h, 1)
+    width_ratio = (x_max - x_min)
+    height_ratio = (y_max - y_min)
+    horiz = "left side" if x_max < 0.4 else "right side" if x_min > 0.6 else "middle width"
+    vert = "upper area" if y_max < 0.4 else "lower area" if y_min > 0.6 else "middle height"
+    size = "small patch" if width_ratio * height_ratio < 0.03 else "broad area"
+    return f"a {size} on the {horiz} in the {vert}"
+
+
+def _describe_difference_evidence(mask, spatial_hint):
+    spatial_hint = _normalize_relation_text(spatial_hint)
+    extent_text = _mask_extent_text(mask)
+    if spatial_hint.lower() in {"", "none", "unknown"}:
+        return extent_text
+    spatial_hint = spatial_hint.rstrip(".")
+    return f"{extent_text}; {spatial_hint.lower()}"
+
+
 def build_teacher_regenerate_difference_context(*, model, gt_mask, ref_mask):
     relation_context = build_mask_relation_context(
         model=model,
@@ -125,10 +152,24 @@ def build_teacher_regenerate_difference_context(*, model, gt_mask, ref_mask):
     target_summary = _normalize_relation_text(relation_context.get("gt_summary", ""))
     distractor_summary = _normalize_relation_text(relation_context.get("ref_summary", ""))
     shared_evidence = _normalize_relation_text(relation_context.get("overlap_summary", ""))
-    target_only_evidence = _normalize_relation_text(relation_context.get("gt_only_summary", ""))
-    distractor_only_evidence = _normalize_relation_text(relation_context.get("ref_only_summary", ""))
+    target_only_raw = _normalize_relation_text(relation_context.get("gt_only_summary", ""))
+    distractor_only_raw = _normalize_relation_text(relation_context.get("ref_only_summary", ""))
     target_localization_hint = _normalize_relation_text(model._coarse_spatial_hint(gt_mask))
     distractor_localization_hint = _normalize_relation_text(model._coarse_spatial_hint(ref_mask))
+    gt_mask = np.asarray(gt_mask).astype(np.uint8)
+    ref_mask = np.asarray(ref_mask).astype(np.uint8)
+    gt_only = np.logical_and(gt_mask > 0, ref_mask == 0).astype(np.uint8)
+    ref_only = np.logical_and(ref_mask > 0, gt_mask == 0).astype(np.uint8)
+    target_only_evidence = (
+        _describe_difference_evidence(gt_only, target_localization_hint)
+        if _is_effective_relation_text(target_only_raw)
+        else "none"
+    )
+    distractor_only_evidence = (
+        _describe_difference_evidence(ref_only, distractor_localization_hint)
+        if _is_effective_relation_text(distractor_only_raw)
+        else "none"
+    )
 
     if target_summary.lower() == distractor_summary.lower():
         if _is_effective_relation_text(target_only_evidence):

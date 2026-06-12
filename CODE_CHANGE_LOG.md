@@ -405,3 +405,31 @@
 
 ### Compatibility Note
 - Legacy heavy fault-report and repair-plan helper functions are still present temporarily for compatibility, but the training main path no longer depends on them.
+
+### Follow-up Logging Fix
+- The first difference-driven version still only exposed verification caption and diagnosis fields in per-sample debug records, which made quick training-log inspection inconvenient.
+- The same main log line also retained accidental `0.0=...` placeholder fragments after the metric rename pass.
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py` so the standard training log line now prints:
+  - `teacher_verification_caption`
+  - `teacher_caption_problem`
+  - `teacher_correction_direction`
+  - `teacher_reason`
+- Removed the stray `0.0=...` placeholders from the same log output.
+
+### Follow-up Fix For Natural-Language Difference Evidence
+- The first difference-driven compression still exposed `target_only_evidence` and `distractor_only_evidence` mainly as `area_ratio / bbox / center` strings.
+- In logs, the teacher often produced semantically correct diagnosis text, but not by copying those numeric mask summaries, so `teacher_diagnosis_valid_rate` remained at `0.0`.
+- Updated the active difference-compression path so `projects/sa2va/evaluation/teacher_diagnosis_common.py` now converts mask-only differences into natural-language spatial evidence such as broad-area vs small-patch and left/right or upper/lower cues, while retaining the coarse localization hint.
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py` so diagnosis validation now accepts either:
+  - direct phrase overlap with those natural-language evidence snippets, or
+  - semantic spatial anchors in `reason` / `correction_direction`
+- This keeps the validator meaningful while no longer requiring the teacher to parrot raw numeric mask summaries.
+
+### Follow-up Confirmation For Main Log Text Fields
+- Verified that the active main training log in `projects/sa2va/models/sa2va_opsd_v2.py` no longer contains the accidental `0.0=0.0000` placeholder fragments.
+- The standard `[Sa2VA_OPSD_V2]` line now prints:
+  - `teacher_verification_caption`
+  - `teacher_caption_problem`
+  - `teacher_correction_direction`
+  - `teacher_reason`
+- If future remote logs still show `0.0=0.0000`, that indicates the server is running an older synced copy rather than the current workspace version.

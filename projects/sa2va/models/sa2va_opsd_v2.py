@@ -1608,6 +1608,25 @@ class Sa2VAOPSDModelV2(BaseModel):
             fragments.append(normalized)
         return fragments[:4]
 
+    def _difference_text_has_semantic_anchor(self, text):
+        normalized = self._normalize_teacher_field_text(text).lower()
+        if not normalized:
+            return False
+        anchor_patterns = (
+            "left side",
+            "right side",
+            "upper area",
+            "lower area",
+            "middle width",
+            "middle height",
+            "broad area",
+            "small patch",
+            "target-specific",
+            "distractor",
+            "target-only",
+        )
+        return any(pattern in normalized for pattern in anchor_patterns)
+
     @staticmethod
     def _teacher_failure_type_set():
         return {
@@ -1655,11 +1674,17 @@ class Sa2VAOPSDModelV2(BaseModel):
             key_evidence.extend(self._build_difference_field_phrase_hints(result.target_only_evidence))
         if self._teacher_field_is_effective(result.distractor_only_evidence):
             key_evidence.extend(self._build_difference_field_phrase_hints(result.distractor_only_evidence))
-        if key_evidence and not any(
-            hint.lower() in result.reason.lower() or hint.lower() in result.correction_direction.lower()
-            for hint in key_evidence
-        ):
-            return False, "diagnosis_invalid:missing_difference_evidence"
+        if key_evidence:
+            matched_hint = any(
+                hint.lower() in result.reason.lower() or hint.lower() in result.correction_direction.lower()
+                for hint in key_evidence
+            )
+            semantic_anchor_ok = (
+                self._difference_text_has_semantic_anchor(result.reason)
+                or self._difference_text_has_semantic_anchor(result.correction_direction)
+            )
+            if not matched_hint and not semantic_anchor_ok:
+                return False, "diagnosis_invalid:missing_difference_evidence"
         return True, ""
 
     @staticmethod
@@ -5834,10 +5859,10 @@ class Sa2VAOPSDModelV2(BaseModel):
                     f"window_teacher_diagnosis_valid_rate={window_teacher_diagnosis_valid_rate:.4f} "
                     f"window_teacher_dlc_valid_rate={window_teacher_dlc_valid_rate:.4f} "
                     f"window_teacher_verification_gate_pass_rate={window_teacher_verification_gate_pass_rate:.4f} "
-                    f"0.0={0.0:.4f} "
-                    f"0.0={0.0:.4f} "
-                    f"0.0={0.0:.4f} "
-                    f"0.0={0.0:.4f} "
+                    f"teacher_verification_caption={teacher_verification_caption!r} "
+                    f"teacher_caption_problem={teacher_caption_problem!r} "
+                    f"teacher_correction_direction={teacher_correction_direction!r} "
+                    f"teacher_reason={teacher_reason!r} "
                     f"window_avg_caption_tokens={window_avg_caption_tokens:.2f} "
                     f"window_caption_seg_style_rate_raw={window_caption_seg_style_rate_raw:.4f} "
                     f"window_caption_mode_failure_rate={window_caption_mode_failure_rate:.4f} "
@@ -5883,15 +5908,15 @@ class Sa2VAOPSDModelV2(BaseModel):
                 f"teacher_regenerate_suppressed={teacher_regenerate_suppressed_count} "
                 f"window_teacher_difference_context_nontrivial_rate={window_teacher_difference_context_nontrivial_rate:.4f} "
                 f"window_teacher_regenerate_verification_caption_valid_rate={window_teacher_regenerate_verification_caption_valid_rate:.4f} "
-                f"window_teacher_regenerate_verification_iou_mean={window_teacher_regenerate_verification_iou_mean:.4f} "
-                f"window_teacher_diagnosis_valid_rate={window_teacher_diagnosis_valid_rate:.4f} "
-                f"window_teacher_dlc_valid_rate={window_teacher_dlc_valid_rate:.4f} "
-                f"window_teacher_verification_gate_pass_rate={window_teacher_verification_gate_pass_rate:.4f} "
-                f"0.0={0.0:.4f} "
-                f"0.0={0.0:.4f} "
-                f"0.0={0.0:.4f} "
-                f"0.0={0.0:.4f} "
-                f"window_avg_caption_tokens={window_avg_caption_tokens:.2f} "
+                    f"window_teacher_regenerate_verification_iou_mean={window_teacher_regenerate_verification_iou_mean:.4f} "
+                    f"window_teacher_diagnosis_valid_rate={window_teacher_diagnosis_valid_rate:.4f} "
+                    f"window_teacher_dlc_valid_rate={window_teacher_dlc_valid_rate:.4f} "
+                    f"window_teacher_verification_gate_pass_rate={window_teacher_verification_gate_pass_rate:.4f} "
+                    f"teacher_verification_caption={teacher_verification_caption!r} "
+                    f"teacher_caption_problem={teacher_caption_problem!r} "
+                    f"teacher_correction_direction={teacher_correction_direction!r} "
+                    f"teacher_reason={teacher_reason!r} "
+                    f"window_avg_caption_tokens={window_avg_caption_tokens:.2f} "
                 f"window_caption_seg_style_rate_raw={window_caption_seg_style_rate_raw:.4f} "
                 f"window_caption_mode_failure_rate={window_caption_mode_failure_rate:.4f} "
                 f"window_onpolicy_blocked_by_seg_style_count={window_totals['onpolicy_blocked_by_seg_style_count']} "
