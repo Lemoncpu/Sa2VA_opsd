@@ -736,3 +736,11 @@
   - defaults `WORK_DIR` to `${PROJECT_ROOT}/work_dirs/sa2va_opsd_combine_4b_dlc_manifest`
   - calls `tools/export_refcoco_opsd_dlc_routes_4b.sh` inside the job
   - forwards the same common parameters (`gpus`, `cuda-devices`, data/model/tokenizer/work-dir/confuser-pool paths)
+
+### Follow-up Default Resource Adjustment
+- The first `tools/export_dlc.sh` draft inherited the 4-GPU resource defaults from the old generic export wrapper, which was unnecessarily large for the intended single-GPU DLC route export.
+- Updated `tools/export_dlc.sh` defaults to a proportional 1-GPU profile:
+  - `JOB_GPU=1`
+  - `JOB_CPU=20`
+  - `JOB_MEMORY=102400`
+  - `CUDA_DEVICES=0`
