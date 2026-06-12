@@ -15,6 +15,13 @@ except ImportError:
     Sa2VAOPSDModel = None
 
 try:
+    from .sa2va_opsd_combine import Sa2VAOPSDCombineModel
+
+    __all__.append("Sa2VAOPSDCombineModel")
+except ImportError:
+    Sa2VAOPSDCombineModel = None
+
+try:
     from .sam2_train import SAM2TrainRunner
 
     __all__.append("SAM2TrainRunner")

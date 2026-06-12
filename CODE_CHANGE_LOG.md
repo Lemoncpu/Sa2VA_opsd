@@ -218,6 +218,74 @@
 - Do not mix caption-quality reward or reconstruction-IoU reward into this change. Keep the dense reward local to the confuser MCQ path so its effect is interpretable.
 - Do not only penalize the chosen wrong option; use the full distribution so reward stays dense even when argmax is correct but confuser mass is high.
 
+## 2026-06-13 Three-Mode Combined OPSD Training Skeleton
+
+### Problem
+- The existing OPSD training code binds the whole route system to a single caption task and a single verifier path.
+- New experiments need one training implementation that can switch between:
+  - DLC-only training with choose-one routing
+  - referring-caption-only training with reconstruction IoU routing
+  - combined dual-caption training with choose-one plus IoU routing
+
+### Root Cause Notes
+- `projects/sa2va/models/sa2va_opsd_v2.py` and `v3.py` assume one student caption path and one main verifier path per sample.
+- The current configs also point at the V3 single-task model and manifest-oriented route setup, which is awkward for a first combined online-routing prototype.
+
+### Chosen Fix Direction
+- Add a new model file `projects/sa2va/models/sa2va_opsd_combine.py` as a V3-derived training skeleton with a `train_mode` switch.
+- Keep the existing three route families unchanged (`teacher_regenerate`, `on_policy_distill`, `grpo_positive`) so DDP route alignment and loss-family shape stay stable.
+- Start with online routing configs for the new modes, and keep combined GRPO conservative by using DLC as the only RL branch while supervising referring captions with auxiliary teacher/on-policy losses.
+
+### Rejected Direction
+- Do not replace the current V2/V3 implementation in-place. The new three-mode behavior is experimental and should land beside the current training path first.
+- Do not introduce a fourth or fifth route family for combined mode in the first patch, because that would immediately complicate sampler and DDP alignment.
+
+### Implemented Changes
+- Added `projects/sa2va/models/sa2va_opsd_combine.py`:
+  - Introduced `train_mode` with values `dlc`, `referring`, and `combine`.
+  - Added mode-specific student prompt builders and output parsing, including dual-output parsing for `DLC:` and `REFERRING:` in combined mode.
+  - Added choose-one based routing for DLC and IoU-based routing for referring captions, plus combined routing where choose-one determines main qualification and IoU gates GRPO promotion.
+  - Added mode-specific teacher prompt builders using `gtmask + wrong confuser mask` for DLC and `gtmask + refmask` for referring supervision.
+  - Added a lightweight referring-caption GRPO path based on reconstruction IoU rewards.
+- Added configs:
+  - `projects/sa2va/configs/sa2va_opsd_combine_4b_dlc.py`
+  - `projects/sa2va/configs/sa2va_opsd_combine_4b_referring.py`
+  - `projects/sa2va/configs/sa2va_opsd_combine_4b_combine.py`
+  - These start in `route_mode="online"` and point to the new model with per-mode `train_mode` selection.
+
+## 2026-06-13 DLC Choose-One Route Export
+
+### Problem
+- The existing offline route exporter only estimates routes from caption-to-mask reconstruction IoU.
+- The new DLC-only training mode needs an offline manifest derived from DLC generation quality measured by confuser choose-one, not reconstruction IoU.
+
+### Root Cause Notes
+- `tools/export_opsd_routes.py` is built around `estimate_opsd_route_for_sample_with_model(...)`, which assumes one caption and one reconstruction verifier.
+- DLC routing instead needs:
+  - generate DLC
+  - score it against GT vs confuser options
+  - map choose-one correctness and confidence to the existing three route families
+
+### Chosen Fix Direction
+- Add a separate exporter `tools/export_opsd_dlc_routes.py` instead of overloading the current IoU exporter.
+- Keep the manifest `route` values unchanged so the sampler and training loader can consume the output immediately.
+- Store choose-one confidence in the manifest `iou` slot for route-summary compatibility, while also writing explicit DLC-specific fields to avoid ambiguity in downstream inspection.
+
+### Rejected Direction
+- Do not replace the existing IoU exporter. Reconstruction-based export is still needed for the referring-only path and other legacy analyses.
+- Do not introduce new manifest route labels; reuse the current three-route family to stay compatible with route-grouped sampling.
+
+### Implemented Changes
+- Added `tools/export_opsd_dlc_routes.py`:
+  - Dynamically builds the configured model class from `cfg["model"]["type"]`.
+  - Generates DLC captions with the selected route model (`student` or `teacher`).
+  - Scores captions with confuser choose-one and maps results to `teacher_regenerate`, `on_policy_distill`, or `grpo_positive`.
+  - Writes manifest records with DLC-specific fields such as `dlc_choose_one_correct`, `dlc_choose_one_confidence`, and `wrong_confuser_available`.
+- Added shell launchers:
+  - `tools/export_refcoco_opsd_dlc_routes_impl.sh`
+  - `tools/export_refcoco_opsd_dlc_routes_4b.sh`
+  - These mirror the existing RefCOCO export launcher style while routing execution to `tools/export_opsd_dlc_routes.py` and forcing `model.train_mode=dlc`.
+
 ## 2026-06-12 Teacher Regenerate Difference Context Switched To Natural-Language Summaries
 
 ### Problem
@@ -645,3 +713,26 @@
   - `correction_direction`
   - `reason`
 - The later DLC prompt still receives those three fields as program-side structured context, so regeneration remains explicitly conditioned on the staged diagnosis without requiring the teacher to emit schema-formatted labels.
+
+## 2026-06-13 DLC Export rjob Wrapper
+
+### Problem
+- The new DLC choose-one route exporter was available as a Python entry and shell launcher, but there was no cluster submission wrapper matching the existing `tools/export.sh` workflow.
+
+### Root Cause Notes
+- Existing export automation on the remote cluster assumes an `rjob submit` wrapper that prepares the runtime image, unpacks the Python environment, installs system libraries, and then calls the appropriate route-export shell launcher.
+- Without a DLC-specific wrapper, running DLC route export would require manually reconstructing that full submission command.
+
+### Chosen Fix Direction
+- Add `tools/export_dlc.sh` by mirroring the structure of `tools/export.sh` and swapping only the export target and default work-dir path.
+- Keep the rest of the remote image/bootstrap flow identical so DLC export behaves like the existing route export job.
+
+### Rejected Direction
+- Do not fold DLC export into the existing `tools/export.sh` yet. Keeping a separate wrapper is clearer while the new route exporter is still experimental.
+
+### Implemented Changes
+- Added `tools/export_dlc.sh`:
+  - submits the same remote image/bootstrap job shape as `tools/export.sh`
+  - defaults `WORK_DIR` to `${PROJECT_ROOT}/work_dirs/sa2va_opsd_combine_4b_dlc_manifest`
+  - calls `tools/export_refcoco_opsd_dlc_routes_4b.sh` inside the job
+  - forwards the same common parameters (`gpus`, `cuda-devices`, data/model/tokenizer/work-dir/confuser-pool paths)

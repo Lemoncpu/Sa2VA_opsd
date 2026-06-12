@@ -1,0 +1,195 @@
+from mmengine.hooks import CheckpointHook, DistSamplerSeedHook, IterTimerHook, LoggerHook, ParamSchedulerHook
+from mmengine.optim import CosineAnnealingLR, LinearLR, OptimWrapper
+from mmengine.dataset.sampler import DefaultSampler
+from torch.optim import AdamW
+
+from xtuner.engine.runner import TrainLoop
+
+from projects.sa2va.hooks.ema_teacher_hook import EMATeacherHook
+from projects.sa2va.hooks.old_policy_sync_hook import OldPolicySyncHook
+from projects.sa2va.datasets.common import DEFAULT_MASK_TO_CAPTION_QUESTION
+from projects.sa2va.datasets.data_utils_opsd_v2 import sa2va_opsd_collect_fn_v2
+from projects.sa2va.datasets.refcoco_opsd import Sa2VAOpsdRefCocoDataset
+from projects.sa2va.models.sa2va_opsd_combine import Sa2VAOPSDCombineModel
+
+
+path = "./pretrained/Sa2VA-4B"
+tokenizer_path = path
+data_root = "./data"
+dataset_name = "refcoco"
+split = "train"
+image_root = None
+device = "auto"
+
+batch_size = 1
+accumulative_counts = 1
+dataloader_num_workers = 0
+max_epochs = 1
+optim_type = AdamW
+lr = 2e-5
+betas = (0.9, 0.999)
+weight_decay = 0.05
+max_norm = 1
+warmup_ratio = 0.03
+save_steps = 100
+save_total_limit = 2
+sam_confuser_pool_dir = "./work_dirs/sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3_manifest/sam_confuser_pool"
+route_mode = "online"
+use_manifest_routes = False
+
+model = dict(
+    type=Sa2VAOPSDCombineModel,
+    model_path=path,
+    enable_teacher=True,
+    teacher_ema_alpha=0.999,
+    tokenizer_path=tokenizer_path,
+    device=device,
+    torch_dtype="auto",
+    use_flash_attn=True,
+    teacher_temperature=1.0,
+    jsd_beta=0.5,
+    iou_low_threshold=0.5,
+    iou_high_threshold=0.85,
+    mid_iou_alpha=1.0,
+    entropy_weight_beta=1.0,
+    grpo_group_size=4,
+    grpo_clip_eps=0.1,
+    grpo_advantage_eps=1e-6,
+    grpo_sample_temperature=0.8,
+    grpo_sample_top_p=0.9,
+    description_max_new_tokens=48,
+    description_repetition_penalty=1.15,
+    description_no_repeat_ngram_size=5,
+    grpo_sample_max_new_tokens=40,
+    low_iou_regen_max_new_tokens=48,
+    min_caption_tokens=5,
+    disable_gradient_checkpointing_for_ddp=False,
+    enable_ddp_route_safety_loss=True,
+    use_online_route_for_loss=True,
+    max_teacher_regenerate_fraction=0.1,
+    max_recovery_fraction=0.05,
+    enable_debug_sample_logging=True,
+    student_freeze_llm=True,
+    student_freeze_visual_encoder=True,
+    student_llm_lora=dict(
+        r=128,
+        lora_alpha=256,
+        lora_dropout=0.05,
+        bias='none',
+        task_type='CAUSAL_LM',
+        modules_to_save=['lm_head', 'embed_tokens'],
+        target_modules=None,
+    ),
+    reconstruct_question_template=(
+        "<image>\n"
+        "Return the segmentation mask for the target region referred to by the description below.\n"
+        "Use nearby objects, scene cues, or local relations only to identify the target region.\n"
+        "Do not include those contextual regions in the mask unless they are explicitly part of the described target.\n"
+        "Description: {caption}"
+    ),
+    train_mode="dlc",
+    combine_choose_one_low_conf_threshold=0.2,
+    dlc_onpolicy_conf_threshold=0.5,
+    referring_iou_sft_threshold=0.5,
+    referring_iou_grpo_threshold=0.85,
+    combine_grpo_choose_one_conf_threshold=0.5,
+    combine_grpo_iou_threshold=0.85,
+)
+
+train_dataset = dict(
+    type=Sa2VAOpsdRefCocoDataset,
+    data_root=data_root,
+    dataset_name=dataset_name,
+    split=split,
+    image_root=image_root,
+    image_root_candidates=[
+        f"{data_root}/refcoco/train2014",
+        f"{data_root}/images/mscoco/images/train2014",
+        "/data/coco/train2014",
+    ],
+    repeats=1,
+    shuffle=False,
+    skip_empty_masks=True,
+    student_question=DEFAULT_MASK_TO_CAPTION_QUESTION,
+    route_manifest_path=None,
+    route_manifest_required=False,
+    skip_route_manifest_skip_samples=False,
+    sam_confuser_pool_dir=sam_confuser_pool_dir,
+    min_confuser_candidate_count=3,
+)
+
+train_sampler = dict(
+    type=DefaultSampler,
+    shuffle=True,
+)
+
+train_dataloader = dict(
+    batch_size=batch_size,
+    num_workers=dataloader_num_workers,
+    dataset=train_dataset,
+    sampler=train_sampler,
+    collate_fn=dict(type=sa2va_opsd_collect_fn_v2),
+)
+
+optim_wrapper = dict(
+    type=OptimWrapper,
+    optimizer=dict(type=optim_type, lr=lr, betas=betas, weight_decay=weight_decay),
+    clip_grad=dict(max_norm=max_norm, error_if_nonfinite=False),
+    accumulative_counts=accumulative_counts,
+)
+
+model_wrapper_cfg = dict(
+    type="MMDistributedDataParallel",
+    find_unused_parameters=False,
+    broadcast_buffers=False,
+)
+
+param_scheduler = [
+    dict(
+        type=LinearLR,
+        start_factor=1e-5,
+        by_epoch=True,
+        begin=0,
+        end=warmup_ratio * max_epochs,
+        convert_to_iter_based=True,
+    ),
+    dict(
+        type=CosineAnnealingLR,
+        eta_min=0.0,
+        by_epoch=True,
+        begin=warmup_ratio * max_epochs,
+        end=max_epochs,
+        convert_to_iter_based=True,
+    ),
+]
+
+train_cfg = dict(type=TrainLoop, max_epochs=max_epochs)
+
+custom_hooks = [dict(type=OldPolicySyncHook), dict(type=EMATeacherHook)]
+
+default_hooks = dict(
+    timer=dict(type=IterTimerHook),
+    logger=dict(type=LoggerHook, log_metric_by_epoch=False, interval=10),
+    param_scheduler=dict(type=ParamSchedulerHook),
+    checkpoint=dict(
+        type=CheckpointHook,
+        save_optimizer=True,
+        by_epoch=False,
+        interval=save_steps,
+        max_keep_ckpts=save_total_limit,
+    ),
+    sampler_seed=dict(type=DistSamplerSeedHook),
+)
+
+env_cfg = dict(
+    cudnn_benchmark=False,
+    mp_cfg=dict(mp_start_method="fork", opencv_num_threads=0),
+    dist_cfg=dict(backend="nccl"),
+)
+
+visualizer = None
+log_level = "INFO"
+load_from = None
+resume = False
+randomness = dict(seed=None, deterministic=False)
+log_processor = dict(by_epoch=False)
