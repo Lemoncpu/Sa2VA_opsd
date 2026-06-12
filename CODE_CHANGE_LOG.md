@@ -558,3 +558,15 @@
   - updated teacher regenerate analysis export so per-sample records now carry staged validity flags
   - added rolling and cumulative diagnostics for three-stage diagnosis, including stage valid rates, primary-target cue hit rates, and `teacher_reason_coarse_rate`
   - updated main logs and pre-return debug output to print staged validity alongside `teacher_caption_problem`, `teacher_correction_direction`, `teacher_reason`, `teacher_dlc`, and `teacher_verification_caption`
+
+### Follow-up Logging Upgrade For Three-Stage Raw Outputs
+- After the staged pipeline was wired in, runtime logs still only showed parsed fields like `teacher_caption_problem`, `teacher_correction_direction`, and `teacher_reason`.
+- That was not enough to distinguish:
+  - the teacher truly generating nothing
+  - the teacher generating free-form text that parser could not align to labels
+  - the parser extracting the wrong slice from an otherwise non-empty raw response
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py` so teacher regenerate logs now also print:
+  - `teacher_problem_raw`
+  - `teacher_direction_raw`
+  - `teacher_reason_raw`
+- These raw fields are exported through teacher analysis, included in per-sample debug records, and printed in the main training log so future diagnosis can distinguish generation failure from parsing failure.

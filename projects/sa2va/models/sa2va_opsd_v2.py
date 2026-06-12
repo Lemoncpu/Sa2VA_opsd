@@ -2449,6 +2449,9 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "caption_problem={caption_problem} "
                 "correction_direction={correction_direction} "
                 "reason={reason} "
+                "problem_raw={problem_raw} "
+                "direction_raw={direction_raw} "
+                "reason_raw={reason_raw} "
                 "teacher_problem_valid={teacher_problem_valid} "
                 "teacher_direction_valid={teacher_direction_valid} "
                 "teacher_reason_valid={teacher_reason_valid} "
@@ -2481,6 +2484,9 @@ class Sa2VAOPSDModelV2(BaseModel):
                     caption_problem=repr(record.get("caption_problem", "")),
                     correction_direction=repr(record.get("correction_direction", "")),
                     reason=repr(record.get("reason", "")),
+                    problem_raw=repr(record.get("problem_raw", "")),
+                    direction_raw=repr(record.get("direction_raw", "")),
+                    reason_raw=repr(record.get("reason_raw", "")),
                     teacher_problem_valid=record.get("teacher_problem_valid"),
                     teacher_direction_valid=record.get("teacher_direction_valid"),
                     teacher_reason_valid=record.get("teacher_reason_valid"),
@@ -4580,6 +4586,9 @@ class Sa2VAOPSDModelV2(BaseModel):
             "teacher_caption_problem": "",
             "teacher_correction_direction": "",
             "teacher_reason": "",
+            "teacher_problem_raw": "",
+            "teacher_direction_raw": "",
+            "teacher_reason_raw": "",
             "teacher_problem_valid": False,
             "teacher_direction_valid": False,
             "teacher_reason_valid": False,
@@ -4631,6 +4640,9 @@ class Sa2VAOPSDModelV2(BaseModel):
         result["teacher_caption_problem"] = teacher_regenerate.caption_problem
         result["teacher_correction_direction"] = teacher_regenerate.correction_direction
         result["teacher_reason"] = teacher_regenerate.reason
+        result["teacher_problem_raw"] = teacher_regenerate.problem_raw
+        result["teacher_direction_raw"] = teacher_regenerate.direction_raw
+        result["teacher_reason_raw"] = teacher_regenerate.reason_raw
         result["teacher_problem_valid"] = bool(teacher_regenerate.problem_valid)
         result["teacher_direction_valid"] = bool(teacher_regenerate.direction_valid)
         result["teacher_reason_valid"] = bool(teacher_regenerate.reason_valid)
@@ -5687,6 +5699,9 @@ class Sa2VAOPSDModelV2(BaseModel):
             teacher_caption_problem = str(teacher_analysis.get("teacher_caption_problem", ""))
             teacher_correction_direction = str(teacher_analysis.get("teacher_correction_direction", ""))
             teacher_reason = str(teacher_analysis.get("teacher_reason", ""))
+            teacher_problem_raw = str(teacher_analysis.get("teacher_problem_raw", ""))
+            teacher_direction_raw = str(teacher_analysis.get("teacher_direction_raw", ""))
+            teacher_reason_raw = str(teacher_analysis.get("teacher_reason_raw", ""))
             teacher_problem_valid = bool(teacher_analysis.get("teacher_problem_valid", False))
             teacher_direction_valid = bool(teacher_analysis.get("teacher_direction_valid", False))
             teacher_reason_valid = bool(teacher_analysis.get("teacher_reason_valid", False))
@@ -5792,6 +5807,9 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "caption_problem": teacher_caption_problem,
                 "correction_direction": teacher_correction_direction,
                 "reason": teacher_reason,
+                "problem_raw": teacher_problem_raw,
+                "direction_raw": teacher_direction_raw,
+                "reason_raw": teacher_reason_raw,
                 "teacher_problem_valid": teacher_problem_valid,
                 "teacher_direction_valid": teacher_direction_valid,
                 "teacher_reason_valid": teacher_reason_valid,
@@ -6544,6 +6562,9 @@ class Sa2VAOPSDModelV2(BaseModel):
                     f"teacher_caption_problem={teacher_caption_problem!r} "
                     f"teacher_correction_direction={teacher_correction_direction!r} "
                     f"teacher_reason={teacher_reason!r} "
+                    f"teacher_problem_raw={teacher_problem_raw!r} "
+                    f"teacher_direction_raw={teacher_direction_raw!r} "
+                    f"teacher_reason_raw={teacher_reason_raw!r} "
                     f"teacher_problem_valid={teacher_problem_valid} "
                     f"teacher_direction_valid={teacher_direction_valid} "
                     f"teacher_reason_valid={teacher_reason_valid} "
@@ -6609,6 +6630,9 @@ class Sa2VAOPSDModelV2(BaseModel):
                     f"teacher_caption_problem={teacher_caption_problem!r} "
                     f"teacher_correction_direction={teacher_correction_direction!r} "
                     f"teacher_reason={teacher_reason!r} "
+                    f"teacher_problem_raw={teacher_problem_raw!r} "
+                    f"teacher_direction_raw={teacher_direction_raw!r} "
+                    f"teacher_reason_raw={teacher_reason_raw!r} "
                     f"teacher_problem_valid={teacher_problem_valid} "
                     f"teacher_direction_valid={teacher_direction_valid} "
                     f"teacher_reason_valid={teacher_reason_valid} "
