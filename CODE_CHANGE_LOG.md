@@ -225,6 +225,17 @@
   - `SA2VA_REFCOCO_OPSD_ENTRY_NAME`
 - The injected defaults point to the DLC combine config and the rjob-provided work/model/tokenizer paths, restoring the expected wrapper contract for the shared training implementation.
 
+### Follow-up Compatibility Fix
+- After the wrapper env fix, DLC training still failed during dataloader construction with:
+  - `TypeError: DefaultSampler.__init__() got an unexpected keyword argument 'per_device_batch_size'`
+- Root cause:
+  - `tools/train_refcoco_opsd_impl.sh` always injected `train_dataloader.sampler.per_device_batch_size` whenever batch size or accumulation overrides were present.
+  - That override is only valid for `RouteGroupedSampler`, but the new DLC combine config uses `mmengine.dataset.sampler.DefaultSampler`.
+- Chosen fix:
+  - Added a launcher-level compatibility switch `SA2VA_REFCOCO_OPSD_OVERRIDE_SAMPLER_PER_DEVICE_BATCH_SIZE`.
+  - Kept the shared implementation default as enabled for legacy OPSD configs.
+  - Disabled the override explicitly in `tools/traindlc.sh`, so the DLC config can keep using `DefaultSampler` without receiving unsupported sampler kwargs.
+
 ### Problem
 - The GRPO confuser reward was sparse: wrong argmax predictions usually received `0`, so many rollout groups produced low-variance or zero-variance reward signals.
 - Recent diagnostics showed GRPO remained the dominant route, so sparse MCQ reward limited how often this route could provide useful policy gradients.
