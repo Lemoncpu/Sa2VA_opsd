@@ -199,6 +199,32 @@
 
 ## 2026-06-11 Dense GRPO Reward For Confuser MCQ
 
+## 2026-06-13 DLC RJob Launcher Missing Wrapper Environment
+
+### Problem
+- `tools/traindlc.sh` submitted the DLC training job successfully, but the remote run failed immediately with:
+  - `SA2VA_REFCOCO_OPSD_CONFIG must be set by the entry wrapper.`
+
+### Root Cause Notes
+- `tools/train_refcoco_opsd_impl.sh` is not a standalone launcher. It requires an outer wrapper to inject the `SA2VA_REFCOCO_OPSD_*` default environment variables before argument parsing.
+- `tools/traindlc.sh` called `train_refcoco_opsd_impl.sh` directly, unlike the standard `tools/train_refcoco_opsd_4b.sh` wrapper path.
+
+### Chosen Fix Direction
+- Keep `traindlc.sh` as the rjob submit wrapper, but inject the required `SA2VA_REFCOCO_OPSD_*` defaults inline before calling `train_refcoco_opsd_impl.sh`.
+
+### Rejected Direction
+- Do not weaken `train_refcoco_opsd_impl.sh` into a partially standalone script. That would duplicate launcher-default logic and drift from the existing 2B/4B entry design.
+
+### Implemented Changes
+- Updated `tools/traindlc.sh` so the remote training command now exports:
+  - `SA2VA_REFCOCO_OPSD_CONFIG`
+  - `SA2VA_REFCOCO_OPSD_DEFAULT_WORK_DIR`
+  - `SA2VA_REFCOCO_OPSD_DEFAULT_MODEL_PATH`
+  - `SA2VA_REFCOCO_OPSD_DEFAULT_TOKENIZER_PATH`
+  - `SA2VA_REFCOCO_OPSD_MODEL_FLAVOR`
+  - `SA2VA_REFCOCO_OPSD_ENTRY_NAME`
+- The injected defaults point to the DLC combine config and the rjob-provided work/model/tokenizer paths, restoring the expected wrapper contract for the shared training implementation.
+
 ### Problem
 - The GRPO confuser reward was sparse: wrong argmax predictions usually received `0`, so many rollout groups produced low-variance or zero-variance reward signals.
 - Recent diagnostics showed GRPO remained the dominant route, so sparse MCQ reward limited how often this route could provide useful policy gradients.
