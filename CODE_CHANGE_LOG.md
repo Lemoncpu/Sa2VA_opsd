@@ -744,3 +744,33 @@
   - `JOB_CPU=20`
   - `JOB_MEMORY=102400`
   - `CUDA_DEVICES=0`
+
+## 2026-06-13 DLC Train rjob Wrapper
+
+### Problem
+- The new DLC training path had model/config support, but there was no dedicated rjob launcher matching the existing `tools/train1.sh` workflow and the requested remote work directory.
+
+### Root Cause Notes
+- Existing training submission wrappers still target the legacy OPSD 4B config and work directories.
+- For the new DLC manifest workflow, the remote launcher must point at the combined-model DLC path while preserving:
+  - single-GPU resource defaults
+  - SAM confuser pool auto-generation
+  - plot watcher
+  - resume/load argument forwarding
+
+### Chosen Fix Direction
+- Add `tools/traindlc.sh` by mirroring `tools/train1.sh`.
+- Keep the same rjob bootstrap flow, but:
+  - default `WORK_DIR` to `/mnt/shared-storage-user/dnacoding/wuyucheng/workspace/Nemotrontiaozheng/Sa2VA_opsd/work_dirs/sa2va_opsd_combine_4b_dlc_manifest`
+  - invoke `tools/train_refcoco_opsd_impl.sh`
+  - inject `--cfg-options model.type=Sa2VAOPSDCombineModel model.train_mode=dlc`
+
+### Rejected Direction
+- Do not modify `tools/train1.sh` in place. The legacy launcher is still useful for the old OPSD path.
+
+### Implemented Changes
+- Added `tools/traindlc.sh`:
+  - mirrors the single-GPU `train1.sh` resource profile and remote bootstrap flow
+  - uses the requested DLC manifest work directory by default
+  - auto-builds the confuser pool if missing
+  - starts training through `tools/train_refcoco_opsd_impl.sh` with DLC-specific config overrides
