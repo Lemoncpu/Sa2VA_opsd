@@ -142,7 +142,7 @@ class Sa2VAOpsdRefCocoDataset(Dataset):
         skip_route_manifest_skip_samples: bool = True,
         sam_confuser_pool_dir: str = None,
         min_confuser_candidate_count: int = 3,
-        sam_confuser_duplicate_iou_threshold: float = 0.95,
+        sam_confuser_duplicate_iou_threshold: float = 0.7,
         sam_confuser_min_area_ratio: float = 0.001,
         sam_confuser_max_area_ratio: float = 0.95,
         sam_confuser_nearby_center_weight: float = 0.25,

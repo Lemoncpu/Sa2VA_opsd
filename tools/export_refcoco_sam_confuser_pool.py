@@ -58,7 +58,7 @@ def parse_args():
     parser.add_argument("--max-area-ratio", type=float, default=0.90)
     parser.add_argument("--min-box-size", type=float, default=8.0)
     parser.add_argument("--sam-duplicate-iou-thresh", type=float, default=0.90)
-    parser.add_argument("--gt-duplicate-iou-thresh", type=float, default=0.95)
+    parser.add_argument("--gt-duplicate-iou-thresh", type=float, default=0.7)
     parser.add_argument("--log-every", type=int, default=50)
     return parser.parse_args()
 

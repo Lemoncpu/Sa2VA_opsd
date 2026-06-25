@@ -144,7 +144,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         grpo_confuser_num_options=4,
         grpo_confuser_num_negatives=3,
         grpo_confuser_min_candidates=3,
-        grpo_confuser_duplicate_iou_threshold=0.95,
+        grpo_confuser_duplicate_iou_threshold=0.7,
         grpo_confuser_min_area_ratio=0.001,
         grpo_confuser_max_area_ratio=0.95,
         grpo_confuser_nearby_center_weight=0.25,

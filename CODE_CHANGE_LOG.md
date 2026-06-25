@@ -232,9 +232,37 @@
   - `tools/train_refcoco_opsd_impl.sh` always injected `train_dataloader.sampler.per_device_batch_size` whenever batch size or accumulation overrides were present.
   - That override is only valid for `RouteGroupedSampler`, but the new DLC combine config uses `mmengine.dataset.sampler.DefaultSampler`.
 - Chosen fix:
-  - Added a launcher-level compatibility switch `SA2VA_REFCOCO_OPSD_OVERRIDE_SAMPLER_PER_DEVICE_BATCH_SIZE`.
-  - Kept the shared implementation default as enabled for legacy OPSD configs.
-  - Disabled the override explicitly in `tools/traindlc.sh`, so the DLC config can keep using `DefaultSampler` without receiving unsupported sampler kwargs.
+- Added a launcher-level compatibility switch `SA2VA_REFCOCO_OPSD_OVERRIDE_SAMPLER_PER_DEVICE_BATCH_SIZE`.
+- Kept the shared implementation default as enabled for legacy OPSD configs.
+- Disabled the override explicitly in `tools/traindlc.sh`, so the DLC config can keep using `DefaultSampler` without receiving unsupported sampler kwargs.
+
+## 2026-06-25 Tighten Confuser-vs-GT Duplicate IoU Threshold
+
+### Problem
+- The existing SAM confuser selection logic treated masks with IoU up to `0.95` against the `gtmask` as valid confusers.
+- In practice, those masks are often near-duplicates of the same object rather than meaningful distractors, which weakens choose-one supervision.
+
+### Root Cause Notes
+- Three stages shared the same overly permissive duplicate threshold:
+  - SAM pool export against RefCOCO `gtmask`
+  - dataset-time SAM pool supplementation
+  - model-time final confuser selection
+- This made the system retain masks that still overlapped the target too heavily.
+
+### Chosen Fix Direction
+- Tighten the duplicate-vs-target IoU threshold from `0.95` to `0.7` in all target-facing confuser filters.
+- Keep the confuser selection score formula unchanged for now so only the admissible candidate set becomes stricter.
+
+### Rejected Direction
+- Do not change only one stage. Leaving export / dataset / model thresholds inconsistent would make confuser behavior harder to reason about and debug.
+
+### Implemented Changes
+- Updated `projects/sa2va/datasets/refcoco_opsd.py`:
+  - `sam_confuser_duplicate_iou_threshold` default `0.95 -> 0.7`
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py`:
+  - `grpo_confuser_duplicate_iou_threshold` default `0.95 -> 0.7`
+- Updated `tools/export_refcoco_sam_confuser_pool.py`:
+  - `--gt-duplicate-iou-thresh` default `0.95 -> 0.7`
 
 ### Problem
 - The GRPO confuser reward was sparse: wrong argmax predictions usually received `0`, so many rollout groups produced low-variance or zero-variance reward signals.
