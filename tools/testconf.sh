@@ -2,10 +2,10 @@
 
 set -euo pipefail
 
-JOB_CPU="${JOB_CPU:-80}"
-JOB_GPU="${JOB_GPU:-4}"
-JOB_MEMORY="${JOB_MEMORY:-409600}"
-CUDA_DEVICES="${CUDA_DEVICES:-0,1,2,3}"
+JOB_CPU="${JOB_CPU:-40}"
+JOB_GPU="${JOB_GPU:-2}"
+JOB_MEMORY="${JOB_MEMORY:-204800}"
+CUDA_DEVICES="${CUDA_DEVICES:-0,1}"
 PROJECT_ROOT="${PROJECT_ROOT:-/mnt/shared-storage-user/dnacoding/wuyucheng/workspace/Nemotrontiaozheng/Sa2VA_opsd}"
 DATA_ROOT="${DATA_ROOT:-/mnt/shared-storage-user/dnacoding/wuyucheng/dataset/refcoco}"
 IMAGE_ROOT="${IMAGE_ROOT:-${DATA_ROOT}/train2014}"
