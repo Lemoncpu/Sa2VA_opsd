@@ -125,6 +125,10 @@ class OpsdRouteRefreshHook(Hook):
             active_window_size=active_window_size,
             restrict_manifest_to_active_window=self.restrict_manifest_to_active_window,
         )
+        train_loop, dataset, _ = self._get_dataset_and_sampler(runner)
+        del train_loop
+        if dataset is not None and hasattr(dataset, "set_active_route_manifest_path"):
+            dataset.set_active_route_manifest_path(str(manifest_path))
         if self._is_rank0():
             exported_route_count = int(sum(route_counts.values())) if route_counts else 0
             runner.logger.info(

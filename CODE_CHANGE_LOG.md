@@ -218,6 +218,31 @@
 ### Implemented Changes
 - Updated `tools/traindlc.sh` so the remote training command now exports:
   - `SA2VA_REFCOCO_OPSD_CONFIG`
+
+## 2026-06-26 Teacher Regenerate Single-Prompt Refactor
+
+### Problem
+- The staged teacher regenerate path bound success too tightly to intermediate diagnosis text fields.
+- Even when the teacher could potentially write a usable regenerated caption, the pipeline often stopped early at `problem`, `direction`, or `reason`.
+
+### Root Cause Notes
+- The active training path called the teacher multiple times for diagnosis before generating the final DLC and verification caption.
+- Those intermediate validators became hard blockers for regenerate CE, reducing the practical usability of teacher supervision.
+
+### Chosen Fix Direction
+- Collapse teacher regenerate into a single privileged teacher prompt that internally describes the full workflow: analyze `gtmask/refmask`, diagnose the caption drift, then directly output `DLC` and `VERIFICATION_CAPTION`.
+- Keep diagnosis fields only as optional parsed log signals, not as routing gates.
+
+### Rejected Direction
+- Do not delete the old staged helper functions immediately. Keep them as compatibility helpers until the single-prompt path is validated in training logs.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py`:
+  - Added shared single-stage teacher prompt builders for privileged context and full regenerate generation.
+  - Added `generate_teacher_regenerate_single_stage(...)` and switched the active teacher regenerate pipeline to call the teacher only once.
+  - Kept DLC and verification validation plus reconstruction gate unchanged.
+  - Downgraded `caption_problem`, `correction_direction`, and `reason` to optional parsed logging fields from the single raw teacher output.
+  - Added `single_stage_raw` logging so the one-shot teacher output is visible in debug and batch logs.
   - `SA2VA_REFCOCO_OPSD_DEFAULT_WORK_DIR`
   - `SA2VA_REFCOCO_OPSD_DEFAULT_MODEL_PATH`
   - `SA2VA_REFCOCO_OPSD_DEFAULT_TOKENIZER_PATH`
@@ -263,6 +288,33 @@
   - `grpo_confuser_duplicate_iou_threshold` default `0.95 -> 0.7`
 - Updated `tools/export_refcoco_sam_confuser_pool.py`:
   - `--gt-duplicate-iou-thresh` default `0.95 -> 0.7`
+
+## 2026-06-26 Route Refresh Did Not Switch Active Manifest
+
+### Problem
+- During OPSD training, route refresh exported new manifests such as `routes_step_0006500.jsonl`, but the active dataset manifest stayed at the initial `routes_step_0000000.jsonl`.
+- As a result, later training batches continued to consume stale static routes even after refresh succeeded.
+
+### Root Cause Notes
+- `OpsdRouteRefreshHook` correctly computed a new manifest path and exported it.
+- However, `Sa2VAOpsdRefCocoDataset.resolve_active_route_manifest_path()` always returned the original `route_manifest_path`, so `refresh_route_manifest_if_needed()` only reloaded the old file.
+- The dataset had an `active_route_manifest_path` field, but it was not actually used as the active source of truth.
+
+### Chosen Fix Direction
+- Make the dataset treat `active_route_manifest_path` as the first-priority manifest path.
+- After each successful route export, have `OpsdRouteRefreshHook` explicitly switch the dataset to the freshly written manifest before forcing a refresh.
+
+### Rejected Direction
+- Do not rely on filename timestamp heuristics or directory scanning inside the dataset. The hook already knows the exact new manifest path, so the handoff should be explicit.
+
+### Implemented Changes
+- Updated `projects/sa2va/datasets/refcoco_opsd.py`:
+  - `resolve_active_route_manifest_path()` now returns `active_route_manifest_path` first, then falls back to `route_manifest_path`
+  - added `set_active_route_manifest_path(path)`
+  - adjusted `load_route_manifest()` so `active_route_manifest_path` is maintained consistently across missing/existing manifest cases
+- Updated `projects/sa2va/hooks/opsd_route_refresh_hook.py`:
+  - after successful export, the hook now calls `dataset.set_active_route_manifest_path(str(manifest_path))`
+  - the subsequent refresh/log path now reloads the newly exported manifest instead of the initial startup manifest
 
 ### Problem
 - The GRPO confuser reward was sparse: wrong argmax predictions usually received `0`, so many rollout groups produced low-variance or zero-variance reward signals.

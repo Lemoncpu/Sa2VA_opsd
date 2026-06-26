@@ -78,6 +78,7 @@ class ConfuserSelectionResult:
 @dataclass
 class TeacherRegeneratePipelineResult:
     diagnosis_raw: str = ""
+    single_stage_raw: str = ""
     problem_raw: str = ""
     direction_raw: str = ""
     reason_raw: str = ""
@@ -2494,6 +2495,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "caption_problem={caption_problem} "
                 "correction_direction={correction_direction} "
                 "reason={reason} "
+                "single_stage_raw={single_stage_raw} "
                 "problem_raw={problem_raw} "
                 "direction_raw={direction_raw} "
                 "reason_raw={reason_raw} "
@@ -2526,6 +2528,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                     caption_problem=repr(record.get("caption_problem", "")),
                     correction_direction=repr(record.get("correction_direction", "")),
                     reason=repr(record.get("reason", "")),
+                    single_stage_raw=repr(record.get("single_stage_raw", "")),
                     problem_raw=repr(record.get("problem_raw", "")),
                     direction_raw=repr(record.get("direction_raw", "")),
                     reason_raw=repr(record.get("reason_raw", "")),
@@ -3626,6 +3629,77 @@ class Sa2VAOPSDModelV2(BaseModel):
             )
         return prompt
 
+    def build_teacher_regenerate_privileged_context_prompt(
+        self,
+        *,
+        student_question,
+        student_caption,
+        description_status,
+        reconstruction,
+        iou,
+        teacher_fields,
+    ):
+        clean_question = self._strip_image_placeholder(student_question)
+        return (
+            "<image>\n"
+            "You are a teacher supervising a mask-to-caption task with privileged access to region1 (gtmask) and "
+            "region2 (the current reconstructed refmask). Your job is to compare the two masks carefully, infer why "
+            "the student caption drifts, and then write a better target caption plus a shorter verification caption.\n"
+            f"Student prompt: {clean_question}\n"
+            f"Failed student caption: {student_caption}\n"
+            f"Description status: {description_status}\n"
+            f"Reconstruction status: {reconstruction.status}\n"
+            f"Reconstruction question: {reconstruction.question or ''}\n"
+            f"Current IoU between region1 and region2: {iou:.4f}\n"
+            f"Target summary: {teacher_fields.get('target_summary', '')}\n"
+            f"Distractor summary: {teacher_fields.get('distractor_summary', '')}\n"
+            f"Shared evidence: {teacher_fields.get('shared_evidence', '')}\n"
+            f"Target-only evidence: {teacher_fields.get('target_only_evidence', '')}\n"
+            f"Distractor-only evidence: {teacher_fields.get('distractor_only_evidence', '')}\n"
+            f"Difference focus: {teacher_fields.get('difference_focus', '')}\n"
+            f"Likely drift reason: {teacher_fields.get('likely_drift_reason', '')}\n"
+            f"Target localization hint: {teacher_fields.get('target_localization_hint', '')}\n"
+            f"Distractor localization hint: {teacher_fields.get('distractor_localization_hint', '')}\n"
+        )
+
+    def build_teacher_regenerate_single_prompt(
+        self,
+        *,
+        student_question,
+        student_caption,
+        description_status,
+        reconstruction,
+        iou,
+        teacher_fields,
+    ):
+        context_prompt = self.build_teacher_regenerate_privileged_context_prompt(
+            student_question=student_question,
+            student_caption=student_caption,
+            description_status=description_status,
+            reconstruction=reconstruction,
+            iou=iou,
+            teacher_fields=teacher_fields,
+        )
+        return context_prompt + (
+            "Follow this workflow internally before writing your answer:\n"
+            "1. Understand region1 / gtmask precisely.\n"
+            "2. Understand region2 / refmask precisely.\n"
+            "3. Compare the shared evidence, the target-only missing evidence, and the distractor-only extra evidence.\n"
+            "4. Infer why the student caption drifts toward region2 instead of isolating region1.\n"
+            "5. Write one corrected detailed localized caption for region1.\n"
+            "6. Write one shorter verification caption for reconstruction gating.\n"
+            "You may optionally include short diagnosis notes, but the main task is to produce both final captions.\n"
+            "Do not omit DLC or VERIFICATION_CAPTION even if the diagnosis is uncertain.\n"
+            "Output format:\n"
+            "DLC: <one natural and complete detailed localized caption>\n"
+            "VERIFICATION_CAPTION: <one shorter verifier-friendly caption>\n"
+            "Optional notes if helpful:\n"
+            "CAPTION_PROBLEM: <optional>\n"
+            "CORRECTION_DIRECTION: <optional>\n"
+            "REASON: <optional>\n"
+            "Do not output bullets, markdown, analysis preambles, or [SEG]."
+        )
+
     @staticmethod
     def generalized_jsd_token_loss(student_logits, teacher_logits, beta=0.5, temperature=1.0):
         student_logits = student_logits / temperature
@@ -3923,6 +3997,103 @@ class Sa2VAOPSDModelV2(BaseModel):
         pipeline_result.reason_is_coarse = self._teacher_reason_is_coarse(pipeline_result.reason)
         return pipeline_result
 
+    def generate_teacher_regenerate_single_stage(
+        self,
+        *,
+        image,
+        teacher_prompt_masks,
+        student_question,
+        student_caption,
+        description_status,
+        reconstruction,
+        iou,
+        gt_mask,
+        ref_mask,
+        teacher_fields,
+        pipeline_result,
+    ):
+        teacher_fields = dict(teacher_fields)
+        teacher_fields.update(
+            {
+                "target_summary": pipeline_result.target_summary,
+                "distractor_summary": pipeline_result.distractor_summary,
+                "shared_evidence": pipeline_result.shared_evidence,
+                "target_only_evidence": pipeline_result.target_only_evidence,
+                "distractor_only_evidence": pipeline_result.distractor_only_evidence,
+                "difference_focus": pipeline_result.difference_focus,
+                "target_localization_hint": pipeline_result.target_localization_hint,
+                "distractor_localization_hint": pipeline_result.distractor_localization_hint,
+                "likely_drift_reason": pipeline_result.likely_drift_reason,
+            }
+        )
+        prompt = self.build_teacher_regenerate_single_prompt(
+            student_question=student_question,
+            student_caption=student_caption,
+            description_status=description_status,
+            reconstruction=reconstruction,
+            iou=iou,
+            teacher_fields=teacher_fields,
+        )
+        teacher_fields["teacher_single_stage_prompt"] = prompt
+        raw_prediction = self._predict_teacher_privileged_text(
+            image=image,
+            teacher_prompt_masks=teacher_prompt_masks,
+            teacher_prompt=prompt,
+        )
+        pipeline_result.single_stage_raw = "" if raw_prediction is None else str(raw_prediction)
+        pipeline_result.dlc_raw = pipeline_result.single_stage_raw
+        pipeline_result.verification_raw = pipeline_result.single_stage_raw
+        pipeline_result.problem_raw = pipeline_result.single_stage_raw
+        pipeline_result.direction_raw = pipeline_result.single_stage_raw
+        pipeline_result.reason_raw = pipeline_result.single_stage_raw
+        pipeline_result.caption_problem = self._normalize_teacher_field_text(
+            self._extract_labeled_teacher_text(raw_prediction, "CAPTION_PROBLEM")
+        )
+        pipeline_result.correction_direction = self._normalize_teacher_field_text(
+            self._extract_labeled_teacher_text(raw_prediction, "CORRECTION_DIRECTION")
+        )
+        pipeline_result.reason = self._normalize_teacher_field_text(
+            self._extract_labeled_teacher_text(raw_prediction, "REASON")
+        )
+        pipeline_result.problem_valid = bool(pipeline_result.caption_problem)
+        pipeline_result.direction_valid = bool(pipeline_result.correction_direction)
+        pipeline_result.reason_valid = bool(pipeline_result.reason)
+        pipeline_result.diagnosis_valid = bool(
+            pipeline_result.problem_valid or pipeline_result.direction_valid or pipeline_result.reason_valid
+        )
+        pipeline_result.reason_is_coarse = bool(
+            pipeline_result.reason and self._teacher_reason_is_coarse(pipeline_result.reason)
+        )
+
+        detailed_caption = self._clean_caption_text(self._extract_labeled_teacher_text(raw_prediction, "DLC"))
+        detailed_completion_ids = self._encode_completion_from_caption(detailed_caption)
+        detailed_caption, detailed_completion_ids, detailed_was_truncated = self._truncate_caption_completion(
+            detailed_caption,
+            detailed_completion_ids,
+            max_tokens=self.description_max_new_tokens,
+        )
+        detailed_status = self._infer_description_status(detailed_caption)
+        if detailed_status == "ok" and not self._is_caption_content_sufficient(detailed_caption):
+            detailed_status = "truncated_caption"
+        if detailed_status != "seg_style_answer" and detailed_was_truncated:
+            detailed_status = "truncated_caption"
+        pipeline_result.detailed_caption = detailed_caption
+        pipeline_result.detailed_completion_ids = detailed_completion_ids
+        pipeline_result.detailed_status = detailed_status
+
+        verification_caption = self._clean_caption_text(
+            self._extract_labeled_teacher_text(raw_prediction, "VERIFICATION_CAPTION")
+        )
+        verification_status = self._infer_description_status(verification_caption)
+        if verification_status == "ok" and (
+            not self._is_caption_content_sufficient(verification_caption)
+            or self._is_overly_generic_caption(verification_caption)
+        ):
+            verification_status = "truncated_caption"
+        pipeline_result.verification_caption = verification_caption
+        pipeline_result.verification_status = verification_status
+        return pipeline_result
+
     def generate_teacher_light_diagnosis(
         self,
         *,
@@ -4196,7 +4367,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             pipeline_result.difference_context_failure_reason = "difference_context_invalid:trivial"
             return pipeline_result
 
-        pipeline_result = self.generate_teacher_problem_identification(
+        pipeline_result = self.generate_teacher_regenerate_single_stage(
             image=image,
             teacher_prompt_masks=teacher_prompt_masks,
             student_question=student_question,
@@ -4209,100 +4380,27 @@ class Sa2VAOPSDModelV2(BaseModel):
             teacher_fields=teacher_fields,
             pipeline_result=pipeline_result,
         )
-        pipeline_result.stop_stage = "problem"
-        (
-            pipeline_result.problem_valid,
-            pipeline_result.problem_failure_reason,
-        ) = self.validate_teacher_problem_identification(pipeline_result)
-        if not pipeline_result.problem_valid:
-            pipeline_result.diagnosis_valid = False
-            pipeline_result.diagnosis_failure_reason = pipeline_result.problem_failure_reason
+        pipeline_result.stop_stage = "single_stage_generation"
+        if not self._teacher_field_is_effective(
+            pipeline_result.single_stage_raw,
+            invalid_markers=("",),
+        ):
+            pipeline_result.diagnosis_failure_reason = "teacher_single_stage_invalid:empty_output"
             return pipeline_result
 
-        pipeline_result = self.generate_teacher_correction_direction(
-            image=image,
-            teacher_prompt_masks=teacher_prompt_masks,
-            student_question=student_question,
-            student_caption=student_caption,
-            description_status=description_status,
-            reconstruction=reconstruction,
-            iou=iou,
-            gt_mask=gt_mask,
-            ref_mask=ref_mask,
-            teacher_fields=teacher_fields,
-            pipeline_result=pipeline_result,
-        )
-        pipeline_result.stop_stage = "direction"
-        (
-            pipeline_result.direction_valid,
-            pipeline_result.direction_failure_reason,
-        ) = self.validate_teacher_correction_direction(pipeline_result)
-        if not pipeline_result.direction_valid:
-            pipeline_result.diagnosis_valid = False
-            pipeline_result.diagnosis_failure_reason = pipeline_result.direction_failure_reason
-            return pipeline_result
-
-        pipeline_result = self.generate_teacher_reason_explanation(
-            image=image,
-            teacher_prompt_masks=teacher_prompt_masks,
-            student_question=student_question,
-            student_caption=student_caption,
-            description_status=description_status,
-            reconstruction=reconstruction,
-            iou=iou,
-            gt_mask=gt_mask,
-            ref_mask=ref_mask,
-            teacher_fields=teacher_fields,
-            pipeline_result=pipeline_result,
-        )
-        pipeline_result.stop_stage = "reason"
-        (
-            pipeline_result.reason_valid,
-            pipeline_result.reason_failure_reason,
-        ) = self.validate_teacher_reason_explanation(pipeline_result)
-        pipeline_result.diagnosis_valid = bool(
-            pipeline_result.problem_valid and pipeline_result.direction_valid and pipeline_result.reason_valid
-        )
-        pipeline_result.diagnosis_failure_reason = (
-            pipeline_result.problem_failure_reason
-            or pipeline_result.direction_failure_reason
-            or pipeline_result.reason_failure_reason
-        )
-        if not pipeline_result.reason_valid:
-            return pipeline_result
-
-        pipeline_result = self.generate_teacher_dlc_from_diagnosis(
-            image=image,
-            teacher_prompt_masks=teacher_prompt_masks,
-            student_question=student_question,
-            student_caption=student_caption,
-            description_status=description_status,
-            reconstruction=reconstruction,
-            iou=iou,
-            gt_mask=gt_mask,
-            ref_mask=ref_mask,
-            teacher_fields=teacher_fields,
-            pipeline_result=pipeline_result,
-        )
         pipeline_result.stop_stage = "dlc"
+        failure_reason = self._validate_teacher_dlc(pipeline_result)
+        if failure_reason:
+            pipeline_result.detailed_failure_reason = failure_reason
         if pipeline_result.detailed_status != "ok" or pipeline_result.detailed_failure_reason:
             if not pipeline_result.detailed_failure_reason:
                 pipeline_result.detailed_failure_reason = f"teacher_dlc_invalid:{pipeline_result.detailed_status}"
             return pipeline_result
 
-        pipeline_result = self.generate_teacher_verification_caption(
-            image=image,
-            teacher_prompt_masks=teacher_prompt_masks,
-            student_question=student_question,
-            description_status=description_status,
-            reconstruction=reconstruction,
-            iou=iou,
-            gt_mask=gt_mask,
-            ref_mask=ref_mask,
-            teacher_fields=teacher_fields,
-            pipeline_result=pipeline_result,
-        )
         pipeline_result.stop_stage = "verification"
+        failure_reason = self._validate_teacher_verification_caption(pipeline_result)
+        if failure_reason:
+            pipeline_result.verification_failure_reason = failure_reason
         if pipeline_result.verification_status != "ok" or pipeline_result.verification_failure_reason:
             if not pipeline_result.verification_failure_reason:
                 pipeline_result.verification_failure_reason = (
@@ -4607,6 +4705,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             "teacher_caption_problem": "",
             "teacher_correction_direction": "",
             "teacher_reason": "",
+            "teacher_single_stage_raw": "",
             "teacher_problem_raw": "",
             "teacher_direction_raw": "",
             "teacher_reason_raw": "",
@@ -4658,6 +4757,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         result["teacher_caption_problem"] = teacher_regenerate.caption_problem
         result["teacher_correction_direction"] = teacher_regenerate.correction_direction
         result["teacher_reason"] = teacher_regenerate.reason
+        result["teacher_single_stage_raw"] = teacher_regenerate.single_stage_raw
         result["teacher_problem_raw"] = teacher_regenerate.problem_raw
         result["teacher_direction_raw"] = teacher_regenerate.direction_raw
         result["teacher_reason_raw"] = teacher_regenerate.reason_raw
@@ -4668,9 +4768,6 @@ class Sa2VAOPSDModelV2(BaseModel):
         result["teacher_pipeline_stop_stage"] = teacher_regenerate.stop_stage
         result["teacher_pipeline_failure_reason"] = (
             teacher_regenerate.difference_context_failure_reason
-            or teacher_regenerate.problem_failure_reason
-            or teacher_regenerate.direction_failure_reason
-            or teacher_regenerate.reason_failure_reason
             or teacher_regenerate.diagnosis_failure_reason
             or teacher_regenerate.detailed_failure_reason
             or teacher_regenerate.verification_failure_reason
@@ -5710,6 +5807,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             teacher_caption_problem = str(teacher_analysis.get("teacher_caption_problem", ""))
             teacher_correction_direction = str(teacher_analysis.get("teacher_correction_direction", ""))
             teacher_reason = str(teacher_analysis.get("teacher_reason", ""))
+            teacher_single_stage_raw = str(teacher_analysis.get("teacher_single_stage_raw", ""))
             teacher_problem_raw = str(teacher_analysis.get("teacher_problem_raw", ""))
             teacher_direction_raw = str(teacher_analysis.get("teacher_direction_raw", ""))
             teacher_reason_raw = str(teacher_analysis.get("teacher_reason_raw", ""))
@@ -5798,6 +5896,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "caption_problem": teacher_caption_problem,
                 "correction_direction": teacher_correction_direction,
                 "reason": teacher_reason,
+                "single_stage_raw": teacher_single_stage_raw,
                 "problem_raw": teacher_problem_raw,
                 "direction_raw": teacher_direction_raw,
                 "reason_raw": teacher_reason_raw,
@@ -6520,6 +6619,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                     f"teacher_caption_problem={teacher_caption_problem!r} "
                     f"teacher_correction_direction={teacher_correction_direction!r} "
                     f"teacher_reason={teacher_reason!r} "
+                    f"teacher_single_stage_raw={teacher_single_stage_raw!r} "
                     f"teacher_difference_focus={teacher_difference_focus!r} "
                     f"teacher_problem_raw={teacher_problem_raw!r} "
                     f"teacher_direction_raw={teacher_direction_raw!r} "
@@ -6589,6 +6689,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                     f"teacher_caption_problem={teacher_caption_problem!r} "
                     f"teacher_correction_direction={teacher_correction_direction!r} "
                     f"teacher_reason={teacher_reason!r} "
+                    f"teacher_single_stage_raw={teacher_single_stage_raw!r} "
                     f"teacher_difference_focus={teacher_difference_focus!r} "
                     f"teacher_problem_raw={teacher_problem_raw!r} "
                     f"teacher_direction_raw={teacher_direction_raw!r} "

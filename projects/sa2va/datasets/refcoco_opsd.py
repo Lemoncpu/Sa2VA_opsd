@@ -206,7 +206,10 @@ class Sa2VAOpsdRefCocoDataset(Dataset):
         return [100] * len(self)
 
     def resolve_active_route_manifest_path(self) -> Optional[str]:
-        return self.route_manifest_path
+        return self.active_route_manifest_path or self.route_manifest_path
+
+    def set_active_route_manifest_path(self, path: Optional[str]) -> None:
+        self.active_route_manifest_path = None if path is None else str(path)
 
     @staticmethod
     def load_route_manifest_file(path: str) -> Dict[str, Dict]:
@@ -231,16 +234,18 @@ class Sa2VAOpsdRefCocoDataset(Dataset):
     def load_route_manifest(self, required: bool = False):
         path = self.resolve_active_route_manifest_path()
         self.route_info_by_key = {}
-        self.active_route_manifest_path = path
         self.route_manifest_mtime = None
         if not path:
+            self.active_route_manifest_path = None
             if required:
                 raise FileNotFoundError("route_manifest_path is required but was not set.")
             return
         if not os.path.exists(path):
+            self.active_route_manifest_path = path
             if required:
                 raise FileNotFoundError(f"Route manifest does not exist: {path}")
             return
+        self.active_route_manifest_path = path
         self.route_info_by_key = self.load_route_manifest_file(path)
         self.route_manifest_mtime = os.path.getmtime(path)
         self.route_manifest_version += 1
