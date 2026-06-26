@@ -3690,6 +3690,9 @@ class Sa2VAOPSDModelV2(BaseModel):
             "6. Write one shorter verification caption for reconstruction gating.\n"
             "You may optionally include short diagnosis notes, but the main task is to produce both final captions.\n"
             "Do not omit DLC or VERIFICATION_CAPTION even if the diagnosis is uncertain.\n"
+            "Your answer must start immediately with 'DLC:' on the first line and 'VERIFICATION_CAPTION:' on the second line.\n"
+            "Do not write any preface such as 'Sure', 'The task is', 'The answer is', HTML tags, or quoted restatements of the prompt.\n"
+            "If you output anything before 'DLC:', the answer is invalid.\n"
             "Output format:\n"
             "DLC: <one natural and complete detailed localized caption>\n"
             "VERIFICATION_CAPTION: <one shorter verifier-friendly caption>\n"
@@ -4065,7 +4068,13 @@ class Sa2VAOPSDModelV2(BaseModel):
             pipeline_result.reason and self._teacher_reason_is_coarse(pipeline_result.reason)
         )
 
-        detailed_caption = self._clean_caption_text(self._extract_labeled_teacher_text(raw_prediction, "DLC"))
+        detailed_caption_raw = self._extract_labeled_teacher_text(raw_prediction, "DLC")
+        if not detailed_caption_raw:
+            fallback_caption = self._clean_caption_text(raw_prediction)
+            fallback_status = self._infer_description_status(fallback_caption)
+            if fallback_status == "ok":
+                detailed_caption_raw = fallback_caption
+        detailed_caption = self._clean_caption_text(detailed_caption_raw)
         detailed_completion_ids = self._encode_completion_from_caption(detailed_caption)
         detailed_caption, detailed_completion_ids, detailed_was_truncated = self._truncate_caption_completion(
             detailed_caption,
@@ -4081,9 +4090,10 @@ class Sa2VAOPSDModelV2(BaseModel):
         pipeline_result.detailed_completion_ids = detailed_completion_ids
         pipeline_result.detailed_status = detailed_status
 
-        verification_caption = self._clean_caption_text(
-            self._extract_labeled_teacher_text(raw_prediction, "VERIFICATION_CAPTION")
-        )
+        verification_caption_raw = self._extract_labeled_teacher_text(raw_prediction, "VERIFICATION_CAPTION")
+        if not verification_caption_raw and detailed_status == "ok":
+            verification_caption_raw = detailed_caption
+        verification_caption = self._clean_caption_text(verification_caption_raw)
         verification_status = self._infer_description_status(verification_caption)
         if verification_status == "ok" and (
             not self._is_caption_content_sufficient(verification_caption)

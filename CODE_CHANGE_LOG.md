@@ -243,6 +243,11 @@
   - Kept DLC and verification validation plus reconstruction gate unchanged.
   - Downgraded `caption_problem`, `correction_direction`, and `reason` to optional parsed logging fields from the single raw teacher output.
   - Added `single_stage_raw` logging so the one-shot teacher output is visible in debug and batch logs.
+
+### Follow-up Correction
+- Training logs showed that most single-stage teacher outputs were natural-language captions without the required `DLC:` / `VERIFICATION_CAPTION:` labels, so the parser treated them as empty and stopped at `teacher_dlc_invalid:empty`.
+- Tightened the single-stage prompt to require that the answer starts immediately with the two caption labels and forbids any prefatory text.
+- Added a parser fallback: when `DLC:` is missing but the raw teacher output cleans into a valid caption, reuse that cleaned text as the DLC instead of discarding the sample outright. When `VERIFICATION_CAPTION:` is missing but the DLC is valid, temporarily reuse the DLC text as the verification caption fallback.
   - `SA2VA_REFCOCO_OPSD_DEFAULT_WORK_DIR`
   - `SA2VA_REFCOCO_OPSD_DEFAULT_MODEL_PATH`
   - `SA2VA_REFCOCO_OPSD_DEFAULT_TOKENIZER_PATH`
