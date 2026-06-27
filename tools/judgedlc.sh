@@ -13,14 +13,16 @@ PRED_OUTPUT="${PRED_OUTPUT:-${OUTPUT_DIR}/pred.json}"
 WHEEL_DIR="${WHEEL_DIR:-/mnt/shared-storage-user/dnacoding/wuyucheng/workspace/Nemotrontiaozheng/wheels_repo}"
 PYTHON_BIN="${PYTHON_BIN:-/opt/vlm/bin/python}"
 LLM_ENGINE="${LLM_ENGINE:-meta-llama/Meta-Llama-3.1-8B-Instruct}"
-LLM_ENGINE_PATH="${LLM_ENGINE_PATH:-https://www.cctq.ai/v1}"
-API_KEY="${API_KEY:-sk-e3xpxVZMhL4I0iaZwurunj8yXK0Zaei25JOV0TP5QKdND04m}"
+LLM_ENGINE_PATH="${LLM_ENGINE_PATH:-https://api.openai.com/v1}"
+API_KEY="${API_KEY:-YOUR_OPENAI_API_KEY_HERE}"
 DEFAULT_PREDICTION="${DEFAULT_PREDICTION:-}"
 EVAL_SUFFIX="${EVAL_SUFFIX:-}"
 VERBOSE="${VERBOSE:-0}"
 QUIET="${QUIET:-0}"
 CSV_ONLY="${CSV_ONLY:-0}"
 PIP_INDEX_URL="${PIP_INDEX_URL:-http://mirrors.h.pjlab.org.cn/pypi/web/simple}"
+HTTP_PROXY="${HTTP_PROXY:-}"
+HTTPS_PROXY="${HTTPS_PROXY:-}"
 
 rjob submit \
   --cpu="${JOB_CPU}" \
@@ -44,6 +46,8 @@ rjob submit \
   LLM_ENGINE="${LLM_ENGINE}" \
   LLM_ENGINE_PATH="${LLM_ENGINE_PATH}" \
   API_KEY="${API_KEY}" \
+  HTTP_PROXY="${HTTP_PROXY}" \
+  HTTPS_PROXY="${HTTPS_PROXY}" \
   DEFAULT_PREDICTION="${DEFAULT_PREDICTION}" \
   EVAL_SUFFIX="${EVAL_SUFFIX}" \
   VERBOSE="${VERBOSE}" \
@@ -65,6 +69,10 @@ LOG_FILE="${OUTPUT_DIR}/judge_dlc.log"
 mkdir -p "${OUTPUT_DIR}"
 : >"${LOG_FILE}"
 export PYTHONUNBUFFERED=1
+export HTTP_PROXY="${HTTP_PROXY:-}"
+export HTTPS_PROXY="${HTTPS_PROXY:-}"
+export http_proxy="${HTTP_PROXY:-}"
+export https_proxy="${HTTPS_PROXY:-}"
 
 cd /opt
 tar -xzf vlm_env.tar.gz -C /opt/vlm

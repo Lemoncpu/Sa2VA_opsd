@@ -122,6 +122,7 @@ LOG_FILE="${LOG_DIR}/convert_$(basename "${SAVE_PATH}").log"
 mkdir -p "${LOG_DIR}"
 : >"${LOG_FILE}"
 export PYTHONUNBUFFERED=1
+export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 
 cd /opt
 tar -xzf vlm_env.tar.gz -C /opt/vlm

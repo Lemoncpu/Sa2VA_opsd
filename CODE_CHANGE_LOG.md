@@ -1184,3 +1184,32 @@
   - uses the requested DLC manifest work directory by default
   - auto-builds the confuser pool if missing
   - starts training through `tools/train_refcoco_opsd_impl.sh` with DLC-specific config overrides
+
+## 2026-06-28 HF Conversion And DLC Judge Environment Fixups
+
+### Problem
+- The new `tools/converthf_ckpt.sh` rjob wrapper reached `tools/convert_to_hf.py`, but failed with `No module named 'projects'` when MMEngine tried to import `projects.sa2va...` from the config.
+- The DLC judge rjob wrapper also ended up with an accidentally embedded real API key and had no first-class proxy passthrough, which made the judge path both unsafe and harder to run in restricted-network environments.
+
+### Root Cause Notes
+- The conversion rjob shell invoked `tools/convert_to_hf.py` from the repository root, but did not export `PYTHONPATH=${PROJECT_ROOT}`, so Python could not resolve the repository-local `projects` package during lazy config import.
+- `tools/judgedlc.sh` had been edited during earlier debugging and retained a real API key plus a non-placeholder default base URL in the script body.
+- The judge wrapper also did not forward `HTTP_PROXY` / `HTTPS_PROXY` into the job environment, so even a correctly configured proxy could not be used by the OpenAI client inside the container.
+
+### Chosen Fix Direction
+- Make the conversion rjob self-sufficient by exporting `PYTHONPATH` before running `tools/convert_to_hf.py`.
+- Restore judge script defaults to safe placeholders and explicitly support proxy passthrough for restricted-network clusters.
+
+### Rejected Direction
+- Do not patch `tools/convert_to_hf.py` itself just to fix the remote job environment. The failure was specific to the rjob wrapper setup, not the conversion utility CLI.
+- Do not leave the real API key in the repository even temporarily. Use placeholders in code and pass real secrets only through environment overrides at runtime.
+
+### Implemented Changes
+- Updated `tools/converthf_ckpt.sh` to export `PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}` before invoking `tools/convert_to_hf.py`, fixing `No module named 'projects'` in the remote conversion job.
+- Updated `tools/judgedlc.sh` to:
+  - restore safe defaults:
+    - `LLM_ENGINE_PATH=https://api.openai.com/v1`
+    - `API_KEY=YOUR_OPENAI_API_KEY_HERE`
+  - remove the accidentally embedded real API key
+  - accept and forward `HTTP_PROXY` / `HTTPS_PROXY`
+  - export lowercase proxy variants inside the container for clients that read `http_proxy` / `https_proxy`
