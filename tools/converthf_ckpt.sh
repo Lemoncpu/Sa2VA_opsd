@@ -132,6 +132,10 @@ mkdir -p "${LOG_DIR}"
 : >"${LOG_FILE}"
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
+cleanup() {
+  rm -f "${TMP_CONFIG}"
+}
+trap cleanup EXIT
 
 cd /opt
 tar -xzf vlm_env.tar.gz -C /opt/vlm
@@ -168,6 +172,25 @@ CONVERT_CMD=(
   --save-path "${SAVE_PATH}"
 )
 
+echo "[convert] config=${CONFIG_PATH}" | tee -a "${LOG_FILE}"
+echo "[convert] pth_model=${PTH_MODEL}" | tee -a "${LOG_FILE}"
+echo "[convert] base_model_path=${BASE_MODEL_PATH}" | tee -a "${LOG_FILE}"
+echo "[convert] save_path=${SAVE_PATH}" | tee -a "${LOG_FILE}"
+
+set +e
 stdbuf -oL -eL "${CONVERT_CMD[@]}" 2>&1 | tee -a "${LOG_FILE}"
-rm -f "${TMP_CONFIG}"
+convert_status=${PIPESTATUS[0]}
+set -e
+
+if [[ "${convert_status}" -ne 0 ]]; then
+  echo "[convert] FAILED exit_code=${convert_status}" | tee -a "${LOG_FILE}" >&2
+  exit "${convert_status}"
+fi
+
+if [[ ! -d "${SAVE_PATH}" ]]; then
+  echo "[convert] FAILED missing_output_dir=${SAVE_PATH}" | tee -a "${LOG_FILE}" >&2
+  exit 1
+fi
+
+echo "[convert] SUCCESS output_dir=${SAVE_PATH}" | tee -a "${LOG_FILE}"
 '

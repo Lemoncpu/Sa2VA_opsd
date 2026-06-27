@@ -1216,6 +1216,14 @@
 - Follow-up conversion fix:
   - `tools/convert_to_hf.py` still failed when the training config pointed `path` at the relative placeholder `./pretrained/Sa2VA-4B`
   - updated `tools/converthf_ckpt.sh` to accept `--base-model-path` and generate a temporary config with `path` rewritten to the actual mounted base model directory before calling `convert_to_hf.py`
+- Follow-up conversion observability fix:
+  - the conversion wrapper could exit before removing its temporary config file, which made failed runs look ambiguous and left no explicit success/failure marker in the log
+  - updated `tools/converthf_ckpt.sh` to:
+    - clean the temporary config via `trap` on every exit path
+    - log the effective config, checkpoint, base-model path, and save path
+    - capture the real `convert_to_hf.py` exit code from the pipeline
+    - emit explicit `[convert] FAILED ...` or `[convert] SUCCESS ...` markers
+    - fail loudly if the expected output directory was not created
 
 ## 2026-06-28 RefCOCO Caption-to-Mask Eval rjob Wrappers
 
@@ -1249,3 +1257,20 @@
   - defaults `MODEL_PATH=${PROJECT_ROOT}/work_dirs/hf_iter_400`
   - defaults `OUTPUT_PATH=${PROJECT_ROOT}/work_dirs/refcoco_caption_to_mask_eval_hf_iter_400.json`
   - forwards to the generic checkpoint wrapper
+
+## 2026-06-28 Local DLC Judge Default Model Update
+
+### Problem
+- The local DLC judge path was still defaulting to `meta-llama/Meta-Llama-3.1-8B-Instruct`, which the configured proxy backend rejected with `model_not_found`.
+
+### Root Cause Notes
+- The common judge wrapper `tools/judgedlc.sh` still carried the earlier backend-specific default model name, even after the local baseline judge flow had been switched to an OpenAI-compatible proxy path.
+
+### Chosen Fix Direction
+- Update the common judge wrapper default model to `gpt-5.5`, which matches the intended OpenAI-style judge backend more closely, while still allowing explicit overrides through `LLM_ENGINE`.
+
+### Rejected Direction
+- Do not hardcode the backend-specific model name only in one ad hoc local command. Keeping the shared wrapper default aligned avoids repeating the override for later baseline or checkpoint judge runs.
+
+### Implemented Changes
+- Updated `tools/judgedlc.sh` so the default `LLM_ENGINE` is now `gpt-5.5`.
