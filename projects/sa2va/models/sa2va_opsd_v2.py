@@ -2626,6 +2626,12 @@ class Sa2VAOPSDModelV2(BaseModel):
             with torch.inference_mode():
                 signature = inspect.signature(model.predict_forward)
                 accepted_kwargs = dict(kwargs)
+                prompt_text = accepted_kwargs.get("text")
+                if isinstance(prompt_text, str):
+                    has_visual_input = accepted_kwargs.get("image") is not None or accepted_kwargs.get("video") is not None
+                    uses_mask_prompts = accepted_kwargs.get("mask_prompts") is not None
+                    if (has_visual_input or uses_mask_prompts) and "<image>" not in prompt_text:
+                        accepted_kwargs["text"] = f"<image>\n{prompt_text.lstrip()}"
                 generation_override_keys = (
                     "max_new_tokens",
                     "do_sample",

@@ -263,6 +263,24 @@
   - builds a top-level `images` lookup when present,
   - resolves image names from `annotation.image_id` when the annotation itself does not include a direct filename field.
 
+## 2026-06-27 Remote Predict-Forward Needs Explicit Image Placeholder
+
+### Problem
+- DLC-Bench evaluation progressed past data loading but then crashed inside the remote `Sa2VA-4B` generation path with:
+  - `AssertionError` at `assert selected.sum() != 0`
+
+### Root Cause Notes
+- The runtime `trust_remote_code` implementation of `predict_forward()` expects the caller text to contain an explicit `<image>` placeholder so it can inject image tokens before tokenization.
+- The local OPSD helper path can build image-token prompts itself, but `_predict_forward_eval(...)` was still forwarding plain text such as `Describe the masked region in detail.` to older remote-code implementations.
+- As a result, the final `input_ids` contained no image-context token slots, and the patched `generate()` path failed when trying to place visual embeddings.
+
+### Chosen Fix Direction
+- Add a caller-side compatibility shim in `_predict_forward_eval(...)`.
+- Whenever visual input or `mask_prompts` are present and the text does not already contain `<image>`, prepend `<image>` automatically before calling the remote `predict_forward()`.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py` so `_predict_forward_eval(...)` now auto-prepends `<image>\n` to `text` for visual or mask-prompt inference calls when the placeholder is missing.
+
 ## 2026-06-26 Teacher Regenerate Single-Prompt Refactor
 
 ### Problem
