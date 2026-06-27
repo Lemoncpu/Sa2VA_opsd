@@ -176,8 +176,8 @@ cat > "${TMP_CONFIG}" <<EOF
 from pathlib import Path
 _src = Path(r"${CONFIG_PATH}")
 _text = _src.read_text()
-_text = _text.replace('path = "./pretrained/Sa2VA-4B"', 'path = r"${BASE_MODEL_PATH}"')
-_text = _text.replace('tokenizer_path = path', 'tokenizer_path = path')
+_text = _text.replace("path = \"./pretrained/Sa2VA-4B\"", "path = r\"${BASE_MODEL_PATH}\"")
+_text = _text.replace("tokenizer_path = path", "tokenizer_path = path")
 exec(compile(_text, str(_src), "exec"))
 EOF
 

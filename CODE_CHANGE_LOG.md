@@ -258,6 +258,24 @@
 - Added `--skip-apt-install 0|1` CLI control and remote log output for the chosen mode.
 - Wrapped the previous apt source rewrite and `apt install` block behind `SKIP_APT_INSTALL != 1`; default behavior now skips apt and uses image-provided system libraries.
 
+## 2026-06-28 HF Conversion Remote Shell Here-Doc Quoting Failure
+
+### Problem
+- After the apt stage was skipped successfully, the remote conversion job still ended immediately with `here-document ... delimited by end-of-file (wanted 'EOF')`.
+
+### Root Cause Notes
+- `tools/converthf_ckpt.sh` embeds a long remote `bash -lc '...'` script inside a single-quoted shell string.
+- The temporary Python config here-doc inside that remote script still contained single-quoted Python string literals, which prematurely terminated the outer single-quoted shell payload before the `EOF` marker could be reached.
+
+### Chosen Fix Direction
+- Remove single quotes from the embedded Python replacement lines so the full remote shell payload remains syntactically intact.
+
+### Rejected Direction
+- Do not keep debugging this as a here-doc formatting issue alone. The real breakage came from nested shell quoting, not from the `EOF` markers themselves.
+
+### Implemented Changes
+- Updated `tools/converthf_ckpt.sh` so the generated temporary Python config now uses double-quoted Python string literals in the `_text.replace(...)` lines, avoiding conflicts with the outer remote `bash -lc` single-quoted script body.
+
 ## 2026-06-27 Teacher Regenerate DLC Reconstruction Should Not Be Pre-Blocked
 
 ### Problem
