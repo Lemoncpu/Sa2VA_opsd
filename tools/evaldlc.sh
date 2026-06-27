@@ -80,7 +80,7 @@ DEVICE="${DEVICE:?}"
 PYTHON_BIN="${PYTHON_BIN:?}"
 JOB_GPU="${JOB_GPU:?}"
 PIP_INDEX_URL="${PIP_INDEX_URL:?}"
-LOG_FILE="${OUTPUT_DIR}/eval_dlc_${JOB_GPU}gpu.log"
+LOG_FILE="${OUTPUT_DIR}/export_dlc_${JOB_GPU}gpu.log"
 
 mkdir -p "${OUTPUT_DIR}"
 : >"${LOG_FILE}"
@@ -105,44 +105,20 @@ apt install -y libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
 cd "${PROJECT_ROOT}"
 
 EVAL_CMD=(
-  bash "${PROJECT_ROOT}/tools/run_dlc_bench_official_eval.sh"
+  bash "${PROJECT_ROOT}/tools/run_dlc_bench_export_only.sh"
   --python-bin "${PYTHON_BIN}"
   --model-path "${MODEL_PATH}"
   --tokenizer-path "${TOKENIZER_PATH}"
   --data-root "${DATA_ROOT}"
   --pred-output "${PRED_OUTPUT}"
   --debug-output "${DEBUG_OUTPUT}"
-  --official-repo-root "${OFFICIAL_REPO_ROOT}"
   --device "${DEVICE}"
   --start "${START}"
   --step "${STEP}"
-  --llm-engine "${LLM_ENGINE}"
 )
 
 if [[ -n "${LIMIT:-}" ]]; then
   EVAL_CMD+=(--limit "${LIMIT}")
 fi
-if [[ -n "${LLM_ENGINE_PATH:-}" ]]; then
-  EVAL_CMD+=(--llm-engine-path "${LLM_ENGINE_PATH}")
-fi
-if [[ -n "${API_KEY_PATH:-}" ]]; then
-  EVAL_CMD+=(--api-key "${API_KEY_PATH}")
-fi
-if [[ -n "${DEFAULT_PREDICTION:-}" ]]; then
-  EVAL_CMD+=(--default-prediction "${DEFAULT_PREDICTION}")
-fi
-if [[ -n "${EVAL_SUFFIX:-}" ]]; then
-  EVAL_CMD+=(--eval-suffix "${EVAL_SUFFIX}")
-fi
-if [[ "${VERBOSE}" == "1" ]]; then
-  EVAL_CMD+=(--verbose)
-fi
-if [[ "${QUIET}" == "1" ]]; then
-  EVAL_CMD+=(--quiet)
-fi
-if [[ "${CSV_ONLY}" == "1" ]]; then
-  EVAL_CMD+=(--csv-only)
-fi
-
 stdbuf -oL -eL "${EVAL_CMD[@]}" 2>&1 | tee -a "${LOG_FILE}"
 '

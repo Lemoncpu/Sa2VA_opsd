@@ -29,31 +29,14 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 PIP_INDEX_URL="${PIP_INDEX_URL:-http://mirrors.h.pjlab.org.cn/pypi/web/simple}"
 
 usage() {
-  echo "Usage:"
-  echo "  bash tools/run_dlc_bench_official_eval.sh --model-path PATH --data-root PATH --pred-output PATH --official-repo-root PATH [options]"
-  echo
-  echo "Options:"
-  echo "  --model-path PATH"
-  echo "  --tokenizer-path PATH"
-  echo "  --data-root PATH"
-  echo "  --pred-output PATH"
-  echo "  --debug-output PATH"
-  echo "  --device NAME               Default: cuda:0"
-  echo "  --official-repo-root PATH   Path to cloned NVlabs/describe-anything repo."
-  echo "  --llm-engine NAME           Passed as --model to official eval."
-  echo "  --llm-engine-path URL       Passed as --base-url to official eval."
-  echo "  --llm-engine-kwargs TEXT    Accepted for compatibility and ignored by the official script."
-  echo "  --api-key PATH              Passed to official eval."
-  echo "  --default-prediction TEXT   Passed to official eval."
-  echo "  --eval-suffix TEXT          Passed to official eval."
-  echo "  --verbose                   Passed to official eval."
-  echo "  --quiet                     Passed to official eval."
-  echo "  --csv-only                  Passed to official eval."
-  echo "  --limit N"
-  echo "  --start N                   Default: 0"
-  echo "  --step N                    Default: 1"
-  echo "  --student-question TEXT     Default: Describe the masked region in detail."
-  echo "  --python-bin PATH           Default: python3"
+  cat <<EOF
+Usage:
+  bash tools/run_dlc_bench_official_eval.sh --model-path PATH --data-root PATH --pred-output PATH --official-repo-root PATH [options]
+
+This is a convenience wrapper that runs:
+  1. export only
+  2. judge only
+EOF
 }
 
 while [[ $# -gt 0 ]]; do
@@ -160,41 +143,15 @@ if [[ -z "${MODEL_PATH}" || -z "${DATA_ROOT}" || -z "${PRED_OUTPUT}" || -z "${OF
   exit 1
 fi
 
-if [[ ! -d "${OFFICIAL_REPO_ROOT}" ]]; then
-  echo "Official repo root does not exist: ${OFFICIAL_REPO_ROOT}" >&2
-  exit 1
-fi
-
 TOKENIZER_PATH="${TOKENIZER_PATH:-${MODEL_PATH}}"
-EVAL_SCRIPT="${OFFICIAL_REPO_ROOT}/evaluation/eval_model_outputs.py"
-if [[ ! -f "${EVAL_SCRIPT}" ]]; then
-  echo "Missing official eval script: ${EVAL_SCRIPT}" >&2
-  exit 1
-fi
-
-ensure_python_dep() {
-  local module_name="$1"
-  local package_name="${2:-$1}"
-  if ! "${PYTHON_BIN}" -c "import ${module_name}" >/dev/null 2>&1; then
-    echo "Installing missing evaluation dependency: ${package_name}" >&2
-    "${PYTHON_BIN}" -m pip install \
-      -i "${PIP_INDEX_URL}" \
-      --trusted-host "mirrors.h.pjlab.org.cn" \
-      "${package_name}"
-  fi
-}
-
-ensure_python_dep "inflect" "inflect"
-ensure_python_dep "tqdm" "tqdm"
-ensure_python_dep "openai" "openai"
 
 EXPORT_CMD=(
-  "${PYTHON_BIN}"
-  "${ROOT_DIR}/tools/eval_dlc_bench_official.py"
+  bash "${ROOT_DIR}/tools/run_dlc_bench_export_only.sh"
+  --python-bin "${PYTHON_BIN}"
   --model-path "${MODEL_PATH}"
   --tokenizer-path "${TOKENIZER_PATH}"
   --data-root "${DATA_ROOT}"
-  --output "${PRED_OUTPUT}"
+  --pred-output "${PRED_OUTPUT}"
   --device "${DEVICE}"
   --start "${START}"
   --step "${STEP}"
@@ -207,41 +164,41 @@ if [[ -n "${DEBUG_OUTPUT}" ]]; then
   EXPORT_CMD+=(--debug-output "${DEBUG_OUTPUT}")
 fi
 
-echo "Generating official DLC-Bench prediction file..."
-"${EXPORT_CMD[@]}"
-
-EVAL_CMD=(
-  "${PYTHON_BIN}"
-  "${EVAL_SCRIPT}"
-  --pred "${PRED_OUTPUT}"
-  --qa "${DATA_ROOT}/qa.json"
-  --class-names "${DATA_ROOT}/class_names.json"
-  --model "${LLM_ENGINE}"
+JUDGE_CMD=(
+  bash "${ROOT_DIR}/tools/run_dlc_bench_judge_only.sh"
+  --python-bin "${PYTHON_BIN}"
+  --pred-output "${PRED_OUTPUT}"
+  --data-root "${DATA_ROOT}"
+  --official-repo-root "${OFFICIAL_REPO_ROOT}"
+  --llm-engine "${LLM_ENGINE}"
 )
 if [[ -n "${LLM_ENGINE_PATH}" ]]; then
-  EVAL_CMD+=(--base-url "${LLM_ENGINE_PATH}")
+  JUDGE_CMD+=(--llm-engine-path "${LLM_ENGINE_PATH}")
 fi
 if [[ -n "${API_KEY_PATH}" ]]; then
-  EVAL_CMD+=(--api-key "${API_KEY_PATH}")
+  JUDGE_CMD+=(--api-key "${API_KEY_PATH}")
 fi
 if [[ -n "${DEFAULT_PREDICTION}" ]]; then
-  EVAL_CMD+=(--default-prediction "${DEFAULT_PREDICTION}")
+  JUDGE_CMD+=(--default-prediction "${DEFAULT_PREDICTION}")
 fi
 if [[ -n "${EVAL_SUFFIX}" ]]; then
-  EVAL_CMD+=(--suffix "${EVAL_SUFFIX}")
+  JUDGE_CMD+=(--eval-suffix "${EVAL_SUFFIX}")
 fi
 if [[ "${VERBOSE}" == "1" ]]; then
-  EVAL_CMD+=(--verbose)
+  JUDGE_CMD+=(--verbose)
 fi
 if [[ "${QUIET}" == "1" ]]; then
-  EVAL_CMD+=(--quiet)
+  JUDGE_CMD+=(--quiet)
 fi
 if [[ "${CSV_ONLY}" == "1" ]]; then
-  EVAL_CMD+=(--csv)
+  JUDGE_CMD+=(--csv-only)
 fi
 if [[ -n "${LLM_ENGINE_KWARGS}" ]]; then
-  echo "Ignoring --llm-engine-kwargs because official eval_model_outputs.py does not accept it." >&2
+  JUDGE_CMD+=(--llm-engine-kwargs "${LLM_ENGINE_KWARGS}")
 fi
 
-echo "Running official NVlabs/describe-anything evaluation..."
-"${EVAL_CMD[@]}"
+echo "Step 1/2: export pred.json"
+"${EXPORT_CMD[@]}"
+
+echo "Step 2/2: run official judge"
+"${JUDGE_CMD[@]}"

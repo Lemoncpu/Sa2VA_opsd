@@ -372,6 +372,31 @@
   - add `--trusted-host mirrors.h.pjlab.org.cn`,
   - remove the unconditional pip install from the remote bootstrap and keep dependency installation only in the wrapper's missing-package check path.
 
+## 2026-06-27 Split DLC Export And Official Judge Into Two Scripts
+
+### Problem
+- The combined DLC-Bench workflow kept mixing two separate concerns:
+  - generating `pred.json`
+  - running the official LLM judge
+- In the current environment, export is stable but the judge side is fragile because Python dependency availability depends on network/mirror state.
+
+### Root Cause Notes
+- A single all-in-one script made the full evaluation job fail even when the useful artifact (`pred.json`) had already been generated correctly.
+- The existing rjob wrapper also defaulted to running both stages together, which is not a good fit for the current constrained runtime.
+
+### Chosen Fix Direction
+- Split the workflow into two first-class scripts:
+  - export only
+  - judge only
+- Keep a compatibility wrapper that can still run both sequentially when the environment supports it.
+- Change the rjob export wrapper to default to the export-only stage.
+
+### Implemented Changes
+- Added `tools/run_dlc_bench_export_only.sh` to generate official-format `pred.json` and optional debug output only.
+- Added `tools/run_dlc_bench_judge_only.sh` to score an existing `pred.json` with the official `describe-anything` judge.
+- Replaced `tools/run_dlc_bench_official_eval.sh` with a thin two-step wrapper that simply chains the new export-only and judge-only scripts.
+- Updated `tools/evaldlc.sh` so the remote rjob path now runs export-only by default and writes `export_dlc_<gpu>.log`.
+
 ## 2026-06-26 Teacher Regenerate Single-Prompt Refactor
 
 ### Problem
