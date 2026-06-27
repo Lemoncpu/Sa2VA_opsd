@@ -27,6 +27,7 @@ EVAL_SUFFIX="${EVAL_SUFFIX:-}"
 VERBOSE="${VERBOSE:-0}"
 QUIET="${QUIET:-0}"
 CSV_ONLY="${CSV_ONLY:-0}"
+PIP_INDEX_URL="${PIP_INDEX_URL:-https://mirrors.h.pjlab.org.cn/pypi/web/simple}"
 
 rjob submit \
   --cpu="${JOB_CPU}" \
@@ -63,6 +64,7 @@ rjob submit \
   VERBOSE="${VERBOSE}" \
   QUIET="${QUIET}" \
   CSV_ONLY="${CSV_ONLY}" \
+  PIP_INDEX_URL="${PIP_INDEX_URL}" \
   bash -lc '
 set -euo pipefail
 
@@ -77,6 +79,7 @@ DEBUG_OUTPUT="${DEBUG_OUTPUT:?}"
 DEVICE="${DEVICE:?}"
 PYTHON_BIN="${PYTHON_BIN:?}"
 JOB_GPU="${JOB_GPU:?}"
+PIP_INDEX_URL="${PIP_INDEX_URL:?}"
 LOG_FILE="${OUTPUT_DIR}/eval_dlc_${JOB_GPU}gpu.log"
 
 mkdir -p "${OUTPUT_DIR}"
@@ -98,7 +101,7 @@ EOF
 apt update
 apt install -y libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
 /opt/vlm/bin/python -c "import torch, transformers; print(\"ok\")"
-/opt/vlm/bin/python -m pip install -q inflect tqdm openai
+/opt/vlm/bin/python -m pip install -q -i "${PIP_INDEX_URL}" inflect tqdm openai
 
 cd "${PROJECT_ROOT}"
 

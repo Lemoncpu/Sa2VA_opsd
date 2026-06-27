@@ -26,6 +26,7 @@ START="${START:-0}"
 STEP="${STEP:-1}"
 STUDENT_QUESTION="${STUDENT_QUESTION:-$'\nDescribe the masked region in detail.'}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+PIP_INDEX_URL="${PIP_INDEX_URL:-https://mirrors.h.pjlab.org.cn/pypi/web/simple}"
 
 usage() {
   echo "Usage:"
@@ -176,7 +177,7 @@ ensure_python_dep() {
   local package_name="${2:-$1}"
   if ! "${PYTHON_BIN}" -c "import ${module_name}" >/dev/null 2>&1; then
     echo "Installing missing evaluation dependency: ${package_name}" >&2
-    "${PYTHON_BIN}" -m pip install "${package_name}"
+    "${PYTHON_BIN}" -m pip install -i "${PIP_INDEX_URL}" "${package_name}"
   fi
 }
 

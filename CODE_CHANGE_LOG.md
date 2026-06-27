@@ -360,6 +360,11 @@
   - `/opt/vlm/bin/python -m pip install -q inflect tqdm openai`
   after unpacking the environment and verifying the base Python stack.
 
+### Follow-up Correction
+- The first dependency-install patch still used the default public `pypi.org` index, which timed out inside the rjob container.
+- Updated both `tools/evaldlc.sh` and `tools/run_dlc_bench_official_eval.sh` to install Python dependencies through the PJLab mirror:
+  - `https://mirrors.h.pjlab.org.cn/pypi/web/simple`
+
 ## 2026-06-26 Teacher Regenerate Single-Prompt Refactor
 
 ### Problem
