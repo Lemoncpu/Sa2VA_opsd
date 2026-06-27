@@ -1,6 +1,7 @@
 import argparse
 import json
 from pathlib import Path
+import re
 import sys
 
 import numpy as np
@@ -132,6 +133,38 @@ def _build_mask_prompts(mask):
     return np.expand_dims(mask.astype(np.float32), axis=0)
 
 
+def _clean_official_eval_caption(caption: str) -> str:
+    text = (caption or "").strip()
+    if not text:
+        return ""
+
+    cleanup_patterns = (
+        r"^\s*in\s+region1\s*,?\s*",
+        r"^\s*the\s+region1\s+contains\s+",
+        r"^\s*the\s+region1\s+region\s+in\s+the\s+image\s+is\s+",
+        r"^\s*the\s+region1\s+region\s+is\s+",
+        r"^\s*the\s+region1\s+is\s+",
+        r"^\s*the\s+region\s+in\s+region1\s+shows\s+",
+        r"^\s*the\s+region\s+in\s+the\s+image\s+shows\s+",
+        r"^\s*the\s+masked\s+region\s+in\s+the\s+image\s+(?:is|represents)\s+",
+        r"^\s*the\s+masked\s+region\s+(?:is|represents)\s+",
+        r"^\s*the\s+target\s+in\s+region1\s+is\s+",
+        r"^\s*the\s+target\s+marked\s+by\s+region1\s+is\s+",
+    )
+    for pattern in cleanup_patterns:
+        text = re.sub(pattern, "", text, flags=re.IGNORECASE)
+
+    text = re.sub(r"\bregion1\b", "region", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip(" ,.")
+    if not text:
+        return ""
+    if text[0].isalpha():
+        text = text[0].upper() + text[1:]
+    if text[-1] not in ".!?":
+        text += "."
+    return text
+
+
 def main():
     args = parse_args()
     data_root = Path(args.data_root).expanduser().resolve()
@@ -203,7 +236,7 @@ def main():
                 mask_prompts=_build_mask_prompts(gt_mask),
                 student_question=args.student_question,
             )
-            caption = description.clean_caption or ""
+            caption = _clean_official_eval_caption(description.clean_caption or "")
             predictions[ann_id] = caption
             token_count = model._caption_token_count(caption)
             if description.status == "ok" and caption:
@@ -214,6 +247,7 @@ def main():
                 "class_name": class_name,
                 "raw_prediction": description.raw_prediction,
                 "clean_caption": caption,
+                "model_clean_caption": description.clean_caption or "",
                 "description_status": description.status,
                 "caption_token_count": token_count,
             }

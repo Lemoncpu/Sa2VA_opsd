@@ -298,6 +298,29 @@
 ### Implemented Changes
 - Updated `tools/run_dlc_bench_official_eval.sh` so it now checks and installs missing `inflect`, `tqdm`, and `openai` packages via `${PYTHON_BIN} -m pip install ...` before running the official evaluation.
 
+## 2026-06-27 DLC-Bench Official Export Caption Cleanup For Region Markers
+
+### Problem
+- Official DLC-Bench export was producing many captions with task-specific marker phrasing such as:
+  - `In region1, ...`
+  - `The region1 contains ...`
+  - `The masked region in the image is ...`
+- These are artifacts of OPSD training/task prompts, not desirable final DLC-style captions for official evaluation.
+
+### Root Cause Notes
+- The model's native `clean_caption` is shared with training behavior and intentionally preserves much of the generated sentence content.
+- For official DLC-Bench scoring, that shared cleanup is not sufficient because it does not strip benchmark-irrelevant task markers like `region1`.
+
+### Chosen Fix Direction
+- Add a dedicated official-eval-only cleanup layer in the export script rather than changing the training-time caption normalization.
+- Remove leading `region1` / `masked region` template phrases while leaving the rest of the sentence intact.
+
+### Implemented Changes
+- Updated `tools/eval_dlc_bench_official.py` so it now:
+  - applies `_clean_official_eval_caption(...)` before writing `pred.json`,
+  - strips common leading patterns such as `In region1,`, `The region1 contains`, `The target in region1 is`, and `The masked region in the image is`,
+  - preserves the original model-cleaned caption separately in the debug sidecar as `model_clean_caption`.
+
 ## 2026-06-26 Teacher Regenerate Single-Prompt Refactor
 
 ### Problem
