@@ -27,6 +27,7 @@ STEP="${STEP:-1}"
 STUDENT_QUESTION="${STUDENT_QUESTION:-$'\nDescribe the masked region in detail.'}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 PIP_INDEX_URL="${PIP_INDEX_URL:-http://mirrors.h.pjlab.org.cn/pypi/web/simple}"
+WHEEL_DIR="${WHEEL_DIR:-}"
 
 usage() {
   cat <<EOF
@@ -36,6 +37,9 @@ Usage:
 This is a convenience wrapper that runs:
   1. export only
   2. judge only
+
+Judge dependency options:
+  --wheel-dir PATH           Offline wheel directory for judge dependencies
 EOF
 }
 
@@ -125,6 +129,10 @@ while [[ $# -gt 0 ]]; do
       PYTHON_BIN="$2"
       shift 2
       ;;
+    --wheel-dir)
+      WHEEL_DIR="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -172,6 +180,9 @@ JUDGE_CMD=(
   --official-repo-root "${OFFICIAL_REPO_ROOT}"
   --llm-engine "${LLM_ENGINE}"
 )
+if [[ -n "${WHEEL_DIR}" ]]; then
+  JUDGE_CMD+=(--wheel-dir "${WHEEL_DIR}")
+fi
 if [[ -n "${LLM_ENGINE_PATH}" ]]; then
   JUDGE_CMD+=(--llm-engine-path "${LLM_ENGINE_PATH}")
 fi

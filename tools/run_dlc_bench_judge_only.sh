@@ -19,6 +19,7 @@ QUIET="${QUIET:-0}"
 CSV_ONLY="${CSV_ONLY:-0}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 PIP_INDEX_URL="${PIP_INDEX_URL:-http://mirrors.h.pjlab.org.cn/pypi/web/simple}"
+WHEEL_DIR="${WHEEL_DIR:-}"
 
 usage() {
   cat <<EOF
@@ -39,6 +40,7 @@ Options:
   --quiet
   --csv-only
   --python-bin PATH
+  --wheel-dir PATH
 EOF
 }
 
@@ -96,6 +98,10 @@ while [[ $# -gt 0 ]]; do
       PYTHON_BIN="$2"
       shift 2
       ;;
+    --wheel-dir)
+      WHEEL_DIR="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -114,6 +120,11 @@ if [[ -z "${PRED_OUTPUT}" || -z "${DATA_ROOT}" || -z "${OFFICIAL_REPO_ROOT}" ]];
   exit 1
 fi
 
+if [[ -n "${WHEEL_DIR}" && ! -d "${WHEEL_DIR}" ]]; then
+  echo "Missing wheel directory: ${WHEEL_DIR}" >&2
+  exit 1
+fi
+
 if [[ ! -f "${PRED_OUTPUT}" ]]; then
   echo "Missing pred file: ${PRED_OUTPUT}" >&2
   exit 1
@@ -125,21 +136,36 @@ if [[ ! -f "${EVAL_SCRIPT}" ]]; then
   exit 1
 fi
 
-ensure_python_dep() {
-  local module_name="$1"
-  local package_name="${2:-$1}"
-  if ! "${PYTHON_BIN}" -c "import ${module_name}" >/dev/null 2>&1; then
-    echo "Installing missing evaluation dependency: ${package_name}" >&2
+ensure_python_deps() {
+  local missing=0
+  local dep_specs=("inflect" "typeguard" "more_itertools" "tqdm" "openai")
+
+  "${PYTHON_BIN}" - <<'PY' >/dev/null 2>&1 || missing=1
+import importlib
+required = ["inflect", "typeguard", "more_itertools", "tqdm", "openai"]
+for name in required:
+    importlib.import_module(name)
+PY
+
+  if [[ "${missing}" != "1" ]]; then
+    return 0
+  fi
+
+  echo "Installing missing evaluation dependencies..." >&2
+  if [[ -n "${WHEEL_DIR}" ]]; then
+    "${PYTHON_BIN}" -m pip install \
+      --no-index \
+      --find-links "${WHEEL_DIR}" \
+      "${dep_specs[@]}"
+  else
     "${PYTHON_BIN}" -m pip install \
       -i "${PIP_INDEX_URL}" \
       --trusted-host "mirrors.h.pjlab.org.cn" \
-      "${package_name}"
+      "${dep_specs[@]}"
   fi
 }
 
-ensure_python_dep "inflect" "inflect"
-ensure_python_dep "tqdm" "tqdm"
-ensure_python_dep "openai" "openai"
+ensure_python_deps
 
 EVAL_CMD=(
   "${PYTHON_BIN}"

@@ -238,6 +238,38 @@
 
 ### Implemented Changes
 - Updated `projects/sa2va/models/sa2va_opsd_v2.py` so `run_teacher_regenerate_pipeline(...)` now:
+  - keeps local DLC validation as a debug signal instead of a hard pre-reconstruction stop
+  - reconstructs directly from the generated teacher DLC once raw output is non-empty
+  - lets the existing gate decide CE admission instead of pre-blocking on local caption heuristics
+
+## 2026-06-27 DLC Official Judge Offline Wheel Support
+
+### Problem
+- The official `NVlabs/describe-anything` DLC-Bench judge path depended on runtime `pip install` from an online index.
+- In the target training/eval environment, public package install was unreliable, and the local mirror did not consistently provide all required judge dependencies such as `inflect`.
+
+### Root Cause Notes
+- `tools/run_dlc_bench_judge_only.sh` only had an online-install fallback and did not support a user-prepared offline wheel repository.
+- There was also no dedicated rjob submit wrapper for judge-only execution, so even after exporting `pred.json`, running the official judge in the remote environment still required manual shell work.
+
+### Chosen Fix Direction
+- Add explicit `--wheel-dir` support to the judge-only wrapper and install judge dependencies from a local wheel directory when provided.
+- Add a dedicated `tools/judgedlc.sh` rjob wrapper so exported predictions can be judged remotely with the offline wheel repo and without hand-assembling commands inside the container.
+
+### Rejected Direction
+- Do not fold more fallback package logic into the export script. Export and judge are intentionally split so caption export remains usable even when official judge dependencies are unavailable.
+
+### Implemented Changes
+- Updated `tools/run_dlc_bench_judge_only.sh`:
+  - validates `--wheel-dir` when provided
+  - installs the official judge dependencies from the offline wheel directory with `pip --no-index --find-links`
+  - installs the full small dependency set required by the official evaluator path: `inflect`, `typeguard`, `more_itertools`, `tqdm`, and `openai`
+- Updated `tools/run_dlc_bench_official_eval.sh` usage text to document the offline `--wheel-dir` judge path.
+- Added `tools/judgedlc.sh` as an rjob submit wrapper for judge-only execution with:
+  - mounted project paths
+  - wheel directory passthrough
+  - container bootstrap
+  - judge log output to `${OUTPUT_DIR}/judge_dlc.log`
   - keeps `teacher_dlc_invalid:*` as a logged failure reason only,
   - always attempts reconstruction from `pipeline_result.detailed_caption` after single-stage DLC generation,
   - uses gate/reconstruction outcome as the real stop condition,
