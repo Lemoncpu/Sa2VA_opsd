@@ -275,6 +275,32 @@
   - Changed the teacher gate reconstruction input from `verification_caption` to the generated DLC itself.
   - Stopped treating trivial difference context as a hard early exit; it is now log-only context.
   - Updated teacher regenerate analysis bookkeeping so reconstruction success and gate status now reflect DLC reconstruction rather than verification-caption reconstruction.
+
+## 2026-06-27 DLC-Bench RJob Evaluation Wrapper
+
+### Problem
+- DLC-Bench evaluation could be run locally through the official wrapper, but there was no remote `rjob` submission script matching the training launch style.
+
+### Root Cause Notes
+- The repository already had `tools/run_dlc_bench_official_eval.sh`, but no cluster-friendly wrapper that mounted shared storage, unpacked the runtime environment, and allowed selecting a custom checkpoint path.
+
+### Chosen Fix Direction
+- Add a dedicated `rjob` submission wrapper for DLC-Bench evaluation that mirrors the style of `tools/train1.sh` while targeting the official NVlabs evaluation flow.
+
+### Implemented Changes
+- Added `tools/evaldlc.sh`:
+  - Submits an `rjob` with 1-GPU defaults suitable for evaluation.
+  - Accepts overridable `MODEL_PATH` / `TOKENIZER_PATH` so different weights can be evaluated directly.
+  - Uses the downloaded `DLC-bench` data root and the cloned `describe-anything` repo root.
+  - Calls `tools/run_dlc_bench_official_eval.sh` inside the job and writes logs under the chosen output directory.
+
+### Follow-up CLI Convenience Wrapper
+- Added `tools/evaldlc_ckpt.sh` as a more ergonomic entrypoint for checkpoint evaluation.
+- It accepts explicit flags such as `--model-path` and `--output-dir`, derives defaults like tokenizer path and output directory when omitted, and then forwards everything to `tools/evaldlc.sh`.
+
+### Follow-up Baseline Wrapper
+- Added `tools/evaldlc_baseline.sh` for the fixed baseline checkpoint at `/mnt/shared-storage-user/dnacoding/wuyucheng/workspace/Nemotrontiaozheng/Sa2VA-4B`.
+- It forwards to `tools/evaldlc_ckpt.sh` while pre-filling the baseline model/tokenizer paths and a dedicated default output directory.
   - `SA2VA_REFCOCO_OPSD_DEFAULT_WORK_DIR`
   - `SA2VA_REFCOCO_OPSD_DEFAULT_MODEL_PATH`
   - `SA2VA_REFCOCO_OPSD_DEFAULT_TOKENIZER_PATH`
