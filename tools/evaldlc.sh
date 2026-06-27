@@ -98,6 +98,7 @@ EOF
 apt update
 apt install -y libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
 /opt/vlm/bin/python -c "import torch, transformers; print(\"ok\")"
+/opt/vlm/bin/python -m pip install -q inflect tqdm openai
 
 cd "${PROJECT_ROOT}"
 

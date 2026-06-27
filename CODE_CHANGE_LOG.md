@@ -342,6 +342,24 @@
   - `teacher_regenerate_rejected_count`
   - `teacher_regenerate_dlc_ce_applied_count`
 
+## 2026-06-27 DLC Eval Remote Image Setup Should Preinstall Judge Dependencies
+
+### Problem
+- The DLC-Bench rjob wrapper could finish model export and only then fail inside the official judge because the remote container was missing packages like `inflect`.
+
+### Root Cause Notes
+- Dependency checks had been added in the local wrapper path, but the remote image bootstrap in `tools/evaldlc.sh` still only guaranteed base system libs plus `torch`/`transformers`.
+- That meant the remote job environment was not explicitly provisioned with the official judge's Python dependencies during startup.
+
+### Chosen Fix Direction
+- Mirror the `train1.sh` style of environment preparation directly in the remote image command.
+- Install the official DLC judge dependencies as part of the rjob bootstrap, before launching the evaluation wrapper.
+
+### Implemented Changes
+- Updated `tools/evaldlc.sh` so the remote job bootstrap now runs:
+  - `/opt/vlm/bin/python -m pip install -q inflect tqdm openai`
+  after unpacking the environment and verifying the base Python stack.
+
 ## 2026-06-26 Teacher Regenerate Single-Prompt Refactor
 
 ### Problem
