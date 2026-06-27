@@ -14,6 +14,10 @@ METRICS = (
     "opsd_grpo",
     "verifier_iou",
     "teacher_regenerate_gate_pass_rate",
+    "teacher_regenerate_ce_applied_count",
+    "teacher_regenerate_verified_count",
+    "teacher_regenerate_rejected_count",
+    "teacher_regenerate_dlc_ce_applied_count",
     "grpo_reward_mean",
     "grpo_mcq_acc",
 )

@@ -321,6 +321,27 @@
   - strips common leading patterns such as `In region1,`, `The region1 contains`, `The target in region1 is`, and `The masked region in the image is`,
   - preserves the original model-cleaned caption separately in the debug sidecar as `model_clean_caption`.
 
+## 2026-06-27 Training Plot Should Show Teacher CE Application Counts
+
+### Problem
+- The training plot could show non-zero `teacher_regenerate_gate_pass_rate` while `opsd_regen_ce` stayed at zero on many sampled iterations.
+- That made it hard to tell whether regen CE was genuinely absent or simply not applied on the plotted logger steps.
+
+### Root Cause Notes
+- `opsd_regen_ce` is already recorded by the training loop, but it only reflects the actual regen loss value for iterations that contain regen entries.
+- The plotting script did not include the teacher CE application counters that would explain when gate-passed teacher outputs were really admitted into CE supervision.
+
+### Chosen Fix Direction
+- Keep the existing `opsd_regen_ce` loss plot as the true regen-loss signal.
+- Expand the plotting defaults to also visualize teacher regenerate CE application and verified/rejected counts.
+
+### Implemented Changes
+- Updated `tools/plot_training_metrics.py` so the default plotted metrics now also include:
+  - `teacher_regenerate_ce_applied_count`
+  - `teacher_regenerate_verified_count`
+  - `teacher_regenerate_rejected_count`
+  - `teacher_regenerate_dlc_ce_applied_count`
+
 ## 2026-06-26 Teacher Regenerate Single-Prompt Refactor
 
 ### Problem
