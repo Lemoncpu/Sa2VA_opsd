@@ -171,6 +171,19 @@ if [[ ! -f "${EVAL_SCRIPT}" ]]; then
   exit 1
 fi
 
+ensure_python_dep() {
+  local module_name="$1"
+  local package_name="${2:-$1}"
+  if ! "${PYTHON_BIN}" -c "import ${module_name}" >/dev/null 2>&1; then
+    echo "Installing missing evaluation dependency: ${package_name}" >&2
+    "${PYTHON_BIN}" -m pip install "${package_name}"
+  fi
+}
+
+ensure_python_dep "inflect" "inflect"
+ensure_python_dep "tqdm" "tqdm"
+ensure_python_dep "openai" "openai"
+
 EXPORT_CMD=(
   "${PYTHON_BIN}"
   "${ROOT_DIR}/tools/eval_dlc_bench_official.py"

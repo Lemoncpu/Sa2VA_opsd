@@ -281,6 +281,23 @@
 ### Implemented Changes
 - Updated `projects/sa2va/models/sa2va_opsd_v2.py` so `_predict_forward_eval(...)` now auto-prepends `<image>\n` to `text` for visual or mask-prompt inference calls when the placeholder is missing.
 
+## 2026-06-27 DLC-Bench Official Judge Missing Runtime Dependencies
+
+### Problem
+- DLC-Bench prediction export succeeded, but the second evaluation stage failed immediately inside the official `describe-anything` judge script with:
+  - `ModuleNotFoundError: No module named 'inflect'`
+
+### Root Cause Notes
+- `tools/run_dlc_bench_official_eval.sh` intentionally delegates scoring to the official `evaluation/eval_model_outputs.py`.
+- The remote job environment used by the wrapper did not guarantee that the official judge's Python-side dependencies were preinstalled.
+
+### Chosen Fix Direction
+- Keep using the official judge entrypoint unchanged.
+- Add lightweight dependency checks in the wrapper and install missing judge packages on demand before launching the official script.
+
+### Implemented Changes
+- Updated `tools/run_dlc_bench_official_eval.sh` so it now checks and installs missing `inflect`, `tqdm`, and `openai` packages via `${PYTHON_BIN} -m pip install ...` before running the official evaluation.
+
 ## 2026-06-26 Teacher Regenerate Single-Prompt Refactor
 
 ### Problem
