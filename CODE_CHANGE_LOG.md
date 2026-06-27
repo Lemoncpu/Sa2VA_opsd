@@ -270,6 +270,12 @@
   - wheel directory passthrough
   - container bootstrap
   - judge log output to `${OUTPUT_DIR}/judge_dlc.log`
+
+### Follow-up
+- Added `tools/judgedlc_baseline.sh` as a one-command baseline wrapper that pins:
+  - `OUTPUT_DIR=${PROJECT_ROOT}/work_dirs/dlc_bench_eval_baseline_sa2va4b`
+  - `PRED_OUTPUT=${OUTPUT_DIR}/pred.json`
+  - the downloaded offline wheel repo path
   - keeps `teacher_dlc_invalid:*` as a logged failure reason only,
   - always attempts reconstruction from `pipeline_result.detailed_caption` after single-stage DLC generation,
   - uses gate/reconstruction outcome as the real stop condition,
