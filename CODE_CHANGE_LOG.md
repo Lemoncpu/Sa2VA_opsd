@@ -276,6 +276,35 @@
 ### Implemented Changes
 - Updated `tools/converthf_ckpt.sh` so the generated temporary Python config now uses double-quoted Python string literals in the `_text.replace(...)` lines, avoiding conflicts with the outer remote `bash -lc` single-quoted script body.
 
+## 2026-06-28 Direct `.pth` Evaluation Entry Points For DLC And RefCOCO
+
+### Problem
+- The existing DLC-Bench and RefCOCO evaluation entry points were primarily built around HF-exported model directories, which forced an extra conversion step before evaluation.
+
+### Root Cause Notes
+- Current evaluation scripts instantiate `Sa2VAOPSDModelV3` from `model_path` / `tokenizer_path` directly.
+- A plain training checkpoint such as `iter_400.pth` is only a state dict payload and cannot be consumed by those HF-style loaders without first rebuilding the model from the training config.
+
+### Chosen Fix Direction
+- Add dedicated evaluation scripts that rebuild the OPSD model from config, restore the `.pth` checkpoint, and then reuse the existing DLC export and RefCOCO caption-to-mask evaluation logic.
+
+### Rejected Direction
+- Do not overload the HF-oriented scripts with multiple incompatible loading modes in one patch. Separate `.pth` entry points are clearer and reduce regression risk for the existing HF path.
+
+### Implemented Changes
+- Added `tools/pth_eval_utils.py` with a shared `load_opsd_model_from_pth(...)` helper that:
+  - loads the config
+  - overrides `model_path` / `tokenizer_path` / runtime flags
+  - builds the model
+  - restores checkpoint weights with `guess_load_checkpoint`
+- Added `tools/eval_dlc_bench_official_pth.py`:
+  - exports official DLC-Bench `pred.json` directly from `config + checkpoint + base_model_path`
+  - keeps the same official-format output contract and sidecar debug support
+- Added `tools/eval_refcoco_caption_to_mask_pth.py`:
+  - runs the existing RefCOCO caption-to-mask evaluation flow from `config + checkpoint + base_model_path`
+  - preserves the current REFER sample-building and evaluator summary logic
+- Added `tools/evaldlc_pth.sh` and `tools/evalrefcoco_pth.sh` as 1-GPU `rjob` wrappers for the new direct-`.pth` evaluation paths.
+
 ## 2026-06-27 Teacher Regenerate DLC Reconstruction Should Not Be Pre-Blocked
 
 ### Problem
