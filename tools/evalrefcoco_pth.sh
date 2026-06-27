@@ -17,6 +17,7 @@ CUDA_DEVICES="${CUDA_DEVICES:-0}"
 DEVICE="${DEVICE:-cuda:0}"
 PYTHON_BIN="${PYTHON_BIN:-/opt/vlm/bin/python}"
 LIMIT="${LIMIT:-}"
+INSTALL_SYSTEM_LIBS="${INSTALL_SYSTEM_LIBS:-1}"
 
 usage() {
   cat <<EOF
@@ -40,6 +41,7 @@ Optional:
   --device NAME
   --python-bin PATH
   --limit N
+  --install-system-libs 0|1
 EOF
 }
 
@@ -101,6 +103,10 @@ while [[ $# -gt 0 ]]; do
       LIMIT="$2"
       shift 2
       ;;
+    --install-system-libs)
+      INSTALL_SYSTEM_LIBS="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -152,6 +158,7 @@ rjob submit \
   DEVICE="${DEVICE}" \
   PYTHON_BIN="${PYTHON_BIN}" \
   LIMIT="${LIMIT}" \
+  INSTALL_SYSTEM_LIBS="${INSTALL_SYSTEM_LIBS}" \
   bash -lc '
 set -euo pipefail
 
@@ -165,6 +172,7 @@ IMAGE_ROOT="${IMAGE_ROOT:?}"
 OUTPUT_PATH="${OUTPUT_PATH:?}"
 DEVICE="${DEVICE:?}"
 PYTHON_BIN="${PYTHON_BIN:?}"
+INSTALL_SYSTEM_LIBS="${INSTALL_SYSTEM_LIBS:-1}"
 LOG_FILE="$(dirname "${OUTPUT_PATH}")/eval_refcoco_pth.log"
 
 mkdir -p "$(dirname "${OUTPUT_PATH}")"
@@ -178,6 +186,17 @@ cd /opt
 tar -xzf vlm_env.tar.gz -C /opt/vlm
 rm vlm_env.tar.gz
 /opt/vlm/bin/python /opt/vlm/bin/conda-unpack
+/opt/vlm/bin/python -c "import sys; print(sys.version)"
+if [[ "${INSTALL_SYSTEM_LIBS}" == "1" ]]; then
+  cat > /etc/apt/sources.list <<EOF
+deb http://mirrors.h.pjlab.org.cn/ubuntu/ jammy main restricted universe multiverse
+deb http://mirrors.h.pjlab.org.cn/ubuntu/ jammy-security main restricted universe multiverse
+deb http://mirrors.h.pjlab.org.cn/ubuntu/ jammy-updates main restricted universe multiverse
+deb http://mirrors.h.pjlab.org.cn/ubuntu/ jammy-backports main restricted universe multiverse
+EOF
+  apt update
+  apt install -y libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
+fi
 /opt/vlm/bin/python -c "import torch, transformers; print(\"ok\")"
 
 cd "${PROJECT_ROOT}"

@@ -305,6 +305,26 @@
   - preserves the current REFER sample-building and evaluator summary logic
 - Added `tools/evaldlc_pth.sh` and `tools/evalrefcoco_pth.sh` as 1-GPU `rjob` wrappers for the new direct-`.pth` evaluation paths.
 
+## 2026-06-28 Direct `.pth` Evaluation Missing `libGL.so.1`
+
+### Problem
+- The new direct-`.pth` DLC and RefCOCO evaluation `rjob` wrappers failed during Python import with `ImportError: libGL.so.1: cannot open shared object file`.
+
+### Root Cause Notes
+- The new wrappers reused the simplified no-apt startup path, but these evaluation flows import `transformers` -> `cv2`, which still requires system OpenGL-related shared libraries in the current runtime image.
+- Skipping those libraries works for some pure-Python checks, but not for the actual evaluator import stack.
+
+### Chosen Fix Direction
+- Restore the small system-library install block for the direct-`.pth` evaluation wrappers by default, while keeping an explicit switch to disable it if the image is later fixed upstream.
+
+### Rejected Direction
+- Do not patch around this with Python-only import hacks. The failure is a missing native dependency in the container runtime, so the wrapper should provision the expected libraries explicitly.
+
+### Implemented Changes
+- Updated `tools/evaldlc_pth.sh` and `tools/evalrefcoco_pth.sh` to add `INSTALL_SYSTEM_LIBS`, defaulting to `1`.
+- Added `--install-system-libs 0|1` CLI flags to both wrappers.
+- Restored the apt source setup and `apt install -y libgl1 libglib2.0-0 libsm6 libxext6 libxrender1` block in both wrappers when `INSTALL_SYSTEM_LIBS=1`.
+
 ## 2026-06-27 Teacher Regenerate DLC Reconstruction Should Not Be Pre-Blocked
 
 ### Problem

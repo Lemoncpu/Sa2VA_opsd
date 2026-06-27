@@ -19,6 +19,7 @@ PYTHON_BIN="${PYTHON_BIN:-/opt/vlm/bin/python}"
 LIMIT="${LIMIT:-}"
 START="${START:-0}"
 STEP="${STEP:-1}"
+INSTALL_SYSTEM_LIBS="${INSTALL_SYSTEM_LIBS:-1}"
 
 usage() {
   cat <<EOF
@@ -44,6 +45,7 @@ Optional:
   --limit N
   --start N
   --step N
+  --install-system-libs 0|1
 EOF
 }
 
@@ -113,6 +115,10 @@ while [[ $# -gt 0 ]]; do
       STEP="$2"
       shift 2
       ;;
+    --install-system-libs)
+      INSTALL_SYSTEM_LIBS="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -165,6 +171,7 @@ rjob submit \
   LIMIT="${LIMIT}" \
   START="${START}" \
   STEP="${STEP}" \
+  INSTALL_SYSTEM_LIBS="${INSTALL_SYSTEM_LIBS}" \
   bash -lc '
 set -euo pipefail
 
@@ -177,6 +184,7 @@ DATA_ROOT="${DATA_ROOT:?}"
 OUTPUT_DIR="${OUTPUT_DIR:?}"
 DEVICE="${DEVICE:?}"
 PYTHON_BIN="${PYTHON_BIN:?}"
+INSTALL_SYSTEM_LIBS="${INSTALL_SYSTEM_LIBS:-1}"
 LOG_FILE="${OUTPUT_DIR}/eval_dlc_pth.log"
 
 mkdir -p "${OUTPUT_DIR}"
@@ -188,6 +196,17 @@ cd /opt
 tar -xzf vlm_env.tar.gz -C /opt/vlm
 rm vlm_env.tar.gz
 /opt/vlm/bin/python /opt/vlm/bin/conda-unpack
+/opt/vlm/bin/python -c "import sys; print(sys.version)"
+if [[ "${INSTALL_SYSTEM_LIBS}" == "1" ]]; then
+  cat > /etc/apt/sources.list <<EOF
+deb http://mirrors.h.pjlab.org.cn/ubuntu/ jammy main restricted universe multiverse
+deb http://mirrors.h.pjlab.org.cn/ubuntu/ jammy-security main restricted universe multiverse
+deb http://mirrors.h.pjlab.org.cn/ubuntu/ jammy-updates main restricted universe multiverse
+deb http://mirrors.h.pjlab.org.cn/ubuntu/ jammy-backports main restricted universe multiverse
+EOF
+  apt update
+  apt install -y libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
+fi
 /opt/vlm/bin/python -c "import torch, transformers; print(\"ok\")"
 
 cd "${PROJECT_ROOT}"
