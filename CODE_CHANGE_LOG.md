@@ -219,6 +219,30 @@
 - Updated `tools/traindlc.sh` so the remote training command now exports:
   - `SA2VA_REFCOCO_OPSD_CONFIG`
 
+## 2026-06-27 Teacher Regenerate DLC Reconstruction Should Not Be Pre-Blocked
+
+### Problem
+- The teacher regenerate path had already been simplified to a DLC-only single-stage generation flow, but training behavior still did not match the intended semantics.
+- In practice, many teacher samples still stopped at `stop_stage=dlc`, so the generated DLC never reached reconstruction and gate evaluation.
+
+### Root Cause Notes
+- `projects/sa2va/models/sa2va_opsd_v2.py` still treated `_validate_teacher_dlc(...)` as a hard return condition inside `run_teacher_regenerate_pipeline(...)`.
+- That meant local caption-shape heuristics such as `distractor_overlap` or `missing_target_only_evidence` could block reconstruction entirely, even when the user wanted the real decision to come from caption-to-mask reconstruction and gate improvement.
+
+### Chosen Fix Direction
+- Keep local DLC validation as a logging/debug signal, but remove it as a pre-reconstruction stop condition.
+- Once the teacher raw output is non-empty, always reconstruct directly from the generated DLC and let the existing teacher gate decide whether CE should be applied.
+
+### Rejected Direction
+- Do not delete `_validate_teacher_dlc(...)` entirely in this patch. Its failure reasons are still useful to understand why a teacher DLC may be weak, even though they should no longer block reconstruction.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py` so `run_teacher_regenerate_pipeline(...)` now:
+  - keeps `teacher_dlc_invalid:*` as a logged failure reason only,
+  - always attempts reconstruction from `pipeline_result.detailed_caption` after single-stage DLC generation,
+  - uses gate/reconstruction outcome as the real stop condition,
+  - records `teacher_gate_failed:reconstruct_failed` or `teacher_gate_failed:iou_not_improved_enough` when CE is rejected after reconstruction.
+
 ## 2026-06-26 Teacher Regenerate Single-Prompt Refactor
 
 ### Problem

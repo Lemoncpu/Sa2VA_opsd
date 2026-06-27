@@ -4384,10 +4384,6 @@ class Sa2VAOPSDModelV2(BaseModel):
         failure_reason = self._validate_teacher_dlc(pipeline_result)
         if failure_reason:
             pipeline_result.detailed_failure_reason = failure_reason
-        if pipeline_result.detailed_status != "ok" or pipeline_result.detailed_failure_reason:
-            if not pipeline_result.detailed_failure_reason:
-                pipeline_result.detailed_failure_reason = f"teacher_dlc_invalid:{pipeline_result.detailed_status}"
-            return pipeline_result
 
         teacher_reconstruction = self.reconstruct_mask(
             image=image,
@@ -4413,8 +4409,10 @@ class Sa2VAOPSDModelV2(BaseModel):
             )
         )
         pipeline_result.stop_stage = "passed" if pipeline_result.gate_passed else "gate"
-        if not teacher_reconstruct_ok and not pipeline_result.diagnosis_failure_reason:
+        if not teacher_reconstruct_ok:
             pipeline_result.diagnosis_failure_reason = "teacher_gate_failed:reconstruct_failed"
+        elif not pipeline_result.gate_passed:
+            pipeline_result.diagnosis_failure_reason = "teacher_gate_failed:iou_not_improved_enough"
         return pipeline_result
 
     @staticmethod
