@@ -13,10 +13,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from projects.sa2va.datasets.common import DEFAULT_MASK_TO_CAPTION_QUESTION
 from projects.sa2va.models.sa2va_opsd_v3 import Sa2VAOPSDModelV3
 
 
-DEFAULT_DLC_BENCH_QUERY = "\nDescribe the masked region in detail."
+DEFAULT_DLC_BENCH_QUERY = DEFAULT_MASK_TO_CAPTION_QUESTION
 
 
 def parse_args():

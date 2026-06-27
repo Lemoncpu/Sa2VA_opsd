@@ -13,10 +13,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from projects.sa2va.datasets.common import DEFAULT_MASK_TO_CAPTION_QUESTION
 from tools.pth_eval_utils import load_opsd_model_from_pth
 
 
-DEFAULT_DLC_BENCH_QUERY = "\nDescribe the masked region in detail."
+DEFAULT_DLC_BENCH_QUERY = DEFAULT_MASK_TO_CAPTION_QUESTION
 
 
 def parse_args():

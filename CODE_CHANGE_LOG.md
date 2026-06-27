@@ -258,6 +258,25 @@
 - Added `--skip-apt-install 0|1` CLI control and remote log output for the chosen mode.
 - Wrapped the previous apt source rewrite and `apt install` block behind `SKIP_APT_INSTALL != 1`; default behavior now skips apt and uses image-provided system libraries.
 
+## 2026-06-28 DLC Export Prompt Alignment With Training
+
+### Problem
+- DLC-Bench exports from both the HF-path and `.pth`-path scripts were producing unusually short, generic captions and very low positive judge scores.
+
+### Root Cause Notes
+- The export scripts used the weak official-style query `Describe the masked region in detail.`, while OPSD training uses a much stronger mask-to-caption instruction that explicitly asks for a detailed, localized target description.
+- This prompt mismatch made the export path a poor diagnostic for whether the trained model had actually learned the training task behavior.
+
+### Chosen Fix Direction
+- Align both DLC export scripts to use the same `DEFAULT_MASK_TO_CAPTION_QUESTION` prompt as training so export diagnostics reflect the trained caption objective.
+
+### Rejected Direction
+- Do not keep the weaker export prompt for this diagnostic run. It is still useful for strict official comparability, but it hides whether short captions are caused by prompt mismatch.
+
+### Implemented Changes
+- Updated `tools/eval_dlc_bench_official.py` to import `DEFAULT_MASK_TO_CAPTION_QUESTION` from `projects/sa2va/datasets/common.py` and use it as the default DLC export query.
+- Updated `tools/eval_dlc_bench_official_pth.py` the same way so HF and `.pth` export paths stay aligned.
+
 ## 2026-06-28 HF Conversion Remote Shell Here-Doc Quoting Failure
 
 ### Problem
