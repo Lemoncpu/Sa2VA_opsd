@@ -12,6 +12,7 @@ PTH_MODEL="${PTH_MODEL:-}"
 SAVE_PATH="${SAVE_PATH:-}"
 BASE_MODEL_PATH="${BASE_MODEL_PATH:-/mnt/shared-storage-user/dnacoding/wuyucheng/workspace/Nemotrontiaozheng/Sa2VA-4B}"
 PYTHON_BIN="${PYTHON_BIN:-/opt/vlm/bin/python}"
+SKIP_APT_INSTALL="${SKIP_APT_INSTALL:-1}"
 
 usage() {
   cat <<EOF
@@ -30,6 +31,7 @@ Optional:
   --job-memory MB
   --cuda-devices LIST
   --python-bin PATH
+  --skip-apt-install 0|1
 EOF
 }
 
@@ -69,6 +71,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --python-bin)
       PYTHON_BIN="$2"
+      shift 2
+      ;;
+    --skip-apt-install)
+      SKIP_APT_INSTALL="$2"
       shift 2
       ;;
     -h|--help)
@@ -115,6 +121,7 @@ rjob submit \
   SAVE_PATH="${SAVE_PATH}" \
   BASE_MODEL_PATH="${BASE_MODEL_PATH}" \
   PYTHON_BIN="${PYTHON_BIN}" \
+  SKIP_APT_INSTALL="${SKIP_APT_INSTALL}" \
   bash -lc '
 set -euo pipefail
 
@@ -124,6 +131,7 @@ PTH_MODEL="${PTH_MODEL:?}"
 SAVE_PATH="${SAVE_PATH:?}"
 BASE_MODEL_PATH="${BASE_MODEL_PATH:?}"
 PYTHON_BIN="${PYTHON_BIN:?}"
+SKIP_APT_INSTALL="${SKIP_APT_INSTALL:-1}"
 LOG_DIR="$(dirname "${SAVE_PATH}")"
 LOG_FILE="${LOG_DIR}/convert_$(basename "${SAVE_PATH}").log"
 TMP_CONFIG="${LOG_DIR}/.$(basename "${SAVE_PATH}").convert_config.py"
@@ -140,21 +148,26 @@ trap cleanup EXIT
 
 echo "[convert] remote_job_started"
 echo "[convert] log_file=${LOG_FILE}"
+echo "[convert] skip_apt_install=${SKIP_APT_INSTALL}"
 
 cd /opt
 tar -xzf vlm_env.tar.gz -C /opt/vlm
 rm vlm_env.tar.gz
 /opt/vlm/bin/python /opt/vlm/bin/conda-unpack
 
-cat > /etc/apt/sources.list <<EOF
+if [[ "${SKIP_APT_INSTALL}" != "1" ]]; then
+  cat > /etc/apt/sources.list <<EOF
 deb http://mirrors.h.pjlab.org.cn/ubuntu/ jammy main restricted universe multiverse
 deb http://mirrors.h.pjlab.org.cn/ubuntu/ jammy-security main restricted universe multiverse
 deb http://mirrors.h.pjlab.org.cn/ubuntu/ jammy-updates main restricted universe multiverse
 deb http://mirrors.h.pjlab.org.cn/ubuntu/ jammy-backports main restricted universe multiverse
 EOF
 
-apt update
-apt install -y libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
+  apt update
+  apt install -y libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
+else
+  echo "[convert] skipping apt install and using image-provided system libraries"
+fi
 /opt/vlm/bin/python -c "import torch, transformers; print(\"ok\")"
 
 cd "${PROJECT_ROOT}"

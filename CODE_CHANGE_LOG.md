@@ -238,6 +238,26 @@
 - Updated `tools/converthf_ckpt.sh` so the remote bash process now runs with `exec > >(tee -a "${LOG_FILE}") 2>&1` immediately after log initialization.
 - Added early `[convert] remote_job_started` and `[convert] log_file=...` markers so the dedicated log proves whether the remote script entered the export body at all.
 
+## 2026-06-28 HF Conversion Blocked In Apt Install Stage
+
+### Problem
+- After fixing dedicated logging, the full HF conversion `rjob` log still ended during `apt install` output and never reached the Python environment check or `convert_to_hf.py`.
+
+### Root Cause Notes
+- `tools/converthf_ckpt.sh` installed extra Ubuntu system packages inside the remote job before running the actual conversion.
+- In the current `rjob` image, that extra apt stage became the blocking point, so the export chain never reached the model conversion step.
+
+### Chosen Fix Direction
+- Default the conversion wrapper to use the `rjob` image plus unpacked `vlm_env` as-is, and skip the in-job apt installation unless explicitly requested for debugging.
+
+### Rejected Direction
+- Do not keep apt installation as the default path. That hides whether the real conversion logic works and repeatedly fails before model export even starts.
+
+### Implemented Changes
+- Updated `tools/converthf_ckpt.sh` to add `SKIP_APT_INSTALL`, defaulting to `1`.
+- Added `--skip-apt-install 0|1` CLI control and remote log output for the chosen mode.
+- Wrapped the previous apt source rewrite and `apt install` block behind `SKIP_APT_INSTALL != 1`; default behavior now skips apt and uses image-provided system libraries.
+
 ## 2026-06-27 Teacher Regenerate DLC Reconstruction Should Not Be Pre-Blocked
 
 ### Problem
