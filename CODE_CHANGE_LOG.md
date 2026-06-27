@@ -371,6 +371,25 @@
   - strip more `The region in the image ...` style templates
   - keep only the first sentence and trim low-signal trailing clauses when possible
 
+## 2026-06-28 Align Direct `.pth` Eval Wrappers With `train1.sh` Startup Shape
+
+### Problem
+- The direct `.pth` evaluation wrappers had drifted from the `train1.sh` remote startup shape by using full-process `exec > >(tee ...)` logging, which made the runtime behavior and log layout differ from the training launcher the user was comparing against.
+
+### Root Cause Notes
+- `train1.sh` prepares the environment, runs apt installation, and only tees the final training command into its dedicated log file.
+- The direct `.pth` wrappers instead redirected the entire remote shell through `tee`, creating a different logging flow and making side-by-side comparison with the training launcher harder.
+
+### Chosen Fix Direction
+- Keep the same environment unpack and apt-install sequence, but change the direct `.pth` wrappers to follow the `train1.sh` pattern: initialize the log file and only pipe the final evaluation command through `tee -a`.
+
+### Rejected Direction
+- Do not keep the full-shell tee redirection when the explicit goal is to align behavior with `train1.sh`. Matching the training launcher shape makes the evaluation wrappers easier to reason about during debugging.
+
+### Implemented Changes
+- Updated `tools/evalrefcoco_pth.sh` and `tools/evaldlc_pth.sh` to remove the full-shell `exec > >(tee -a "${LOG_FILE}") 2>&1` redirection.
+- Both wrappers now match `train1.sh` more closely by keeping the setup steps plain and piping only the final `stdbuf -oL -eL "${CMD[@]}" 2>&1 | tee -a "${LOG_FILE}"` evaluation command into the dedicated log.
+
 ## 2026-06-27 Teacher Regenerate DLC Reconstruction Should Not Be Pre-Blocked
 
 ### Problem

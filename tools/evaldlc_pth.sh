@@ -183,7 +183,6 @@ mkdir -p "${OUTPUT_DIR}"
 : >"${LOG_FILE}"
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
-exec > >(tee -a "${LOG_FILE}") 2>&1
 
 cd /opt
 tar -xzf vlm_env.tar.gz -C /opt/vlm
@@ -223,5 +222,5 @@ if [[ -n "${LIMIT:-}" ]]; then
   CMD+=(--limit "${LIMIT}")
 fi
 
-stdbuf -oL -eL "${CMD[@]}"
+stdbuf -oL -eL "${CMD[@]}" 2>&1 | tee -a "${LOG_FILE}"
 '
