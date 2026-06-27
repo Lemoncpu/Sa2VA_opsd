@@ -145,7 +145,7 @@ CONVERT_CMD=(
   "${PYTHON_BIN}"
   "${PROJECT_ROOT}/tools/convert_to_hf.py"
   "${CONFIG_PATH}"
-  --pth-model "${PTH_MODEL}"
+  "${PTH_MODEL}"
   --save-path "${SAVE_PATH}"
 )
 

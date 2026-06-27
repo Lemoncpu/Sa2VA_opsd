@@ -287,6 +287,9 @@
   - defaults the config to the active 4B RefCOCO OPSD config
   - derives `SAVE_PATH=${PROJECT_ROOT}/work_dirs/hf_<checkpoint_stem>` by default
   - writes conversion logs to `$(dirname SAVE_PATH)/convert_<save_dir_name>.log`
+- Follow-up correction:
+  - `tools/convert_to_hf.py` accepts `pth_model` as a positional argument, not `--pth-model`
+  - updated `tools/converthf_ckpt.sh` to call `convert_to_hf.py <config> <pth_model> --save-path ...` so the rjob wrapper matches the real CLI signature
 - Updated `tools/judgedlc.sh`, `tools/judgedlc_baseline.sh`, and `tools/judgedlc_ckpt.sh` so the rjob submit path now includes explicit judge-service placeholders in the script body:
   - `LLM_ENGINE_PATH=https://api.openai.com/v1`
   - `API_KEY=YOUR_OPENAI_API_KEY_HERE`
