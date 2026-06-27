@@ -139,8 +139,34 @@ def _clean_official_eval_caption(caption: str) -> str:
     text = (caption or "").strip()
     if not text:
         return ""
+    refusal_patterns = (
+        r"^\s*i'?m sorry\b",
+        r"^\s*sorry\b",
+        r"^\s*i cannot\b",
+        r"^\s*i can not\b",
+        r"^\s*i can't\b",
+        r"^\s*the masked region is not visible\b",
+        r"^\s*the specific details .* not visible\b",
+    )
+    lowered = text.lower()
+    if any(re.search(pattern, lowered, flags=re.IGNORECASE) for pattern in refusal_patterns):
+        return ""
+    black_box_patterns = (
+        r"\bblack box\b",
+        r"\bintentional obstruction\b",
+        r"\bobscured\b",
+        r"\bhidden from view\b",
+        r"\bblocked by another\b",
+    )
+    if any(re.search(pattern, lowered, flags=re.IGNORECASE) for pattern in black_box_patterns):
+        return ""
     cleanup_patterns = (
         r"^\s*in\s+region1\s*,?\s*",
+        r"^\s*the\s+region\s+in\s+the\s+image\s+is\s+",
+        r"^\s*the\s+region\s+in\s+the\s+image\s+represents\s+",
+        r"^\s*the\s+region\s+in\s+the\s+image\s+shows\s+",
+        r"^\s*the\s+region\s+represents\s+",
+        r"^\s*the\s+region\s+shows\s+",
         r"^\s*the\s+region1\s+contains\s+",
         r"^\s*the\s+region1\s+region\s+in\s+the\s+image\s+is\s+",
         r"^\s*the\s+region1\s+region\s+is\s+",
@@ -156,6 +182,13 @@ def _clean_official_eval_caption(caption: str) -> str:
         text = re.sub(pattern, "", text, flags=re.IGNORECASE)
     text = re.sub(r"\bregion1\b", "region", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+", " ", text).strip(" ,.")
+    if ", but " in text.lower():
+        text = text.split(",", 1)[0].strip()
+    sentence_parts = re.split(r"(?<=[.!?])\s+", text)
+    if sentence_parts:
+        text = sentence_parts[0].strip()
+    text = re.sub(r"\b(this|that|it|they|these|those)\.$", "", text, flags=re.IGNORECASE).strip(" ,.")
+    text = re.sub(r"\b(adds to|appears to|suggests that|can also refer to)\.?$", "", text, flags=re.IGNORECASE).strip(" ,.")
     if not text:
         return ""
     if text[0].isalpha():

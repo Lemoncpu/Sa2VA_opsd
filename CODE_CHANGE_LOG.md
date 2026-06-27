@@ -344,6 +344,33 @@
 - Updated `tools/evaldlc_pth.sh` and `tools/evalrefcoco_pth.sh` to truncate their log files at startup with `: >"${LOG_FILE}"`.
 - Strengthened the startup check in both wrappers from `import torch, transformers` to `import cv2; import torch; from transformers import PreTrainedModel`, so missing `libGL` or related import issues fail immediately in the controlled preflight step.
 
+## 2026-06-28 Switch `.pth` Eval Defaults To `iter_300` And Tighten DLC Cleaning
+
+### Problem
+- The direct `.pth` evaluation wrappers still defaulted to the later `iter_400` checkpoint, while the next debugging round needed both RefCOCO and DLC evaluation to target the same `iter_300` checkpoint in the training work directory.
+- Exported DLC captions also contained a large amount of refusal text, mask-as-occluder explanations, and scene-level template prefixes that polluted downstream analysis.
+
+### Root Cause Notes
+- The wrappers only accepted checkpoint overrides but did not provide a shared default target checkpoint for the current round of investigation.
+- The existing DLC export cleaner removed only shallow prompt prefixes and punctuation noise, but it did not filter refusal/occlusion captions or cut off low-signal trailing explanation clauses.
+
+### Chosen Fix Direction
+- Change both direct `.pth` evaluation wrappers to default to the same `iter_300.pth` checkpoint under the active training work directory.
+- Tighten the DLC export cleaner so obviously invalid captions collapse to empty strings and weak multi-sentence explanations are reduced to a cleaner first sentence.
+
+### Rejected Direction
+- Do not keep `iter_400` as the default and rely on long command-line overrides for every run. The current debugging workflow benefits from aligned defaults across both evaluation paths.
+- Do not leave refusal and black-box captions untouched in `pred.json`; those strings are not useful mask-to-caption outputs and make the exported DLC quality harder to inspect.
+
+### Implemented Changes
+- Updated `tools/evalrefcoco_pth.sh` and `tools/evaldlc_pth.sh` so `CHECKPOINT_PATH` now defaults to `.../work_dirs/sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3_manifest/iter_300.pth`.
+- Relaxed the wrapper usage text so `--checkpoint` remains supported but is no longer required when the shared default path is desired.
+- Updated `tools/eval_dlc_bench_official_pth.py` cleaning logic to:
+  - drop refusal-style captions
+  - drop black-box / occlusion-explanation captions
+  - strip more `The region in the image ...` style templates
+  - keep only the first sentence and trim low-signal trailing clauses when possible
+
 ## 2026-06-27 Teacher Regenerate DLC Reconstruction Should Not Be Pre-Blocked
 
 ### Problem

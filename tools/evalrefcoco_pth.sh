@@ -4,7 +4,7 @@ set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-/mnt/shared-storage-user/dnacoding/wuyucheng/workspace/Nemotrontiaozheng/Sa2VA_opsd}"
 CONFIG_PATH="${CONFIG_PATH:-${PROJECT_ROOT}/projects/sa2va/configs/refcoco_caption_to_mask_eval_4b_local.py}"
-CHECKPOINT_PATH="${CHECKPOINT_PATH:-}"
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-${PROJECT_ROOT}/work_dirs/sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3_manifest/iter_300.pth}"
 BASE_MODEL_PATH="${BASE_MODEL_PATH:-/mnt/shared-storage-user/dnacoding/wuyucheng/workspace/Nemotrontiaozheng/Sa2VA-4B}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-}"
 DATA_ROOT="${DATA_ROOT:-/mnt/shared-storage-user/dnacoding/wuyucheng/dataset/refcoco}"
@@ -24,10 +24,8 @@ usage() {
 Usage:
   bash tools/evalrefcoco_pth.sh --checkpoint PATH [options]
 
-Required:
-  --checkpoint PATH
-
 Optional:
+  --checkpoint PATH
   --config PATH
   --base-model-path PATH
   --tokenizer-path PATH
@@ -118,12 +116,6 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
-
-if [[ -z "${CHECKPOINT_PATH}" ]]; then
-  echo "--checkpoint is required." >&2
-  usage >&2
-  exit 1
-fi
 
 if [[ -z "${TOKENIZER_PATH}" ]]; then
   TOKENIZER_PATH="${BASE_MODEL_PATH}"
