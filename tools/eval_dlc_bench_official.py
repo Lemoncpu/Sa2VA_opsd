@@ -59,19 +59,47 @@ def _load_annotations(data_root: Path):
     payload = json.loads(annotations_path.read_text(encoding="utf-8"))
     if isinstance(payload, dict):
         if isinstance(payload.get("annotations"), list):
-            return payload["annotations"]
+            return payload["annotations"], payload
         if isinstance(payload.get("data"), list):
-            return payload["data"]
+            return payload["data"], payload
     if isinstance(payload, list):
-        return payload
+        return payload, None
     raise ValueError("Unsupported DLC-Bench annotations.json format.")
 
 
-def _resolve_image_name(annotation):
+def _build_image_lookup(annotation_payload):
+    lookup = {}
+    if not isinstance(annotation_payload, dict):
+        return lookup
+    images = annotation_payload.get("images")
+    if not isinstance(images, list):
+        return lookup
+    for image_item in images:
+        if not isinstance(image_item, dict):
+            continue
+        image_id = image_item.get("id", image_item.get("image_id"))
+        if image_id is None:
+            continue
+        lookup[str(image_id)] = image_item
+    return lookup
+
+
+def _resolve_image_name(annotation, image_lookup):
     for key in ("image_name", "file_name", "image", "image_path"):
         value = annotation.get(key)
         if value:
             return str(value)
+    image_id = annotation.get("image_id", annotation.get("img_id"))
+    if image_id is not None:
+        image_item = image_lookup.get(str(image_id))
+        if isinstance(image_item, dict):
+            for key in ("file_name", "image_name", "coco_url", "flickr_url"):
+                value = image_item.get(key)
+                if value:
+                    value = str(value)
+                    if key in {"coco_url", "flickr_url"}:
+                        return value.rsplit("/", 1)[-1]
+                    return value
     raise KeyError(f"Missing image name fields in annotation ann_id={annotation.get('ann_id', annotation.get('id'))!r}")
 
 
@@ -115,7 +143,8 @@ def main():
     if not (data_root / "class_names.json").exists():
         raise FileNotFoundError(f"Missing class_names.json: {data_root / 'class_names.json'}")
 
-    annotations = _load_annotations(data_root)
+    annotations, annotation_payload = _load_annotations(data_root)
+    image_lookup = _build_image_lookup(annotation_payload)
     tokenizer_path = args.tokenizer_path or args.model_path
     model = Sa2VAOPSDModelV3(
         model_path=args.model_path,
@@ -146,7 +175,7 @@ def main():
             annotation = annotations[index]
             attempted += 1
             ann_id = _resolve_ann_id(annotation)
-            image_name = _resolve_image_name(annotation)
+            image_name = _resolve_image_name(annotation, image_lookup)
             image_path = images_root / image_name
             class_name = _resolve_class_name(annotation)
             if not image_path.exists():

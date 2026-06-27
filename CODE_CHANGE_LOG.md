@@ -243,6 +243,26 @@
   - uses gate/reconstruction outcome as the real stop condition,
   - records `teacher_gate_failed:reconstruct_failed` or `teacher_gate_failed:iou_not_improved_enough` when CE is rejected after reconstruction.
 
+## 2026-06-27 DLC-Bench Official Export COCO Image Lookup Compatibility
+
+### Problem
+- The new official DLC-Bench export script failed immediately on downloaded official data with:
+  - `KeyError: Missing image name fields in annotation ann_id=...`
+
+### Root Cause Notes
+- `tools/eval_dlc_bench_official.py` assumed each annotation directly carried `image_name` or `file_name`.
+- The actual downloaded DLC-Bench annotations can be COCO-style, where annotations reference `image_id` and the filename lives in the top-level `images` table.
+
+### Chosen Fix Direction
+- Keep direct per-annotation filename fields as the first preference.
+- Add COCO-style fallback by building an `image_id -> image metadata` lookup from top-level `images` and resolving filenames from there.
+
+### Implemented Changes
+- Updated `tools/eval_dlc_bench_official.py` so it now:
+  - returns both annotation rows and the raw annotation payload from `_load_annotations(...)`,
+  - builds a top-level `images` lookup when present,
+  - resolves image names from `annotation.image_id` when the annotation itself does not include a direct filename field.
+
 ## 2026-06-26 Teacher Regenerate Single-Prompt Refactor
 
 ### Problem
