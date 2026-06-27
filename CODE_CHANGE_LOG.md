@@ -248,6 +248,33 @@
 - Training logs showed that most single-stage teacher outputs were natural-language captions without the required `DLC:` / `VERIFICATION_CAPTION:` labels, so the parser treated them as empty and stopped at `teacher_dlc_invalid:empty`.
 - Tightened the single-stage prompt to require that the answer starts immediately with the two caption labels and forbids any prefatory text.
 - Added a parser fallback: when `DLC:` is missing but the raw teacher output cleans into a valid caption, reuse that cleaned text as the DLC instead of discarding the sample outright. When `VERIFICATION_CAPTION:` is missing but the DLC is valid, temporarily reuse the DLC text as the verification caption fallback.
+
+## 2026-06-27 Teacher Regenerate DLC-Only Reconstruction Gate
+
+### Problem
+- The verification-caption subpath became an extra failure layer for teacher regenerate and still did not produce meaningful reconstruction gains.
+- Teacher supervision was split between generating a DLC target and separately generating a verification caption used only for CE admission.
+
+### Root Cause Notes
+- The main training goal remains the regenerated DLC, but the pipeline required a second caption artifact before CE could be applied.
+- Even when verification captions were syntactically valid, they were often generic or noisy, so reconstruction gate pass stayed near zero.
+
+### Chosen Fix Direction
+- Collapse teacher regenerate to a single output: `DLC`.
+- Always allow teacher regenerate to attempt DLC generation, even when the difference context is trivial.
+- Reconstruct directly from the generated DLC and keep the existing IoU gate only for deciding whether CE is applied.
+
+### Rejected Direction
+- Do not keep the verification-caption stage as a soft fallback. That would preserve the same split objective and continue to obscure whether the DLC itself is useful.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py`:
+  - Rewrote the single-stage teacher prompt so it only asks for `DLC: ...`.
+  - Removed verification-caption parsing from the active single-stage regenerate path.
+  - Added stronger DLC cleanup for leftover labels and template noise.
+  - Changed the teacher gate reconstruction input from `verification_caption` to the generated DLC itself.
+  - Stopped treating trivial difference context as a hard early exit; it is now log-only context.
+  - Updated teacher regenerate analysis bookkeeping so reconstruction success and gate status now reflect DLC reconstruction rather than verification-caption reconstruction.
   - `SA2VA_REFCOCO_OPSD_DEFAULT_WORK_DIR`
   - `SA2VA_REFCOCO_OPSD_DEFAULT_MODEL_PATH`
   - `SA2VA_REFCOCO_OPSD_DEFAULT_TOKENIZER_PATH`

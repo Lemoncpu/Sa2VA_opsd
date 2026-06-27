@@ -3687,19 +3687,12 @@ class Sa2VAOPSDModelV2(BaseModel):
             "3. Compare the shared evidence, the target-only missing evidence, and the distractor-only extra evidence.\n"
             "4. Infer why the student caption drifts toward region2 instead of isolating region1.\n"
             "5. Write one corrected detailed localized caption for region1.\n"
-            "6. Write one shorter verification caption for reconstruction gating.\n"
-            "You may optionally include short diagnosis notes, but the main task is to produce both final captions.\n"
-            "Do not omit DLC or VERIFICATION_CAPTION even if the diagnosis is uncertain.\n"
-            "Your answer must start immediately with 'DLC:' on the first line and 'VERIFICATION_CAPTION:' on the second line.\n"
-            "Do not write any preface such as 'Sure', 'The task is', 'The answer is', HTML tags, or quoted restatements of the prompt.\n"
+            "Write only one corrected detailed localized caption for region1.\n"
+            "Your answer must start immediately with 'DLC:' on the first line.\n"
+            "Do not write any preface such as 'Sure', 'The task is', 'The answer is', HTML tags, numbering, or quoted restatements of the prompt.\n"
             "If you output anything before 'DLC:', the answer is invalid.\n"
             "Output format:\n"
             "DLC: <one natural and complete detailed localized caption>\n"
-            "VERIFICATION_CAPTION: <one shorter verifier-friendly caption>\n"
-            "Optional notes if helpful:\n"
-            "CAPTION_PROBLEM: <optional>\n"
-            "CORRECTION_DIRECTION: <optional>\n"
-            "REASON: <optional>\n"
             "Do not output bullets, markdown, analysis preambles, or [SEG]."
         )
 
@@ -4075,6 +4068,9 @@ class Sa2VAOPSDModelV2(BaseModel):
             if fallback_status == "ok":
                 detailed_caption_raw = fallback_caption
         detailed_caption = self._clean_caption_text(detailed_caption_raw)
+        detailed_caption = re.sub(r"^(?:dlc\s*:\s*)+", "", detailed_caption, flags=re.IGNORECASE).strip()
+        detailed_caption = re.sub(r"^(?:the task is|task is|region1 is)\s+", "", detailed_caption, flags=re.IGNORECASE)
+        detailed_caption = re.sub(r"^(?:horse-\d+|t\d+)\s*", "", detailed_caption, flags=re.IGNORECASE)
         detailed_completion_ids = self._encode_completion_from_caption(detailed_caption)
         detailed_caption, detailed_completion_ids, detailed_was_truncated = self._truncate_caption_completion(
             detailed_caption,
@@ -4089,19 +4085,8 @@ class Sa2VAOPSDModelV2(BaseModel):
         pipeline_result.detailed_caption = detailed_caption
         pipeline_result.detailed_completion_ids = detailed_completion_ids
         pipeline_result.detailed_status = detailed_status
-
-        verification_caption_raw = self._extract_labeled_teacher_text(raw_prediction, "VERIFICATION_CAPTION")
-        if not verification_caption_raw and detailed_status == "ok":
-            verification_caption_raw = detailed_caption
-        verification_caption = self._clean_caption_text(verification_caption_raw)
-        verification_status = self._infer_description_status(verification_caption)
-        if verification_status == "ok" and (
-            not self._is_caption_content_sufficient(verification_caption)
-            or self._is_overly_generic_caption(verification_caption)
-        ):
-            verification_status = "truncated_caption"
-        pipeline_result.verification_caption = verification_caption
-        pipeline_result.verification_status = verification_status
+        pipeline_result.verification_caption = ""
+        pipeline_result.verification_status = "empty"
         return pipeline_result
 
     def generate_teacher_light_diagnosis(
@@ -4373,9 +4358,6 @@ class Sa2VAOPSDModelV2(BaseModel):
             or self._teacher_field_is_effective(pipeline_result.distractor_only_evidence)
         )
         pipeline_result.stop_stage = "difference_context"
-        if not pipeline_result.difference_context_nontrivial:
-            pipeline_result.difference_context_failure_reason = "difference_context_invalid:trivial"
-            return pipeline_result
 
         pipeline_result = self.generate_teacher_regenerate_single_stage(
             image=image,
@@ -4407,21 +4389,10 @@ class Sa2VAOPSDModelV2(BaseModel):
                 pipeline_result.detailed_failure_reason = f"teacher_dlc_invalid:{pipeline_result.detailed_status}"
             return pipeline_result
 
-        pipeline_result.stop_stage = "verification"
-        failure_reason = self._validate_teacher_verification_caption(pipeline_result)
-        if failure_reason:
-            pipeline_result.verification_failure_reason = failure_reason
-        if pipeline_result.verification_status != "ok" or pipeline_result.verification_failure_reason:
-            if not pipeline_result.verification_failure_reason:
-                pipeline_result.verification_failure_reason = (
-                    f"verification_invalid:{pipeline_result.verification_status}"
-                )
-            return pipeline_result
-
         teacher_reconstruction = self.reconstruct_mask(
             image=image,
-            caption=pipeline_result.verification_caption,
-            description_status=pipeline_result.verification_status,
+            caption=pipeline_result.detailed_caption,
+            description_status=pipeline_result.detailed_status,
             gt_mask=gt_mask,
         )
         teacher_pred_mask = None if teacher_reconstruction is None else teacher_reconstruction.pred_mask
@@ -4442,8 +4413,8 @@ class Sa2VAOPSDModelV2(BaseModel):
             )
         )
         pipeline_result.stop_stage = "passed" if pipeline_result.gate_passed else "gate"
-        if not teacher_reconstruct_ok and not pipeline_result.verification_failure_reason:
-            pipeline_result.verification_failure_reason = "verification_invalid:reconstruct_failed"
+        if not teacher_reconstruct_ok and not pipeline_result.diagnosis_failure_reason:
+            pipeline_result.diagnosis_failure_reason = "teacher_gate_failed:reconstruct_failed"
         return pipeline_result
 
     @staticmethod
@@ -4751,8 +4722,8 @@ class Sa2VAOPSDModelV2(BaseModel):
         result["teacher_completion_len"] = int(teacher_regenerate.detailed_completion_ids.shape[1])
         result["teacher_difference_context_nontrivial"] = bool(teacher_regenerate.difference_context_nontrivial)
         result["teacher_diagnosis_valid"] = bool(teacher_regenerate.diagnosis_valid)
-        result["teacher_verification_caption_status"] = str(teacher_regenerate.verification_status)
-        result["teacher_verification_caption"] = teacher_regenerate.verification_caption
+        result["teacher_verification_caption_status"] = "unused"
+        result["teacher_verification_caption"] = ""
         result["teacher_dlc"] = teacher_regenerate.detailed_caption
         result["teacher_dlc_valid"] = bool(
             teacher_regenerate.detailed_status == "ok" and not teacher_regenerate.detailed_failure_reason
@@ -4780,7 +4751,6 @@ class Sa2VAOPSDModelV2(BaseModel):
             teacher_regenerate.difference_context_failure_reason
             or teacher_regenerate.diagnosis_failure_reason
             or teacher_regenerate.detailed_failure_reason
-            or teacher_regenerate.verification_failure_reason
             or ("" if teacher_regenerate.gate_passed else "teacher_gate_failed")
         )
         if teacher_regenerate.detailed_completion_ids.shape[1] == 0:
@@ -4791,7 +4761,7 @@ class Sa2VAOPSDModelV2(BaseModel):
 
         teacher_iou_plain = float(teacher_regenerate.verification_iou or 0.0)
         result["teacher_verification_iou"] = float(teacher_iou_plain)
-        teacher_reconstruct_ok = bool(teacher_regenerate.verification_status == "ok" and teacher_iou_plain > 0.0)
+        teacher_reconstruct_ok = bool(teacher_regenerate.detailed_status == "ok" and teacher_iou_plain > 0.0)
         teacher_gate_passed = bool(teacher_regenerate.gate_passed)
         result["teacher_reconstruct_ok"] = bool(teacher_reconstruct_ok)
         result["teacher_gate_passed"] = bool(teacher_gate_passed)
