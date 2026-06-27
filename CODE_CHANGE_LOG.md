@@ -365,6 +365,13 @@
 - Updated both `tools/evaldlc.sh` and `tools/run_dlc_bench_official_eval.sh` to install Python dependencies through the PJLab mirror:
   - `https://mirrors.h.pjlab.org.cn/pypi/web/simple`
 
+### Second Follow-up Correction
+- The first mirror-based patch still failed in the rjob container because the `https://mirrors.h.pjlab.org.cn/...` endpoint returned connection refused during pip install.
+- Updated the DLC evaluation wrappers to:
+  - use the mirror via `http://mirrors.h.pjlab.org.cn/pypi/web/simple`,
+  - add `--trusted-host mirrors.h.pjlab.org.cn`,
+  - remove the unconditional pip install from the remote bootstrap and keep dependency installation only in the wrapper's missing-package check path.
+
 ## 2026-06-26 Teacher Regenerate Single-Prompt Refactor
 
 ### Problem

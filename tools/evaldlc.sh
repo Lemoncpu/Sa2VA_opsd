@@ -27,7 +27,7 @@ EVAL_SUFFIX="${EVAL_SUFFIX:-}"
 VERBOSE="${VERBOSE:-0}"
 QUIET="${QUIET:-0}"
 CSV_ONLY="${CSV_ONLY:-0}"
-PIP_INDEX_URL="${PIP_INDEX_URL:-https://mirrors.h.pjlab.org.cn/pypi/web/simple}"
+PIP_INDEX_URL="${PIP_INDEX_URL:-http://mirrors.h.pjlab.org.cn/pypi/web/simple}"
 
 rjob submit \
   --cpu="${JOB_CPU}" \
@@ -101,7 +101,6 @@ EOF
 apt update
 apt install -y libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
 /opt/vlm/bin/python -c "import torch, transformers; print(\"ok\")"
-/opt/vlm/bin/python -m pip install -q -i "${PIP_INDEX_URL}" inflect tqdm openai
 
 cd "${PROJECT_ROOT}"
 
