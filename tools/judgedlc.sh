@@ -13,8 +13,8 @@ PRED_OUTPUT="${PRED_OUTPUT:-${OUTPUT_DIR}/pred.json}"
 WHEEL_DIR="${WHEEL_DIR:-/mnt/shared-storage-user/dnacoding/wuyucheng/workspace/Nemotrontiaozheng/wheels_repo}"
 PYTHON_BIN="${PYTHON_BIN:-/opt/vlm/bin/python}"
 LLM_ENGINE="${LLM_ENGINE:-meta-llama/Meta-Llama-3.1-8B-Instruct}"
-LLM_ENGINE_PATH="${LLM_ENGINE_PATH:-}"
-API_KEY_PATH="${API_KEY_PATH:-}"
+LLM_ENGINE_PATH="${LLM_ENGINE_PATH:-https://api.openai.com/v1}"
+API_KEY="${API_KEY:-sk-e3xpxVZMhL4I0iaZwurunj8yXK0Zaei25JOV0TP5QKdND04m}"
 DEFAULT_PREDICTION="${DEFAULT_PREDICTION:-}"
 EVAL_SUFFIX="${EVAL_SUFFIX:-}"
 VERBOSE="${VERBOSE:-0}"
@@ -43,7 +43,7 @@ rjob submit \
   PYTHON_BIN="${PYTHON_BIN}" \
   LLM_ENGINE="${LLM_ENGINE}" \
   LLM_ENGINE_PATH="${LLM_ENGINE_PATH}" \
-  API_KEY_PATH="${API_KEY_PATH}" \
+  API_KEY="${API_KEY}" \
   DEFAULT_PREDICTION="${DEFAULT_PREDICTION}" \
   EVAL_SUFFIX="${EVAL_SUFFIX}" \
   VERBOSE="${VERBOSE}" \
@@ -96,8 +96,8 @@ JUDGE_CMD=(
 if [[ -n "${LLM_ENGINE_PATH:-}" ]]; then
   JUDGE_CMD+=(--llm-engine-path "${LLM_ENGINE_PATH}")
 fi
-if [[ -n "${API_KEY_PATH:-}" ]]; then
-  JUDGE_CMD+=(--api-key "${API_KEY_PATH}")
+if [[ -n "${API_KEY:-}" && "${API_KEY}" != "YOUR_OPENAI_API_KEY_HERE" ]]; then
+  JUDGE_CMD+=(--api-key "${API_KEY}")
 fi
 if [[ -n "${DEFAULT_PREDICTION:-}" ]]; then
   JUDGE_CMD+=(--default-prediction "${DEFAULT_PREDICTION}")

@@ -287,6 +287,11 @@
   - defaults the config to the active 4B RefCOCO OPSD config
   - derives `SAVE_PATH=${PROJECT_ROOT}/work_dirs/hf_<checkpoint_stem>` by default
   - writes conversion logs to `$(dirname SAVE_PATH)/convert_<save_dir_name>.log`
+- Updated `tools/judgedlc.sh`, `tools/judgedlc_baseline.sh`, and `tools/judgedlc_ckpt.sh` so the rjob submit path now includes explicit judge-service placeholders in the script body:
+  - `LLM_ENGINE_PATH=https://api.openai.com/v1`
+  - `API_KEY=YOUR_OPENAI_API_KEY_HERE`
+  - baseline/ckpt wrappers now export those defaults directly, so the user can modify the script-local values without remembering extra environment variable names
+- Renamed the judge submit wrapper variable from the misleading `API_KEY_PATH` to `API_KEY` in the rjob path, because the official judge expects a raw API key string rather than a filesystem path
   - keeps `teacher_dlc_invalid:*` as a logged failure reason only,
   - always attempts reconstruction from `pipeline_result.detailed_caption` after single-stage DLC generation,
   - uses gate/reconstruction outcome as the real stop condition,
