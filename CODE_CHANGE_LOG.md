@@ -276,6 +276,12 @@
   - `OUTPUT_DIR=${PROJECT_ROOT}/work_dirs/dlc_bench_eval_baseline_sa2va4b`
   - `PRED_OUTPUT=${OUTPUT_DIR}/pred.json`
   - the downloaded offline wheel repo path
+- Updated `tools/evaldlc_ckpt.sh` to export the same offline `WHEEL_DIR` default used by the judge wrappers, so checkpoint-based export/eval entrypoints share one consistent DLC-Bench environment setup.
+- Added `tools/judgedlc_ckpt.sh` as the checkpoint-parallel companion to `tools/evaldlc_ckpt.sh`:
+  - requires `--model-path`
+  - derives `OUTPUT_DIR=${PROJECT_ROOT}/work_dirs/dlc_bench_eval_<ckpt_name>` by default
+  - derives `PRED_OUTPUT=${OUTPUT_DIR}/pred.json`
+  - forwards the remaining judge options to the shared `tools/judgedlc.sh` rjob wrapper
   - keeps `teacher_dlc_invalid:*` as a logged failure reason only,
   - always attempts reconstruction from `pipeline_result.detailed_caption` after single-stage DLC generation,
   - uses gate/reconstruction outcome as the real stop condition,
