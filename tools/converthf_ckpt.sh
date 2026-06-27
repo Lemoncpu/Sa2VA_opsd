@@ -10,6 +10,7 @@ PROJECT_ROOT="${PROJECT_ROOT:-/mnt/shared-storage-user/dnacoding/wuyucheng/works
 CONFIG_PATH="${CONFIG_PATH:-${PROJECT_ROOT}/projects/sa2va/configs/sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3.py}"
 PTH_MODEL="${PTH_MODEL:-}"
 SAVE_PATH="${SAVE_PATH:-}"
+BASE_MODEL_PATH="${BASE_MODEL_PATH:-/mnt/shared-storage-user/dnacoding/wuyucheng/workspace/Nemotrontiaozheng/Sa2VA-4B}"
 PYTHON_BIN="${PYTHON_BIN:-/opt/vlm/bin/python}"
 
 usage() {
@@ -23,6 +24,7 @@ Required:
 Optional:
   --config PATH
   --save-path PATH
+  --base-model-path PATH
   --job-cpu N
   --job-gpu N
   --job-memory MB
@@ -43,6 +45,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --save-path)
       SAVE_PATH="$2"
+      shift 2
+      ;;
+    --base-model-path)
+      BASE_MODEL_PATH="$2"
       shift 2
       ;;
     --job-cpu)
@@ -107,6 +113,7 @@ rjob submit \
   CONFIG_PATH="${CONFIG_PATH}" \
   PTH_MODEL="${PTH_MODEL}" \
   SAVE_PATH="${SAVE_PATH}" \
+  BASE_MODEL_PATH="${BASE_MODEL_PATH}" \
   PYTHON_BIN="${PYTHON_BIN}" \
   bash -lc '
 set -euo pipefail
@@ -115,9 +122,11 @@ PROJECT_ROOT="${PROJECT_ROOT:?}"
 CONFIG_PATH="${CONFIG_PATH:?}"
 PTH_MODEL="${PTH_MODEL:?}"
 SAVE_PATH="${SAVE_PATH:?}"
+BASE_MODEL_PATH="${BASE_MODEL_PATH:?}"
 PYTHON_BIN="${PYTHON_BIN:?}"
 LOG_DIR="$(dirname "${SAVE_PATH}")"
 LOG_FILE="${LOG_DIR}/convert_$(basename "${SAVE_PATH}").log"
+TMP_CONFIG="${LOG_DIR}/.$(basename "${SAVE_PATH}").convert_config.py"
 
 mkdir -p "${LOG_DIR}"
 : >"${LOG_FILE}"
@@ -142,13 +151,23 @@ apt install -y libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
 
 cd "${PROJECT_ROOT}"
 
+cat > "${TMP_CONFIG}" <<EOF
+from pathlib import Path
+_src = Path(r"${CONFIG_PATH}")
+_text = _src.read_text()
+_text = _text.replace('path = "./pretrained/Sa2VA-4B"', 'path = r"${BASE_MODEL_PATH}"')
+_text = _text.replace('tokenizer_path = path', 'tokenizer_path = path')
+exec(compile(_text, str(_src), "exec"))
+EOF
+
 CONVERT_CMD=(
   "${PYTHON_BIN}"
   "${PROJECT_ROOT}/tools/convert_to_hf.py"
-  "${CONFIG_PATH}"
+  "${TMP_CONFIG}"
   "${PTH_MODEL}"
   --save-path "${SAVE_PATH}"
 )
 
 stdbuf -oL -eL "${CONVERT_CMD[@]}" 2>&1 | tee -a "${LOG_FILE}"
+rm -f "${TMP_CONFIG}"
 '

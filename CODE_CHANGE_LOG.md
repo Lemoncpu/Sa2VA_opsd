@@ -1213,3 +1213,39 @@
   - remove the accidentally embedded real API key
   - accept and forward `HTTP_PROXY` / `HTTPS_PROXY`
   - export lowercase proxy variants inside the container for clients that read `http_proxy` / `https_proxy`
+- Follow-up conversion fix:
+  - `tools/convert_to_hf.py` still failed when the training config pointed `path` at the relative placeholder `./pretrained/Sa2VA-4B`
+  - updated `tools/converthf_ckpt.sh` to accept `--base-model-path` and generate a temporary config with `path` rewritten to the actual mounted base model directory before calling `convert_to_hf.py`
+
+## 2026-06-28 RefCOCO Caption-to-Mask Eval rjob Wrappers
+
+### Problem
+- The repository already had Python evaluators for RefCOCO metrics, but there was no cluster-friendly `rjob` wrapper equivalent to the DLC export/eval entrypoints.
+- The user needed a one-command RefCOCO evaluation path for the current `iter_400` checkpoint and the dataset root `/mnt/shared-storage-user/dnacoding/wuyucheng/dataset/refcoco`.
+
+### Root Cause Notes
+- `tools/eval_refcoco_caption_to_mask.py` can directly evaluate RefCOCO short-referring-expression segmentation quality, but it expects a config and runtime environment rather than a ready-to-submit remote wrapper.
+- Existing example configs hardcode legacy local paths, so they were not suitable as-is for the current cluster paths and HF-exported checkpoint directory.
+
+### Chosen Fix Direction
+- Add a local-path config dedicated to RefCOCO caption-to-mask evaluation against HF model directories.
+- Add one generic checkpoint-based `rjob` wrapper plus one fixed `iter_400` convenience wrapper, mirroring the existing DLC helper style.
+
+### Rejected Direction
+- Do not start with the mask-closure evaluator for this wrapper. The user asked for RefCOCO指标, and the standard `caption_to_mask` evaluator is the more direct match for short-referring-expression segmentation quality.
+
+### Implemented Changes
+- Added `projects/sa2va/configs/refcoco_caption_to_mask_eval_4b_local.py`:
+  - defaults model path to `${PROJECT_ROOT}/work_dirs/hf_iter_400`
+  - defaults data root to `/mnt/shared-storage-user/dnacoding/wuyucheng/dataset/refcoco`
+  - defaults image root to `${data_root}/train2014`
+  - reads overrides from `SA2VA_REFCOCO_EVAL_*` environment variables
+- Added `tools/evalrefcoco_ckpt.sh`:
+  - submits a 1-GPU `rjob`
+  - exports the evaluation env vars
+  - runs `tools/eval_refcoco_caption_to_mask.py`
+  - writes logs to `$(dirname OUTPUT_PATH)/eval_refcoco_<gpu>gpu.log`
+- Added `tools/evalrefcoco_iter400.sh`:
+  - defaults `MODEL_PATH=${PROJECT_ROOT}/work_dirs/hf_iter_400`
+  - defaults `OUTPUT_PATH=${PROJECT_ROOT}/work_dirs/refcoco_caption_to_mask_eval_hf_iter_400.json`
+  - forwards to the generic checkpoint wrapper
