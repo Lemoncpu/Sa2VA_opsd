@@ -282,6 +282,11 @@
   - derives `OUTPUT_DIR=${PROJECT_ROOT}/work_dirs/dlc_bench_eval_<ckpt_name>` by default
   - derives `PRED_OUTPUT=${OUTPUT_DIR}/pred.json`
   - forwards the remaining judge options to the shared `tools/judgedlc.sh` rjob wrapper
+- Added `tools/converthf_ckpt.sh` as an rjob submit wrapper for `tools/convert_to_hf.py`:
+  - requires `--pth-model`
+  - defaults the config to the active 4B RefCOCO OPSD config
+  - derives `SAVE_PATH=${PROJECT_ROOT}/work_dirs/hf_<checkpoint_stem>` by default
+  - writes conversion logs to `$(dirname SAVE_PATH)/convert_<save_dir_name>.log`
   - keeps `teacher_dlc_invalid:*` as a logged failure reason only,
   - always attempts reconstruction from `pipeline_result.detailed_caption` after single-stage DLC generation,
   - uses gate/reconstruction outcome as the real stop condition,
