@@ -219,6 +219,25 @@
 - Updated `tools/traindlc.sh` so the remote training command now exports:
   - `SA2VA_REFCOCO_OPSD_CONFIG`
 
+## 2026-06-28 HF Conversion RJob Empty Dedicated Log
+
+### Problem
+- `tools/converthf_ckpt.sh` submitted the HF export job, but the dedicated log file such as `work_dirs/convert_hf_iter_400.log` could stay empty even when the outer `rjob` log showed the container had started.
+
+### Root Cause Notes
+- The remote script only started appending to `LOG_FILE` when it reached the later `convert_to_hf.py | tee -a "${LOG_FILE}"` step.
+- Any earlier failure during environment unpack, `apt update`, or dependency install happened before that tee pipeline, so the dedicated log remained empty and hid the real failure point.
+
+### Chosen Fix Direction
+- Start full-process log redirection immediately after the remote script initializes `LOG_FILE`, so every later command writes to the dedicated export log.
+
+### Rejected Direction
+- Do not rely on the outer `rjob` log alone. It is often truncated and does not give a stable per-export file for debugging repeated runs.
+
+### Implemented Changes
+- Updated `tools/converthf_ckpt.sh` so the remote bash process now runs with `exec > >(tee -a "${LOG_FILE}") 2>&1` immediately after log initialization.
+- Added early `[convert] remote_job_started` and `[convert] log_file=...` markers so the dedicated log proves whether the remote script entered the export body at all.
+
 ## 2026-06-27 Teacher Regenerate DLC Reconstruction Should Not Be Pre-Blocked
 
 ### Problem

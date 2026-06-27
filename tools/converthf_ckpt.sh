@@ -132,10 +132,14 @@ mkdir -p "${LOG_DIR}"
 : >"${LOG_FILE}"
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
+exec > >(tee -a "${LOG_FILE}") 2>&1
 cleanup() {
   rm -f "${TMP_CONFIG}"
 }
 trap cleanup EXIT
+
+echo "[convert] remote_job_started"
+echo "[convert] log_file=${LOG_FILE}"
 
 cd /opt
 tar -xzf vlm_env.tar.gz -C /opt/vlm
