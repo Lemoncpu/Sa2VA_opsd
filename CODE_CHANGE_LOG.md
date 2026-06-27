@@ -325,6 +325,25 @@
 - Added `--install-system-libs 0|1` CLI flags to both wrappers.
 - Restored the apt source setup and `apt install -y libgl1 libglib2.0-0 libsm6 libxext6 libxrender1` block in both wrappers when `INSTALL_SYSTEM_LIBS=1`.
 
+## 2026-06-28 Direct `.pth` Evaluation Logs Mixed With Stale Failures
+
+### Problem
+- The refreshed `.pth` evaluation runs still appeared to show the old `libGL.so.1` traceback even after the wrapper had been changed to install system libraries first.
+
+### Root Cause Notes
+- The evaluation wrappers appended to their existing log files without truncating them first, so old failure traces remained at the top and made the newest run look broken before the fresh apt-install section.
+- The lightweight startup probe only checked `import torch, transformers`, which could pass before the later `transformers -> PreTrainedModel -> cv2` import path failed.
+
+### Chosen Fix Direction
+- Make each evaluation run start from a clean log file and strengthen the startup import probe so it matches the real dependency path used by checkpoint evaluation.
+
+### Rejected Direction
+- Do not keep diagnosing from mixed old/new logs. The wrappers should make each run self-contained so the first visible traceback always belongs to the current job.
+
+### Implemented Changes
+- Updated `tools/evaldlc_pth.sh` and `tools/evalrefcoco_pth.sh` to truncate their log files at startup with `: >"${LOG_FILE}"`.
+- Strengthened the startup check in both wrappers from `import torch, transformers` to `import cv2; import torch; from transformers import PreTrainedModel`, so missing `libGL` or related import issues fail immediately in the controlled preflight step.
+
 ## 2026-06-27 Teacher Regenerate DLC Reconstruction Should Not Be Pre-Blocked
 
 ### Problem

@@ -176,6 +176,7 @@ INSTALL_SYSTEM_LIBS="${INSTALL_SYSTEM_LIBS:-1}"
 LOG_FILE="$(dirname "${OUTPUT_PATH}")/eval_refcoco_pth.log"
 
 mkdir -p "$(dirname "${OUTPUT_PATH}")"
+: >"${LOG_FILE}"
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 export SA2VA_REFCOCO_EVAL_DATA_ROOT="${DATA_ROOT}"
@@ -197,7 +198,7 @@ EOF
   apt update
   apt install -y libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
 fi
-/opt/vlm/bin/python -c "import torch, transformers; print(\"ok\")"
+/opt/vlm/bin/python -c "import cv2; import torch; from transformers import PreTrainedModel; print(\"ok\")"
 
 cd "${PROJECT_ROOT}"
 
