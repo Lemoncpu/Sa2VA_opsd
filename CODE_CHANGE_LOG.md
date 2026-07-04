@@ -383,6 +383,24 @@
 - Updated the same loader to prefer `data_root/train2014` when present for RefCOCO-family datasets.
 - Updated `projects/sa2va/datasets/refcoco_opsd.py` so `resolve_refcoco_image_root()` now checks `data_root/train2014` before the older nested fallback paths.
 
+## 2026-07-04 SAM Confuser Export Still Passed Parent Directory
+
+### Problem
+- Even after fixing the shell wrapper and REFER loader, SAM confuser export could still resolve `refs(unc).p` under `.../snapshots/refcoco/...` instead of the provided snapshot directory.
+
+### Root Cause Notes
+- `tools/export_refcoco_sam_confuser_pool.py` still normalized `data_root` to `(root.parent, root)` and then passed the first value into `build_refcoco_opsd_records()`.
+- That reintroduced the parent-directory assumption one layer deeper in the call chain.
+
+### Chosen Fix Direction
+- Make the exporter pass the provided snapshot directory itself as the canonical `data_root`.
+
+### Rejected Direction
+- Do not rely on the extra `refcoco_root` return value to preserve the older parent-directory contract. The explicit requirement now is that the provided directory is already the final dataset root.
+
+### Implemented Changes
+- Updated `tools/export_refcoco_sam_confuser_pool.py` so `normalize_refcoco_data_root()` returns `(root, root)` and the exporter no longer passes a parent directory into `build_refcoco_opsd_records()`.
+
 ## 2026-06-28 HF Conversion Remote Shell Here-Doc Quoting Failure
 
 ### Problem

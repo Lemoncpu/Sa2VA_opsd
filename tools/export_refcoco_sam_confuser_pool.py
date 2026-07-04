@@ -65,7 +65,7 @@ def parse_args():
 
 def normalize_refcoco_data_root(data_root: str) -> Tuple[str, str]:
     root = Path(data_root).expanduser().resolve()
-    return str(root.parent), str(root)
+    return str(root), str(root)
 
 
 def normalize_sam2_config_name(config_name: str) -> str:
