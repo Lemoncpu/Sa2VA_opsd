@@ -244,6 +244,10 @@
 - Updated `tools/export_refcoco_opsd_dlc_routes_impl.sh` and `tools/export_refcoco_opsd_routes_impl.sh` so they no longer rewrite `DATA_ROOT` to a parent directory or append `/refcoco`.
 - Updated the wrapper help text to describe `--data-root` as the final RefCOCO annotation root.
 
+### Follow-up Correction
+- The first `Adafactor` compatibility patch only checked the current registry's local module table, but the actual host failure came from a duplicate already visible through the parent `torch.optim` scope.
+- Updated both route exporters so the patch also checks `Registry.get("Adafactor")` and suppresses the duplicate even when MMEngine resolves the existing optimizer from a parent scope and raises later inside `_register_module`.
+
 ## 2026-06-28 HF Conversion RJob Empty Dedicated Log
 
 ### Problem

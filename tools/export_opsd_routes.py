@@ -92,18 +92,34 @@ def _patch_mmengine_adafactor_duplicate_registration() -> None:
             for name in names:
                 if name != "Adafactor":
                     continue
-                existing = self._module_dict.get(name)
-                if existing is None:
-                    continue
-                if existing is module:
-                    return
-                if (
-                    getattr(existing, "__name__", None) == getattr(module, "__name__", None)
-                    and getattr(existing, "__module__", None) == getattr(module, "__module__", None)
+                for existing in (
+                    self._module_dict.get(name),
+                    getattr(self, "get", lambda _: None)(name),
+                ):
+                    if existing is None:
+                        continue
+                    if existing is module:
+                        return
+                    if (
+                        getattr(existing, "__name__", None) == getattr(module, "__name__", None)
+                        and getattr(existing, "__module__", None) == getattr(module, "__module__", None)
+                    ):
+                        return
+
+        try:
+            return original_register_module(self, module=module, module_name=module_name, force=force)
+        except KeyError as exc:
+            if not force and self.name == "optimizer" and any(name == "Adafactor" for name in names):
+                existing = getattr(self, "get", lambda _: None)("Adafactor")
+                if existing is not None and (
+                    existing is module
+                    or (
+                        getattr(existing, "__name__", None) == getattr(module, "__name__", None)
+                        and getattr(existing, "__module__", None) == getattr(module, "__module__", None)
+                    )
                 ):
                     return
-
-        return original_register_module(self, module=module, module_name=module_name, force=force)
+            raise exc
 
     Registry._register_module = patched_register_module
     Registry._sa2va_adafactor_duplicate_patch = True
