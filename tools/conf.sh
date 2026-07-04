@@ -26,7 +26,7 @@ usage() {
   echo
   echo "Options:"
   echo "  --activate-script PATH   Optional activation script."
-  echo "  --data-root PATH         RefCOCO root or its parent directory. Default: /data/xiaoyicheng/refcoco"
+  echo "  --data-root PATH         RefCOCO root directory itself. Default: /data/xiaoyicheng/refcoco"
   echo "  --image-root PATH        train2014 image directory. Default: /data/xiaoyicheng/refcoco/train2014"
   echo "  --dataset NAME           refcoco | refcoco_plus | refcoco+ | refcocog. Default: refcoco"
   echo "  --split NAME             Dataset split. Default: train"
@@ -233,11 +233,6 @@ fi
 validate_environment
 
 REFCOCO_ROOT="${DATA_ROOT}"
-if [[ "$(basename "${DATA_ROOT}")" == "refcoco" ]]; then
-  REFCOCO_ROOT="${DATA_ROOT}"
-else
-  REFCOCO_ROOT="${DATA_ROOT}/refcoco"
-fi
 
 if [[ ! -d "${REFCOCO_ROOT}" ]]; then
   echo "Expected RefCOCO annotations under: ${REFCOCO_ROOT}" >&2

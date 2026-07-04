@@ -341,6 +341,27 @@
 ### Implemented Changes
 - Updated `tools/conf.sh` so the final exporter invocation branches on `EXTRA_ARGS` length and avoids expanding the empty array under `set -u`.
 
+## 2026-07-04 RefCOCO Data Root Should Be Treated As Final Directory
+
+### Problem
+- The SAM confuser export path kept failing on datasets stored under a snapshot directory because the shell wrapper and exporter both tried to append an extra `/refcoco` layer automatically.
+
+### Root Cause Notes
+- `tools/conf.sh` treated any `DATA_ROOT` whose basename was not literally `refcoco` as a parent directory and rewrote it to `${DATA_ROOT}/refcoco`.
+- `tools/export_refcoco_sam_confuser_pool.py` had the same fallback assumption in `normalize_refcoco_data_root`.
+- The user's actual dataset layout already places `instances.json`, `refs(...).p`, and `train2014/` directly inside the provided snapshot directory.
+
+### Chosen Fix Direction
+- Stop guessing parent directories for this export flow.
+- Treat the passed `DATA_ROOT` as the actual RefCOCO root directory unconditionally.
+
+### Rejected Direction
+- Do not keep the fallback-to-`/refcoco` behavior for `confuser` export. It makes snapshot-based layouts fail and hides the real directory contract.
+
+### Implemented Changes
+- Updated `tools/conf.sh` to use the provided `DATA_ROOT` directly and to document it as the RefCOCO root directory itself.
+- Updated `tools/export_refcoco_sam_confuser_pool.py` so `normalize_refcoco_data_root()` no longer appends `/refcoco`.
+
 ## 2026-06-28 HF Conversion Remote Shell Here-Doc Quoting Failure
 
 ### Problem
