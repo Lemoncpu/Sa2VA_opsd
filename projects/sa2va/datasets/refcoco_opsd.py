@@ -61,6 +61,7 @@ def resolve_refcoco_image_root(
     if image_root:
         return image_root
     candidates = [
+        os.path.join(data_root, "train2014"),
         os.path.join(data_root, "refcoco", "train2014"),
         os.path.join(data_root, "images/mscoco/images/train2014"),
         *(image_root_candidates or []),

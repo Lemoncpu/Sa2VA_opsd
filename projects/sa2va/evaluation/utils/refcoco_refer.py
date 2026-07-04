@@ -47,9 +47,20 @@ class REFER:
         # e.g., dataset = 'refcoco', splitBy = 'unc'
         print("loading dataset %s into memory..." % dataset)
         self.ROOT_DIR = osp.abspath(osp.dirname(__file__))
-        self.DATA_DIR = osp.join(data_root, dataset)
+        direct_ref_file = osp.join(data_root, "refs(" + splitBy + ").p")
+        direct_instances_file = osp.join(data_root, "instances.json")
+        if osp.isfile(direct_ref_file) and osp.isfile(direct_instances_file):
+            self.DATA_DIR = data_root
+        else:
+            self.DATA_DIR = osp.join(data_root, dataset)
+
         if dataset in ["refcoco", "refcoco+", "refcocog"]:
-            self.IMAGE_DIR = osp.join(data_root, "images/mscoco/images/train2014")
+            direct_train2014 = osp.join(self.DATA_DIR, "train2014")
+            nested_train2014 = osp.join(data_root, "images/mscoco/images/train2014")
+            if osp.isdir(direct_train2014):
+                self.IMAGE_DIR = direct_train2014
+            else:
+                self.IMAGE_DIR = nested_train2014
         elif dataset == "refclef":
             self.IMAGE_DIR = osp.join(data_root, "images/saiapr_tc-12")
         else:

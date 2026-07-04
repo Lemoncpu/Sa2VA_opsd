@@ -362,6 +362,27 @@
 - Updated `tools/conf.sh` to use the provided `DATA_ROOT` directly and to document it as the RefCOCO root directory itself.
 - Updated `tools/export_refcoco_sam_confuser_pool.py` so `normalize_refcoco_data_root()` no longer appends `/refcoco`.
 
+## 2026-07-04 REFER Loader Support For Flat Snapshot Layout
+
+### Problem
+- Even after the SAM confuser wrapper stopped appending `/refcoco`, the downstream RefCOCO loader still tried to read files from `data_root/refcoco/...` and `data_root/images/mscoco/images/train2014`.
+
+### Root Cause Notes
+- `projects/sa2va/evaluation/utils/refcoco_refer.py` hardcoded `self.DATA_DIR = os.path.join(data_root, dataset)`.
+- `projects/sa2va/datasets/refcoco_opsd.py` also preferred nested image locations and did not check `data_root/train2014`.
+- The user's snapshot directory already stores `refs(unc).p`, `instances.json`, and `train2014/` directly at the passed root.
+
+### Chosen Fix Direction
+- Teach the core REFER loader and RefCOCO image-root resolver to recognize a flat snapshot-style dataset root directly, while preserving the older nested layout as fallback.
+
+### Rejected Direction
+- Do not keep relying on symlink wrappers around the dataset just to satisfy old path assumptions. The loaders should support the real on-disk layout directly.
+
+### Implemented Changes
+- Updated `projects/sa2va/evaluation/utils/refcoco_refer.py` so it uses the passed `data_root` directly when `refs(splitBy).p` and `instances.json` exist there.
+- Updated the same loader to prefer `data_root/train2014` when present for RefCOCO-family datasets.
+- Updated `projects/sa2va/datasets/refcoco_opsd.py` so `resolve_refcoco_image_root()` now checks `data_root/train2014` before the older nested fallback paths.
+
 ## 2026-06-28 HF Conversion Remote Shell Here-Doc Quoting Failure
 
 ### Problem
