@@ -277,6 +277,70 @@
 - Updated `tools/eval_dlc_bench_official.py` to import `DEFAULT_MASK_TO_CAPTION_QUESTION` from `projects/sa2va/datasets/common.py` and use it as the default DLC export query.
 - Updated `tools/eval_dlc_bench_official_pth.py` the same way so HF and `.pth` export paths stay aligned.
 
+## 2026-06-30 DLC Judge Resume Loop For Flaky API Endpoint
+
+### Problem
+- Official DLC judge runs against the configured `gpt-5.5` endpoint were repeatedly timing out mid-run, leaving only partially populated `pred_eval_*.json` files and forcing manual restart.
+
+### Root Cause Notes
+- `tools/run_dlc_bench_judge_only.sh` invoked the official `eval_model_outputs.py` only once.
+- The official evaluator already supports loading partial eval files and resuming, but the wrapper did not automate that behavior when the remote API failed partway through.
+
+### Chosen Fix Direction
+- Keep using the official evaluator and its saved partial JSON format, but wrap it in a bounded retry/resume loop in the local launcher so a flaky endpoint can eventually finish a 100-sample run.
+
+### Rejected Direction
+- Do not fork or heavily rewrite the official judge logic just to add retry behavior. The safer change is to retry at the wrapper level and let the official script resume from the saved eval file.
+
+### Implemented Changes
+- Updated `tools/run_dlc_bench_judge_only.sh` to:
+  - derive the target eval JSON path from `pred_output` and `eval_suffix`
+  - count completed entries in the saved eval file
+  - rerun the official evaluator until the saved progress reaches the QA count or a configurable attempt limit is hit
+  - expose `--resume-attempts` and `--resume-sleep-seconds` for tuning retry behavior
+
+## 2026-07-04 Full Legacy Docker Environment For Sa2VA-4B
+
+### Problem
+- The target server could not install the full `uv sync --extra=legacy` environment on the host because the host `glibc` and compiler toolchain were too old for packages such as `decord2` and `contourpy`.
+
+### Root Cause Notes
+- The project pins packages that expect newer manylinux wheels or newer C/C++ build support than the host environment provides.
+- Installing only inference dependencies was a workaround, but the user explicitly needed the full legacy environment that matches repository setup.
+
+### Chosen Fix Direction
+- Add a dedicated Dockerfile that uses a newer CUDA Ubuntu base image and runs `uv sync --extra=legacy` fully inside the container, isolating the project from host toolchain limitations.
+
+### Rejected Direction
+- Do not keep trying to force the host environment to compile or install the full dependency graph. That path is brittle and diverges from the repository's intended `uv` workflow.
+
+### Implemented Changes
+- Added `Dockerfile.legacy`:
+  - based on `nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04`
+  - installs required system libraries and `uv`
+  - installs Python 3.11 via `uv`
+  - runs `uv sync --python 3.11 --extra=legacy --frozen`
+  - places the synced virtual environment at `/opt/sa2va-venv`
+  - routes Hugging Face and Torch caches to `/cache`
+
+## 2026-07-04 Empty EXTRA_ARGS Expansion In conf.sh
+
+### Problem
+- `tools/conf.sh` failed before launching the exporter on some bash environments with `EXTRA_ARGS[@]: unbound variable` when no extra passthrough arguments were provided.
+
+### Root Cause Notes
+- The script runs with `set -u` and always expanded `"${EXTRA_ARGS[@]}"` even when the array was empty.
+- On the target server's bash behavior, that empty-array expansion still triggered an unbound-variable failure.
+
+### Chosen Fix Direction
+- Only append `EXTRA_ARGS` to the exporter command when the array has at least one element.
+
+### Rejected Direction
+- Do not require callers to pass a dummy argument just to avoid the empty-array bug. The shell wrapper should handle the zero-extra-argument case itself.
+
+### Implemented Changes
+- Updated `tools/conf.sh` so the final exporter invocation branches on `EXTRA_ARGS` length and avoids expanding the empty array under `set -u`.
+
 ## 2026-06-28 HF Conversion Remote Shell Here-Doc Quoting Failure
 
 ### Problem

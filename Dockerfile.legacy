@@ -1,0 +1,53 @@
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
+ENV UV_LINK_MODE=copy
+ENV UV_COMPILE_BYTECODE=1
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
+ENV UV_PROJECT_ENVIRONMENT=/opt/sa2va-venv
+ENV HF_HOME=/cache/huggingface
+ENV TORCH_HOME=/cache/torch
+ENV XDG_CACHE_HOME=/cache/xdg
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    curl \
+    ffmpeg \
+    git \
+    libegl1 \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    ninja-build \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH=/root/.local/bin:${PATH}
+
+WORKDIR /workspace/Sa2VA_opsd
+
+COPY pyproject.toml uv.lock README.md ./
+COPY projects ./projects
+COPY tools ./tools
+COPY demo ./demo
+COPY sa2va_eval ./sa2va_eval
+COPY third_parts ./third_parts
+COPY vlm ./vlm
+COPY assets ./assets
+COPY docs ./docs
+COPY AGENTS.md CODE_CHANGE_LOG.md LICENSE Dockerfile.cluster demo.ipynb ./
+
+RUN mkdir -p /cache /opt/uv-python && \
+    uv python install 3.11 && \
+    uv sync --python 3.11 --extra=legacy --frozen
+
+ENV PATH=/opt/sa2va-venv/bin:/root/.local/bin:${PATH}
+
+CMD ["/bin/bash"]

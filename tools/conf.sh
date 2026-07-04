@@ -297,4 +297,8 @@ if [[ "${OVERWRITE}" == "1" ]]; then
   echo "  OVERWRITE=1"
 fi
 
-"${PYTHON_BIN}" tools/export_refcoco_sam_confuser_pool.py "${EXPORT_ARGS[@]}" "${EXTRA_ARGS[@]}"
+if [[ "${#EXTRA_ARGS[@]}" -gt 0 ]]; then
+  "${PYTHON_BIN}" tools/export_refcoco_sam_confuser_pool.py "${EXPORT_ARGS[@]}" "${EXTRA_ARGS[@]}"
+else
+  "${PYTHON_BIN}" tools/export_refcoco_sam_confuser_pool.py "${EXPORT_ARGS[@]}"
+fi

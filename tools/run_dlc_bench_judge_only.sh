@@ -14,6 +14,8 @@ LLM_ENGINE_KWARGS="${LLM_ENGINE_KWARGS:-}"
 API_KEY_PATH="${API_KEY_PATH:-}"
 DEFAULT_PREDICTION="${DEFAULT_PREDICTION:-}"
 EVAL_SUFFIX="${EVAL_SUFFIX:-}"
+RESUME_ATTEMPTS="${RESUME_ATTEMPTS:-8}"
+RESUME_SLEEP_SECONDS="${RESUME_SLEEP_SECONDS:-3}"
 VERBOSE="${VERBOSE:-0}"
 QUIET="${QUIET:-0}"
 CSV_ONLY="${CSV_ONLY:-0}"
@@ -36,6 +38,8 @@ Options:
   --api-key PATH
   --default-prediction TEXT
   --eval-suffix TEXT
+  --resume-attempts N
+  --resume-sleep-seconds N
   --verbose
   --quiet
   --csv-only
@@ -80,6 +84,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --eval-suffix)
       EVAL_SUFFIX="$2"
+      shift 2
+      ;;
+    --resume-attempts)
+      RESUME_ATTEMPTS="$2"
+      shift 2
+      ;;
+    --resume-sleep-seconds)
+      RESUME_SLEEP_SECONDS="$2"
       shift 2
       ;;
     --verbose)
@@ -201,5 +213,66 @@ if [[ -n "${LLM_ENGINE_KWARGS}" ]]; then
   echo "Ignoring --llm-engine-kwargs because official eval_model_outputs.py does not accept it." >&2
 fi
 
-echo "Running official NVlabs/describe-anything evaluation on an existing pred.json..."
-"${EVAL_CMD[@]}"
+EVAL_FILE="${PRED_OUTPUT%.*}_eval${EVAL_SUFFIX}.json"
+
+count_completed_items() {
+  if [[ ! -f "${EVAL_FILE}" ]]; then
+    echo 0
+    return 0
+  fi
+  "${PYTHON_BIN}" - "${EVAL_FILE}" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+done = sum(1 for value in data.values() if isinstance(value, dict) and "score_pos" in value)
+print(done)
+PY
+}
+
+count_total_items() {
+  "${PYTHON_BIN}" - "${DATA_ROOT}/qa.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+print(len(data))
+PY
+}
+
+TOTAL_ITEMS="$(count_total_items)"
+ATTEMPT=1
+
+while (( ATTEMPT <= RESUME_ATTEMPTS )); do
+  CURRENT_DONE="$(count_completed_items)"
+  if (( CURRENT_DONE >= TOTAL_ITEMS )); then
+    echo "Evaluation already complete: ${CURRENT_DONE}/${TOTAL_ITEMS} items in ${EVAL_FILE}"
+    break
+  fi
+
+  echo "Running official NVlabs/describe-anything evaluation on an existing pred.json..."
+  echo "Resume attempt ${ATTEMPT}/${RESUME_ATTEMPTS}: ${CURRENT_DONE}/${TOTAL_ITEMS} completed"
+  set +e
+  "${EVAL_CMD[@]}"
+  CMD_EXIT=$?
+  set -e
+
+  NEW_DONE="$(count_completed_items)"
+  echo "Attempt ${ATTEMPT} finished with exit code ${CMD_EXIT}; progress is now ${NEW_DONE}/${TOTAL_ITEMS}"
+
+  if (( NEW_DONE >= TOTAL_ITEMS )); then
+    break
+  fi
+
+  if (( ATTEMPT >= RESUME_ATTEMPTS )); then
+    echo "Evaluation still incomplete after ${RESUME_ATTEMPTS} attempts: ${NEW_DONE}/${TOTAL_ITEMS}" >&2
+    exit 1
+  fi
+
+  sleep "${RESUME_SLEEP_SECONDS}"
+  ATTEMPT=$((ATTEMPT + 1))
+done
