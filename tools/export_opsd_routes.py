@@ -109,16 +109,13 @@ def _patch_mmengine_adafactor_duplicate_registration() -> None:
         try:
             return original_register_module(self, module=module, module_name=module_name, force=force)
         except KeyError as exc:
-            if not force and self.name == "optimizer" and any(name == "Adafactor" for name in names):
-                existing = getattr(self, "get", lambda _: None)("Adafactor")
-                if existing is not None and (
-                    existing is module
-                    or (
-                        getattr(existing, "__name__", None) == getattr(module, "__name__", None)
-                        and getattr(existing, "__module__", None) == getattr(module, "__module__", None)
-                    )
-                ):
-                    return
+            if (
+                not force
+                and self.name == "optimizer"
+                and any(name == "Adafactor" for name in names)
+                and "Adafactor is already registered in optimizer" in str(exc)
+            ):
+                return
             raise exc
 
     Registry._register_module = patched_register_module

@@ -248,6 +248,10 @@
 - The first `Adafactor` compatibility patch only checked the current registry's local module table, but the actual host failure came from a duplicate already visible through the parent `torch.optim` scope.
 - Updated both route exporters so the patch also checks `Registry.get("Adafactor")` and suppresses the duplicate even when MMEngine resolves the existing optimizer from a parent scope and raises later inside `_register_module`.
 
+### Second Follow-up Correction
+- The parent-scope equality check was still too strict for the host MMEngine/Transformers combination, because the duplicate registration is harmless for route export and may not expose a directly comparable existing module object before `_register_module` raises.
+- Simplified the compatibility layer to a targeted message-based bypass: when optimizer registration raises the known `Adafactor is already registered in optimizer` duplicate error, the route exporters now skip it unconditionally and continue config loading.
+
 ## 2026-06-28 HF Conversion RJob Empty Dedicated Log
 
 ### Problem
