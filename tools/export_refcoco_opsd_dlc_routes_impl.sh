@@ -210,7 +210,7 @@ usage() {
   echo "  --tokenizer-path PATH   Tokenizer path. Default: ${DEFAULT_TOKENIZER_PATH}"
   echo "  --checkpoint PATH       Optional checkpoint used to estimate initial routes."
   echo "  --activate-script PATH  Optional activation script. Default: empty (use image PATH python)."
-  echo "  --data-root PATH        RefCOCO annotation root or its parent directory. Default: /data/xiaoyicheng/refcoco"
+  echo "  --data-root PATH        RefCOCO annotation root. Default: /data/xiaoyicheng/refcoco"
   echo "  --image-root PATH       train2014 image directory. Default: /data/xiaoyicheng/refcoco/train2014"
   echo "  --dataset NAME          refcoco | refcoco_plus | refcoco+ | refcocog. Default: refcoco"
   echo "  --split NAME            Dataset split. Default: train"
@@ -371,12 +371,6 @@ fi
 validate_export_environment
 
 REFCOCO_ROOT="${DATA_ROOT}"
-if [[ "$(basename "${DATA_ROOT}")" == "refcoco" ]]; then
-  REFCOCO_ROOT="${DATA_ROOT}"
-  DATA_ROOT="$(dirname "${DATA_ROOT}")"
-else
-  REFCOCO_ROOT="${DATA_ROOT}/refcoco"
-fi
 
 if [[ ! -d "${REFCOCO_ROOT}" ]]; then
   echo "Expected RefCOCO annotations under: ${REFCOCO_ROOT}" >&2

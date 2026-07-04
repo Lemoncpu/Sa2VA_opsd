@@ -93,7 +93,47 @@ def _merge_cfg_options(cfg: dict, cfg_options: dict):
     return cfg
 
 
+def _patch_mmengine_adafactor_duplicate_registration() -> None:
+    try:
+        from mmengine.registry.registry import Registry
+    except Exception:
+        return
+
+    if getattr(Registry, "_sa2va_adafactor_duplicate_patch", False):
+        return
+
+    original_register_module = Registry._register_module
+
+    def patched_register_module(self, module, module_name=None, force=False):
+        names = module_name
+        if names is None:
+            names = [module.__name__]
+        elif isinstance(names, str):
+            names = [names]
+
+        if not force and self.name == "optimizer":
+            for name in names:
+                if name != "Adafactor":
+                    continue
+                existing = self._module_dict.get(name)
+                if existing is None:
+                    continue
+                if existing is module:
+                    return
+                if (
+                    getattr(existing, "__name__", None) == getattr(module, "__name__", None)
+                    and getattr(existing, "__module__", None) == getattr(module, "__module__", None)
+                ):
+                    return
+
+        return original_register_module(self, module=module, module_name=module_name, force=force)
+
+    Registry._register_module = patched_register_module
+    Registry._sa2va_adafactor_duplicate_patch = True
+
+
 def load_config(path: str, cfg_options: dict = None):
+    _patch_mmengine_adafactor_duplicate_registration()
     cfg = runpy.run_path(path)
     return _merge_cfg_options(cfg, cfg_options)
 

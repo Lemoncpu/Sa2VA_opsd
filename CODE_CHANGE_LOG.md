@@ -219,6 +219,31 @@
 - Updated `tools/traindlc.sh` so the remote training command now exports:
   - `SA2VA_REFCOCO_OPSD_CONFIG`
 
+## 2026-07-05 RefCOCO Route Export MMEngine Optimizer Collision
+
+### Problem
+- RefCOCO route export failed before model loading in the host venv with:
+  - `KeyError: 'Adafactor is already registered in optimizer at torch.optim'`
+- The DLC route wrapper also still rewrote `DATA_ROOT` back to the parent directory, which conflicted with the now-supported flat RefCOCO snapshot layout where `refs(unc).p`, `instances.json`, and `train2014/` live directly under the passed directory.
+
+### Root Cause Notes
+- `tools/export_opsd_dlc_routes.py` and `tools/export_opsd_routes.py` load configs via `runpy.run_path(...)`, which imports `mmengine.optim.optimizer.builder` during config evaluation.
+- In the host environment, `Adafactor` was already discoverable through the optimizer registry scope, so MMEngine's transformer optimizer registration raised on the duplicate instead of treating it as idempotent.
+- The route shell wrappers still contained older "annotation root or its parent directory" logic and silently rewrote `train_dataset.data_root`, unlike the already-fixed confuser export path.
+
+### Chosen Fix Direction
+- Patch the route exporters before config load so MMEngine ignores duplicate `Adafactor` registration when the existing registry entry already matches the same optimizer class.
+- Align both RefCOCO route wrapper scripts with the confuser exporter: the `--data-root` argument is now treated as the final RefCOCO annotation root and is passed through unchanged.
+
+### Rejected Direction
+- Do not pin or downgrade MMEngine/Transformers just to work around this host-only registry collision. The export tools should be robust across the current server environments.
+- Do not keep mixed `DATA_ROOT` semantics between confuser export and route export, because that keeps reintroducing flat-layout path bugs.
+
+### Implemented Changes
+- Updated `tools/export_opsd_dlc_routes.py` and `tools/export_opsd_routes.py` to install a narrow MMEngine registry compatibility patch before config evaluation, skipping duplicate optimizer registration only for matching `Adafactor` entries.
+- Updated `tools/export_refcoco_opsd_dlc_routes_impl.sh` and `tools/export_refcoco_opsd_routes_impl.sh` so they no longer rewrite `DATA_ROOT` to a parent directory or append `/refcoco`.
+- Updated the wrapper help text to describe `--data-root` as the final RefCOCO annotation root.
+
 ## 2026-06-28 HF Conversion RJob Empty Dedicated Log
 
 ### Problem
