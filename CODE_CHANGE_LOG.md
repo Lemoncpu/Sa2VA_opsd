@@ -252,6 +252,27 @@
 - The parent-scope equality check was still too strict for the host MMEngine/Transformers combination, because the duplicate registration is harmless for route export and may not expose a directly comparable existing module object before `_register_module` raises.
 - Simplified the compatibility layer to a targeted message-based bypass: when optimizer registration raises the known `Adafactor is already registered in optimizer` duplicate error, the route exporters now skip it unconditionally and continue config loading.
 
+## 2026-07-05 Route Export XTuner Optionality For Host Eval Venv
+
+### Problem
+- After bypassing the MMEngine optimizer collision, RefCOCO route export still failed during config import in the host evaluation venv with:
+  - `ModuleNotFoundError: No module named 'xtuner'`
+- Installing `xtuner` directly was blocked because its dependency chain pulled `tiktoken==0.13.0`, which fell back to source build and required a Rust compiler not available on the host.
+
+### Root Cause Notes
+- The route exporters load the training config with `runpy.run_path(...)`, so even export-only jobs execute top-level config imports.
+- `projects/sa2va/configs/sa2va_opsd_combine_4b_dlc.py` imports `TrainLoop` from `xtuner.engine.runner`, but route export only needs the config object graph and never instantiates the training runner.
+
+### Chosen Fix Direction
+- Make the route exporters tolerant to a missing XTuner runtime by injecting a minimal `xtuner.engine.runner.TrainLoop` stub before config loading when XTuner is unavailable.
+
+### Rejected Direction
+- Do not require the host eval venv to install the full XTuner training stack just to export routes.
+- Do not require Rust installation only to satisfy `tiktoken` during an export-only workflow.
+
+### Implemented Changes
+- Updated `tools/export_opsd_dlc_routes.py` and `tools/export_opsd_routes.py` to provide an XTuner `TrainLoop` stub during config import when `xtuner.engine.runner` is missing.
+
 ## 2026-06-28 HF Conversion RJob Empty Dedicated Log
 
 ### Problem

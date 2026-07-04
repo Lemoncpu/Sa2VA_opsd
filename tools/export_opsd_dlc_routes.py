@@ -3,6 +3,7 @@ import json
 import os
 import runpy
 import shutil
+import types
 import sys
 import time
 from datetime import datetime, timezone
@@ -145,8 +146,31 @@ def _patch_mmengine_adafactor_duplicate_registration() -> None:
     Registry._sa2va_adafactor_duplicate_patch = True
 
 
+def _ensure_xtuner_trainloop_stub() -> None:
+    if "xtuner.engine.runner" in sys.modules:
+        return
+    try:
+        from xtuner.engine.runner import TrainLoop  # noqa: F401
+        return
+    except Exception:
+        pass
+
+    xtuner_module = sys.modules.setdefault("xtuner", types.ModuleType("xtuner"))
+    engine_module = sys.modules.setdefault("xtuner.engine", types.ModuleType("xtuner.engine"))
+    runner_module = types.ModuleType("xtuner.engine.runner")
+
+    class TrainLoop:  # pragma: no cover - config import compatibility stub
+        pass
+
+    runner_module.TrainLoop = TrainLoop
+    engine_module.runner = runner_module
+    xtuner_module.engine = engine_module
+    sys.modules["xtuner.engine.runner"] = runner_module
+
+
 def load_config(path: str, cfg_options: dict = None):
     _patch_mmengine_adafactor_duplicate_registration()
+    _ensure_xtuner_trainloop_stub()
     cfg = runpy.run_path(path)
     return _merge_cfg_options(cfg, cfg_options)
 
