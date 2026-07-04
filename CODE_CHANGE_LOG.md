@@ -273,6 +273,25 @@
 ### Implemented Changes
 - Updated `tools/export_opsd_dlc_routes.py` and `tools/export_opsd_routes.py` to provide an XTuner `TrainLoop` stub during config import when `xtuner.engine.runner` is missing.
 
+## 2026-07-05 Route Export GPU Visibility Preflight
+
+### Problem
+- After the config-import compatibility fixes, multi-GPU route export progressed into model construction but failed on higher local ranks with:
+  - `RuntimeError: CUDA error: invalid device ordinal`
+- The failure pattern (`rank4` and above) indicated that the export process could only see fewer GPUs than the requested `GPUS=8`.
+
+### Root Cause Notes
+- `projects/sa2va/models/sa2va_opsd_v3.py` resolved `device="auto"` to `cuda:${LOCAL_RANK}` without checking whether that rank was within the visible CUDA device count.
+- The RefCOCO route wrapper scripts also trusted the requested `GPUS` count and only validated it against the length of the `CUDA_VISIBLE_DEVICES` string, not against the number of GPUs actually exposed inside the runtime environment.
+
+### Chosen Fix Direction
+- Add an explicit preflight in the route wrapper scripts to measure `torch.cuda.device_count()` under the requested `CUDA_VISIBLE_DEVICES` and fail early with a clear message if `GPUS` exceeds the visible count.
+- Add a matching guard in `Sa2VAOPSDModelV3` so model-side failures report `LOCAL_RANK`, visible device count, and `CUDA_VISIBLE_DEVICES` instead of surfacing a raw CUDA ordinal error.
+
+### Implemented Changes
+- Updated `tools/export_refcoco_opsd_dlc_routes_impl.sh` and `tools/export_refcoco_opsd_routes_impl.sh` to verify the visible CUDA count before launch.
+- Updated `projects/sa2va/models/sa2va_opsd_v3.py` so auto device resolution raises a descriptive error when `LOCAL_RANK` exceeds the visible CUDA devices.
+
 ## 2026-06-28 HF Conversion RJob Empty Dedicated Log
 
 ### Problem

@@ -408,6 +408,22 @@ if [[ "${ROUTE_MODEL}" != "teacher" && "${ROUTE_MODEL}" != "student" ]]; then
   exit 1
 fi
 
+VISIBLE_CUDA_COUNT="$(
+  CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_IDS}" "${PYTHON_BIN}" - <<'PY'
+import torch
+print(torch.cuda.device_count())
+PY
+)"
+if [[ ! "${VISIBLE_CUDA_COUNT}" =~ ^[0-9]+$ ]]; then
+  echo "Failed to determine visible CUDA device count, got: ${VISIBLE_CUDA_COUNT}" >&2
+  exit 1
+fi
+if [[ "${GPUS}" -gt "${VISIBLE_CUDA_COUNT}" ]]; then
+  echo "Requested GPUS=${GPUS}, but only ${VISIBLE_CUDA_COUNT} CUDA devices are visible to the export process." >&2
+  echo "CUDA_VISIBLE_DEVICES=${CUDA_DEVICE_IDS}" >&2
+  exit 1
+fi
+
 EFFECTIVE_BATCH_SIZE="${BATCH_SIZE_OVERRIDE:-1}"
 
 mkdir -p "${WORK_DIR}/route_cache"

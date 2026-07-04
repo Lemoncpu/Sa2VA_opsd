@@ -17,6 +17,13 @@ class Sa2VAOPSDModelV3(Sa2VAOPSDModelV2):
             if not torch.cuda.is_available():
                 raise RuntimeError("CUDA is required for Sa2VA_OPSD V3 training.")
             local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            visible_device_count = int(torch.cuda.device_count())
+            if local_rank >= visible_device_count:
+                raise RuntimeError(
+                    "Requested LOCAL_RANK exceeds visible CUDA device count for Sa2VA OPSD V3. "
+                    f"LOCAL_RANK={local_rank}, visible_cuda_devices={visible_device_count}, "
+                    f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}"
+                )
             return torch.device(f"cuda:{local_rank}")
 
         return torch.device(device)
