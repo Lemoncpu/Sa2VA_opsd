@@ -924,6 +924,41 @@ class Sa2VAOPSDModelV2(BaseModel):
         caption = re.sub(r"<[^>]+>", " ", caption)
         caption = re.sub(r"<[^>\n]*$", "", caption)
         caption = re.sub(r"(assistant|bot)\s*[:：]\s*", "", caption, flags=re.IGNORECASE)
+        # Normalize referential scaffolds so training captions match DLC-style
+        # direct descriptions instead of "the target / the region / region1 ..."
+        # lead-ins.
+        caption = re.sub(
+            r"^(?:the\s+)?target(?:\s+(?:object|person|item|area|region))?"
+            r"(?:\s+in\s+region\d+)?\s+(?:is|appears\s+to\s+be|looks\s+like)\s+",
+            "",
+            caption,
+            flags=re.IGNORECASE,
+        )
+        caption = re.sub(
+            r"^(?:the\s+)?(?:object|person|item|area)\s+in\s+region\d+\s+"
+            r"(?:is|appears\s+to\s+be|looks\s+like)\s+",
+            "",
+            caption,
+            flags=re.IGNORECASE,
+        )
+        caption = re.sub(
+            r"^(?:the\s+)?region\d+\s+(?:shows|contains|is|appears\s+to\s+be|looks\s+like)\s+",
+            "",
+            caption,
+            flags=re.IGNORECASE,
+        )
+        caption = re.sub(
+            r"^(?:the\s+)?region\s+(?:shows|contains)\s+",
+            "",
+            caption,
+            flags=re.IGNORECASE,
+        )
+        caption = re.sub(
+            r"^(?:the\s+)?(?:target|object|person|item|area|region)\s*[:：]\s*",
+            "",
+            caption,
+            flags=re.IGNORECASE,
+        )
         caption = re.sub(r"\s+", " ", caption)
         caption = re.sub(r"\s+([,.;:!?])", r"\1", caption)
         caption = re.sub(r"([,.;:!?])([^\s])", r"\1 \2", caption)

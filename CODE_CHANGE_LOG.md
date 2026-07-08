@@ -262,6 +262,34 @@
 - The first normalization changed `train_cfg.type` into the Python class object `EpochBasedTrainLoop`, which `mmengine` then rendered as `type=<class '...'>`; that string is not valid Python config syntax and caused `SyntaxError` during pretty-print formatting.
 - Updated `tools/train_fallback_compat.py` so fallback normalization now writes `train_cfg.type='EpochBasedTrainLoop'`, which remains registry-resolvable and keeps mmengine config pretty-printing valid.
 
+## 2026-07-09 DLC-Style Caption Cleaning For Training Supervision
+
+### Problem
+- Training captions were already supervised mainly through `clean_caption`, but the current cleaning logic still left referential sentence starters such as `the target is ...`, `the target in region1 is ...`, and `the region shows ...`.
+- These lead-ins are not a good match for DLC-Bench style judging, where more direct visual descriptions are preferred.
+
+### Root Cause Notes
+- `projects/sa2va/models/sa2va_opsd_v2.py::_clean_caption_text()` removed control tokens and generic chat wrappers, but it did not normalize referential scaffolds at the beginning of captions.
+- As a result, student and teacher captions could remain syntactically tied to region labels even after cleaning, despite the downstream loss already aligning mostly against `clean_caption`.
+
+### Chosen Fix Direction
+- Keep the existing training structure that supervises on cleaned captions.
+- Extend only the cleaning step so sentence-initial `target / region / region1` scaffolds are stripped and the remaining text becomes a direct DLC-style description.
+
+### Rejected Direction
+- Do not move supervision back to raw generations or redesign the loss path. The main issue was the definition of `clean_caption`, not the fact that the loss used cleaned text.
+- Do not aggressively rewrite mentions in the middle of captions; only normalize leading scaffolds to avoid damaging genuine descriptive content.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py::_clean_caption_text()` to strip sentence-initial templates such as:
+  - `the target is ...`
+  - `the target in region1 is ...`
+  - `the object in region1 is ...`
+  - `region1 shows ...`
+  - `the region shows ...`
+  - `target: ...`
+- The cleaned caption continues to feed `completion_ids` and training losses, so the supervision target is now more DLC-style without changing the broader training pipeline.
+
 ## 2026-07-05 RefCOCO Route Export MMEngine Optimizer Collision
 
 ### Problem
