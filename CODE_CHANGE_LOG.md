@@ -219,6 +219,39 @@
 - Updated `tools/traindlc.sh` so the remote training command now exports:
   - `SA2VA_REFCOCO_OPSD_CONFIG`
 
+## 2026-07-08 RefCOCO OPSD Training Fallback For Host Route-Export Environment
+
+### Problem
+- The current RefCOCO OPSD 4B host environment can already export IoU routes and DLC routes, but main training still failed immediately at startup with `ModuleNotFoundError: No module named 'xtuner'`.
+- This blocked training even though the route-export chain had already proven that the model, dataset, sampler, hooks, and manifest logic were mostly runnable in that environment.
+
+### Root Cause Notes
+- `tools/train.py` hard-imported `xtuner.tools.train` before doing anything else, so the process could not fall back to a repo-local runner path.
+- The active RefCOCO OPSD 4B config imported `xtuner.engine.runner.TrainLoop`, and some shared dataset utilities still imported a few small `xtuner` helpers and constants.
+- For this chain, the missing pieces were narrow startup/runtime compatibility shims rather than a fundamentally missing training implementation.
+
+### Chosen Fix Direction
+- Keep the existing `xtuner` entrypoint as the first choice.
+- When `xtuner` is unavailable, allow only the current RefCOCO OPSD 4B training chain to fall back to a repo-local mmengine launcher with a minimal `xtuner` compatibility layer.
+- Keep route manifest behavior strict: missing or incomplete manifests must still fail loudly.
+
+### Rejected Direction
+- Do not add a repo-wide generic `xtuner` replacement. That would broaden risk well beyond the current host-training unblock.
+- Do not weaken route checks or silently skip route-less samples just to make startup succeed.
+
+### Implemented Changes
+- Added `tools/train_fallback_compat.py` with the minimum compatibility needed by the current RefCOCO OPSD 4B training chain:
+  - `xtuner.engine.runner.TrainLoop` compatibility mapped to an mmengine epoch train loop.
+  - local `guess_load_checkpoint` fallback.
+  - minimal `xtuner.registry.BUILDER` / `MAP_FUNC`.
+  - minimal `xtuner.dataset.utils.get_bos_eos_token_ids` and `xtuner.utils` constants.
+  - reused the existing Adafactor duplicate-registration patch pattern.
+- Reworked `tools/train.py`:
+  - still prefers the native `xtuner.tools.train` path when available.
+  - falls back to the local mmengine runner path only when `xtuner` is missing and the target is the current RefCOCO OPSD 4B chain.
+  - logs clearly when fallback mode is active and ignores the CLI deepspeed alias in that local fallback path.
+- Updated `tools/train_refcoco_opsd_impl.sh` to export and log `SA2VA_TRAIN_FALLBACK_CHAIN=refcoco_opsd_4b` so the intended training wrapper aligns with the new fallback launcher.
+
 ## 2026-07-05 RefCOCO Route Export MMEngine Optimizer Collision
 
 ### Problem
