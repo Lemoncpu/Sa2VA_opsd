@@ -252,6 +252,11 @@
   - logs clearly when fallback mode is active and ignores the CLI deepspeed alias in that local fallback path.
 - Updated `tools/train_refcoco_opsd_impl.sh` to export and log `SA2VA_TRAIN_FALLBACK_CHAIN=refcoco_opsd_4b` so the intended training wrapper aligns with the new fallback launcher.
 
+### Follow-up Correction
+- The first fallback stub only inserted `xtuner` modules into `sys.modules`, but `mmengine` lazy config parsing also calls `importlib.find_spec("xtuner")`.
+- Without a valid `__spec__`, the fallback crashed during `Config.fromfile(...)` with `ValueError: xtuner.__spec__ is None` before runner construction.
+- Updated `tools/train_fallback_compat.py` so all injected `xtuner*` compatibility modules now carry minimal `ModuleSpec` metadata, which keeps mmengine's lazy import scan compatible with the stubbed package.
+
 ## 2026-07-05 RefCOCO Route Export MMEngine Optimizer Collision
 
 ### Problem

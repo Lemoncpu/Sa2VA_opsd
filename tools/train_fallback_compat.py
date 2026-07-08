@@ -1,4 +1,5 @@
 import importlib
+import importlib.machinery
 import logging
 import os
 import os.path as osp
@@ -157,9 +158,19 @@ def install_xtuner_fallback_modules() -> None:
     from mmengine.runner.loops import EpochBasedTrainLoop
 
     xtuner_module = sys.modules.setdefault("xtuner", types.ModuleType("xtuner"))
+    if getattr(xtuner_module, "__spec__", None) is None:
+        xtuner_module.__spec__ = importlib.machinery.ModuleSpec("xtuner", loader=None, is_package=True)
+    if not hasattr(xtuner_module, "__path__"):
+        xtuner_module.__path__ = []
 
     engine_module = sys.modules.setdefault("xtuner.engine", types.ModuleType("xtuner.engine"))
     runner_module = sys.modules.setdefault("xtuner.engine.runner", types.ModuleType("xtuner.engine.runner"))
+    if getattr(engine_module, "__spec__", None) is None:
+        engine_module.__spec__ = importlib.machinery.ModuleSpec("xtuner.engine", loader=None, is_package=True)
+    if not hasattr(engine_module, "__path__"):
+        engine_module.__path__ = []
+    if getattr(runner_module, "__spec__", None) is None:
+        runner_module.__spec__ = importlib.machinery.ModuleSpec("xtuner.engine.runner", loader=None)
 
     class TrainLoop(EpochBasedTrainLoop):
         pass
@@ -172,12 +183,20 @@ def install_xtuner_fallback_modules() -> None:
     model_utils_module = sys.modules.setdefault(
         "xtuner.model.utils", types.ModuleType("xtuner.model.utils")
     )
+    if getattr(model_module, "__spec__", None) is None:
+        model_module.__spec__ = importlib.machinery.ModuleSpec("xtuner.model", loader=None, is_package=True)
+    if not hasattr(model_module, "__path__"):
+        model_module.__path__ = []
+    if getattr(model_utils_module, "__spec__", None) is None:
+        model_utils_module.__spec__ = importlib.machinery.ModuleSpec("xtuner.model.utils", loader=None)
     model_utils_module.guess_load_checkpoint = guess_load_checkpoint
     model_utils_module.get_peft_model_state_dict = get_peft_model_state_dict
     model_module.utils = model_utils_module
     xtuner_module.model = model_module
 
     registry_module = sys.modules.setdefault("xtuner.registry", types.ModuleType("xtuner.registry"))
+    if getattr(registry_module, "__spec__", None) is None:
+        registry_module.__spec__ = importlib.machinery.ModuleSpec("xtuner.registry", loader=None)
     if not hasattr(registry_module, "BUILDER"):
         registry_module.BUILDER = _MinimalBuilder()
     if not hasattr(registry_module, "MAP_FUNC"):
@@ -188,16 +207,26 @@ def install_xtuner_fallback_modules() -> None:
     dataset_utils_module = sys.modules.setdefault(
         "xtuner.dataset.utils", types.ModuleType("xtuner.dataset.utils")
     )
+    if getattr(dataset_module, "__spec__", None) is None:
+        dataset_module.__spec__ = importlib.machinery.ModuleSpec("xtuner.dataset", loader=None, is_package=True)
+    if not hasattr(dataset_module, "__path__"):
+        dataset_module.__path__ = []
+    if getattr(dataset_utils_module, "__spec__", None) is None:
+        dataset_utils_module.__spec__ = importlib.machinery.ModuleSpec("xtuner.dataset.utils", loader=None)
     dataset_utils_module.get_bos_eos_token_ids = get_bos_eos_token_ids
     dataset_module.utils = dataset_utils_module
     xtuner_module.dataset = dataset_module
 
     utils_module = sys.modules.setdefault("xtuner.utils", types.ModuleType("xtuner.utils"))
+    if getattr(utils_module, "__spec__", None) is None:
+        utils_module.__spec__ = importlib.machinery.ModuleSpec("xtuner.utils", loader=None)
     utils_module.IGNORE_INDEX = -100
     utils_module.DEFAULT_PAD_TOKEN_INDEX = 0
     xtuner_module.utils = utils_module
 
     configs_module = sys.modules.setdefault("xtuner.configs", types.ModuleType("xtuner.configs"))
+    if getattr(configs_module, "__spec__", None) is None:
+        configs_module.__spec__ = importlib.machinery.ModuleSpec("xtuner.configs", loader=None)
     if not hasattr(configs_module, "cfgs_name_path"):
         configs_module.cfgs_name_path = {}
     xtuner_module.configs = configs_module
