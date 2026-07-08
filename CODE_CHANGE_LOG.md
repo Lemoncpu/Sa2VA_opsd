@@ -292,6 +292,24 @@
 - Updated `tools/export_refcoco_opsd_dlc_routes_impl.sh` and `tools/export_refcoco_opsd_routes_impl.sh` to verify the visible CUDA count before launch.
 - Updated `projects/sa2va/models/sa2va_opsd_v3.py` so auto device resolution raises a descriptive error when `LOCAL_RANK` exceeds the visible CUDA devices.
 
+## 2026-07-08 RefCOCO Training Wrapper Data Root Alignment
+
+### Problem
+- RefCOCO 4B training still failed its startup path check with:
+  - `Expected RefCOCO annotations under: <data_root>/refcoco`
+- This no longer matched the export/confuser workflow, where the passed `DATA_ROOT` already points at the final RefCOCO annotation directory containing `refs(unc).p`, `instances.json`, and `train2014/`.
+
+### Root Cause Notes
+- `tools/train_refcoco_opsd_impl.sh` still contained the older parent-directory fallback and silently rewrote `DATA_ROOT` by appending `/refcoco` unless the basename already matched exactly.
+- The route export wrappers and confuser export path had already been updated to treat the passed path as the final dataset root, so training had drifted out of sync with the rest of the workflow.
+
+### Chosen Fix Direction
+- Align the training wrapper with the export wrappers: the passed `--data-root` / `DATA_ROOT` value is now interpreted as the final RefCOCO annotation root and validated directly.
+
+### Implemented Changes
+- Updated `tools/train_refcoco_opsd_impl.sh` so it no longer rewrites `DATA_ROOT` to a parent directory or appends `/refcoco`.
+- Updated the wrapper help text to describe `--data-root` as the final RefCOCO annotation root.
+
 ## 2026-06-28 HF Conversion RJob Empty Dedicated Log
 
 ### Problem
