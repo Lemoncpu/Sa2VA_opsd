@@ -257,6 +257,11 @@
 - Without a valid `__spec__`, the fallback crashed during `Config.fromfile(...)` with `ValueError: xtuner.__spec__ is None` before runner construction.
 - Updated `tools/train_fallback_compat.py` so all injected `xtuner*` compatibility modules now carry minimal `ModuleSpec` metadata, which keeps mmengine's lazy import scan compatible with the stubbed package.
 
+### Second Follow-up Correction
+- After the `__spec__` fix, fallback training progressed into mmengine runner construction but failed while logging `cfg.pretty_text`.
+- The first normalization changed `train_cfg.type` into the Python class object `EpochBasedTrainLoop`, which `mmengine` then rendered as `type=<class '...'>`; that string is not valid Python config syntax and caused `SyntaxError` during pretty-print formatting.
+- Updated `tools/train_fallback_compat.py` so fallback normalization now writes `train_cfg.type='EpochBasedTrainLoop'`, which remains registry-resolvable and keeps mmengine config pretty-printing valid.
+
 ## 2026-07-05 RefCOCO Route Export MMEngine Optimizer Collision
 
 ### Problem

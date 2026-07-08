@@ -263,8 +263,6 @@ def load_fallback_config(config_path: str, args):
 
 
 def normalize_train_cfg_for_fallback(cfg) -> None:
-    from mmengine.runner.loops import EpochBasedTrainLoop
-
     train_cfg = cfg.get("train_cfg")
     if not isinstance(train_cfg, dict):
         return
@@ -272,7 +270,7 @@ def normalize_train_cfg_for_fallback(cfg) -> None:
     loop_type = train_cfg.get("type")
     loop_name = getattr(loop_type, "__name__", None)
     if loop_name == "TrainLoop":
-        train_cfg["type"] = EpochBasedTrainLoop
+        train_cfg["type"] = "EpochBasedTrainLoop"
 
 
 def build_runner_from_cfg(cfg):
