@@ -12,6 +12,16 @@ DEFAULT_MASK_TO_CAPTION_QUESTION = (
 )
 
 
+DEFAULT_MASK_TO_REFERRING_QUESTION = (
+    "<image>"
+    "Describe the target marked by region1 with one short, precise referring expression. "
+    "Focus on the target itself and keep only the minimum visible details needed to localize it among nearby similar objects. "
+    "Prefer a compact noun phrase or one short natural expression instead of a long scene description. "
+    "Use directly visible category, color, clothing, parts, pose, or local spatial cue only when necessary. "
+    "Do not mention segmentation tokens, tags, placeholder text, or unnecessary background."
+)
+
+
 
 # Glamm
 SEG_QUESTIONS = [

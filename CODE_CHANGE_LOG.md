@@ -302,14 +302,42 @@
 
 ### Implemented Changes
 - Updated `projects/sa2va/models/sa2va_opsd_v2.py` so `_teacher_regenerate_gate_passed()` now applies the “`iou_gain > 0` is enough” rule only when `student_iou >= iou_high_threshold`.
-  - logs did not expose the raw structured diagnosis or repair outputs, making it hard to tell whether failures came from prompt non-compliance or from over-strict local validation
-- Updated `projects/sa2va/models/sa2va_opsd_v2.py` again to:
-  - relax problem/direction/reason validators for weak-but-usable spatial evidence
-  - stop hard-failing trivial `difference_context` cases when minimal diagnosis signal exists
-  - backfill missing diagnosis fields from `likely_drift_reason` and simple local heuristics
-  - allow degraded candidate generation whenever minimal diagnosis signal exists, instead of requiring full diagnosis validity
-  - treat some imperfect DLC candidates as usable so reranking can start earlier
-  - log `structured_diagnosis_raw`, `repair_raw`, and per-field diagnosis failure reasons so the next training run can reveal whether the structured stage is actually being followed
+
+## 2026-07-09 Referring-Caption Training Path Realignment
+
+### Problem
+- The repository still had a short referring-caption training path, but it lived on the older `sa2va_opsd_combine.py` implementation.
+- As a result, the referring path had drifted away from the current DLC OPSD training stack in route handling, sampler choice, route-refresh hooks, checkpoint behavior, and fallback/debug logic.
+
+### Root Cause Notes
+- `projects/sa2va/configs/sa2va_opsd_combine_4b_referring.py` simply reused the older combine-model config with `train_mode="referring"`.
+- The current RefCOCO DLC path had already moved to `Sa2VAOPSDModelV3` plus manifest routes, `RouteGroupedSampler`, `OpsdRouteRefreshHook`, optimizer-save disabling, and the newer teacher pipeline.
+- This meant the short referring-caption path differed in much more than just “how captions are generated”.
+
+### Chosen Fix Direction
+- Stop building new short-referring training on top of the old combine model.
+- Add a dedicated referring-expression subclass on top of the current `Sa2VAOPSDModelV3`, and keep every non-generation training behavior aligned with the current DLC RefCOCO path.
+- Limit referring-specific behavior to:
+  - student/teacher caption prompt wording
+  - short-expression cleanup and canonicalization
+  - short-expression sufficiency and length preferences
+
+### Rejected Direction
+- Do not keep extending `sa2va_opsd_combine.py` for the new short-referring experiment. That would preserve the current drift in route/sampler/hook/checkpoint behavior and make future fixes diverge again.
+
+### Implemented Changes
+- Added `projects/sa2va/models/sa2va_opsd_referring_v3.py`:
+  - subclasses `Sa2VAOPSDModelV3`
+  - reuses the current DLC OPSD training skeleton
+  - overrides caption-generation-facing behavior only, so student and teacher captions are trained as short referring expressions instead of DLC-style detailed captions
+- Added `DEFAULT_MASK_TO_REFERRING_QUESTION` to `projects/sa2va/datasets/common.py`.
+- Added new RefCOCO 4B referring configs:
+  - `projects/sa2va/configs/sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3_referring.py`
+  - `projects/sa2va/configs/sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3_referring_online.py`
+- Added matching wrappers:
+  - `tools/train_refcoco_opsd_4b_referring.sh`
+  - `tools/export_refcoco_opsd_routes_4b_referring.sh`
+- The new referring configs inherit from the current DLC RefCOCO config, so route manifest handling, route refresh, sampler behavior, checkpoint policy, and fallback launcher compatibility stay aligned by default.
 
 ## 2026-07-09 Iter-100 Checkpoint Blow-Up In 4B OPSD Training
 
