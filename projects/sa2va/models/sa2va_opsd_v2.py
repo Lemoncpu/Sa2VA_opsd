@@ -1799,7 +1799,7 @@ class Sa2VAOPSDModelV2(BaseModel):
     def validate_teacher_problem_identification(self, result):
         if not self._teacher_field_is_effective(result.caption_problem, invalid_markers=("",)):
             return False, "problem_invalid:missing_caption_problem"
-        if len(result.caption_problem.split()) < 6:
+        if len(result.caption_problem.split()) < 4:
             return False, "problem_invalid:too_short"
         normalized_problem = result.caption_problem.lower()
         if not any(
@@ -1815,6 +1815,9 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "does not accurately describe",
                 "fails to capture",
                 "under-describes",
+                "still fits",
+                "drifts",
+                "pulled toward",
             )
         ):
             return False, "problem_invalid:generic_problem"
@@ -1833,17 +1836,43 @@ class Sa2VAOPSDModelV2(BaseModel):
                     "shared",
                     "target-only",
                     "distractor",
+                    "left",
+                    "right",
+                    "top",
+                    "bottom",
+                    "center",
+                    "middle",
+                    "region",
+                    "drift",
+                    "fit",
                 )
             )
         )
         if not semantic_anchor_ok:
-            return False, "problem_invalid:lacks_fine_grained_anchor"
+            weak_anchor_ok = any(
+                token in normalized_problem
+                for token in (
+                    "left",
+                    "right",
+                    "top",
+                    "bottom",
+                    "center",
+                    "middle",
+                    "target-only",
+                    "distractor-only",
+                    "missing",
+                    "still fits",
+                    "drifts",
+                )
+            )
+            if not weak_anchor_ok:
+                return False, "problem_invalid:lacks_fine_grained_anchor"
         return True, ""
 
     def validate_teacher_correction_direction(self, result):
         if not self._teacher_field_is_effective(result.correction_direction, invalid_markers=("",)):
             return False, "direction_invalid:missing_direction"
-        if len(result.correction_direction.split()) < 8:
+        if len(result.correction_direction.split()) < 5:
             return False, "direction_invalid:too_short"
         normalized_direction = result.correction_direction.lower()
         has_add_action = any(
@@ -1872,7 +1901,12 @@ class Sa2VAOPSDModelV2(BaseModel):
         )
         if not has_add_action:
             return False, "direction_invalid:missing_add_action"
-        if self._teacher_field_is_effective(result.distractor_only_evidence) and not has_avoid_action:
+        distractor_strength = self._caption_token_count(result.distractor_only_evidence or "")
+        if (
+            self._teacher_field_is_effective(result.distractor_only_evidence)
+            and distractor_strength >= 8
+            and not has_avoid_action
+        ):
             return False, "direction_invalid:missing_avoid_action"
         if (
             self._teacher_text_overlap_ratio(result.correction_direction, result.target_summary) >= 0.75
@@ -1892,7 +1926,7 @@ class Sa2VAOPSDModelV2(BaseModel):
     def validate_teacher_reason_explanation(self, result):
         if not self._teacher_field_is_effective(result.reason, invalid_markers=("",)):
             return False, "reason_invalid:missing_reason"
-        if len(result.reason.split()) < 8:
+        if len(result.reason.split()) < 5:
             return False, "reason_invalid:too_short"
         if self._teacher_reason_is_coarse(result.reason):
             return False, "reason_invalid:too_coarse"
@@ -1906,12 +1940,22 @@ class Sa2VAOPSDModelV2(BaseModel):
             token in normalized_reason
             for token in ("target-only", "shared", "overlap", "missing", "under-describes")
         ) and not self._difference_text_has_semantic_anchor(result.reason):
-            return False, "reason_invalid:missing_target_difference_anchor"
+            weak_target_anchor_ok = any(
+                token in normalized_reason
+                for token in ("left", "right", "top", "bottom", "center", "middle", "target", "region")
+            )
+            if not weak_target_anchor_ok:
+                return False, "reason_invalid:missing_target_difference_anchor"
         if self._teacher_field_is_effective(result.distractor_only_evidence) and not any(
             token in normalized_reason
             for token in ("distractor", "extra region", "still fits", "still matches", "drifts toward")
         ):
-            return False, "reason_invalid:missing_distractor_difference_anchor"
+            weak_distractor_anchor_ok = any(
+                token in normalized_reason
+                for token in ("left", "right", "top", "bottom", "center", "middle", "other region")
+            )
+            if not weak_distractor_anchor_ok:
+                return False, "reason_invalid:missing_distractor_difference_anchor"
         return True, ""
 
     def _parse_teacher_light_diagnosis(self, raw_prediction, base_result=None):
@@ -2046,6 +2090,27 @@ class Sa2VAOPSDModelV2(BaseModel):
         if result.confidence not in {"high", "medium", "low"}:
             result.confidence = "medium"
         result.reason_is_coarse = self._teacher_reason_is_coarse(result.reason)
+        if not self._teacher_field_is_effective(result.caption_problem, invalid_markers=("",)) and self._teacher_field_is_effective(
+            result.likely_drift_reason,
+            invalid_markers=("",),
+        ):
+            result.caption_problem = self._normalize_teacher_field_text(result.likely_drift_reason)
+        if not self._teacher_field_is_effective(result.correction_direction, invalid_markers=("",)):
+            if self._teacher_field_is_effective(result.target_only_evidence) and self._teacher_field_is_effective(
+                result.distractor_only_evidence
+            ):
+                result.correction_direction = (
+                    "Add the target-only cue and avoid wording that still fits the distractor-side cue."
+                )
+            elif self._teacher_field_is_effective(result.target_only_evidence):
+                result.correction_direction = "Add the missing target-only cue more explicitly."
+            elif self._teacher_field_is_effective(result.distractor_only_evidence):
+                result.correction_direction = "Avoid wording that still fits the distractor-side cue."
+        if not self._teacher_field_is_effective(result.reason, invalid_markers=("",)) and self._teacher_field_is_effective(
+            result.likely_drift_reason,
+            invalid_markers=("",),
+        ):
+            result.reason = self._normalize_teacher_field_text(result.likely_drift_reason)
         result.problem_valid, result.problem_failure_reason = self.validate_teacher_problem_identification(result)
         result.direction_valid, result.direction_failure_reason = self.validate_teacher_correction_direction(result)
         result.reason_valid, result.reason_failure_reason = self.validate_teacher_reason_explanation(result)
@@ -2053,7 +2118,17 @@ class Sa2VAOPSDModelV2(BaseModel):
 
     def validate_teacher_structured_diagnosis(self, result):
         if not result.difference_context_nontrivial:
-            return False, "structured_diagnosis_invalid:trivial_difference_context"
+            has_minimal_signal = any(
+                self._teacher_field_is_effective(value, invalid_markers=("",))
+                for value in (
+                    result.caption_problem,
+                    result.correction_direction,
+                    result.reason,
+                    result.likely_drift_reason,
+                )
+            )
+            if not has_minimal_signal:
+                return False, "structured_diagnosis_invalid:trivial_difference_context"
         if not result.problem_valid:
             return False, result.problem_failure_reason or "structured_diagnosis_invalid:problem"
         if not result.direction_valid:
@@ -2072,6 +2147,19 @@ class Sa2VAOPSDModelV2(BaseModel):
         result.reason_valid = True
         result.diagnosis_valid = True
         return True, ""
+
+    def _teacher_has_minimal_diagnosis_signal(self, result):
+        return any(
+            self._teacher_field_is_effective(value, invalid_markers=("",))
+            for value in (
+                result.caption_problem,
+                result.correction_direction,
+                result.reason,
+                result.likely_drift_reason,
+                result.target_only_evidence,
+                result.distractor_only_evidence,
+            )
+        )
 
     @staticmethod
     def _teacher_template_prefix_hit_count(text):
@@ -2145,13 +2233,25 @@ class Sa2VAOPSDModelV2(BaseModel):
             caption,
             candidate.get("distractor_only_evidence", ""),
         ):
-            score -= 0.8
+            score -= 0.4
         score -= 0.5 * float(self._teacher_template_prefix_hit_count(caption))
         if self._is_overly_generic_caption(caption):
             score -= 0.8
         score += self._teacher_candidate_length_score(caption)
         score += 2.0 * float(candidate.get("reconstruct_iou", 0.0) or 0.0)
         return float(score)
+
+    def _teacher_candidate_is_usable(self, candidate):
+        if candidate.get("status") != "ok":
+            return False
+        failure_reason = str(candidate.get("failure_reason", "") or "")
+        if failure_reason in {
+            "",
+            "teacher_dlc_invalid:missing_target_only_evidence",
+            "teacher_dlc_invalid:distractor_overlap",
+        }:
+            return True
+        return False
 
     def _materialize_teacher_caption_result(self, result, caption, source):
         caption = self._clean_teacher_dlc_caption_text(caption)
@@ -2709,6 +2809,8 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "correction_direction={correction_direction} "
                 "reason={reason} "
                 "single_stage_raw={single_stage_raw} "
+                "structured_diagnosis_raw={structured_diagnosis_raw} "
+                "repair_raw={repair_raw} "
                 "problem_raw={problem_raw} "
                 "direction_raw={direction_raw} "
                 "reason_raw={reason_raw} "
@@ -2716,6 +2818,10 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "teacher_direction_valid={teacher_direction_valid} "
                 "teacher_reason_valid={teacher_reason_valid} "
                 "teacher_reason_is_coarse={teacher_reason_is_coarse} "
+                "teacher_problem_failure_reason={teacher_problem_failure_reason} "
+                "teacher_direction_failure_reason={teacher_direction_failure_reason} "
+                "teacher_reason_failure_reason={teacher_reason_failure_reason} "
+                "teacher_diagnosis_failure_reason={teacher_diagnosis_failure_reason} "
                 "teacher_pipeline_mode={teacher_pipeline_mode} "
                 "teacher_diagnosis_retry_count={teacher_diagnosis_retry_count} "
                 "teacher_dlc_candidate_count={teacher_dlc_candidate_count} "
@@ -2752,6 +2858,8 @@ class Sa2VAOPSDModelV2(BaseModel):
                     correction_direction=repr(record.get("correction_direction", "")),
                     reason=repr(record.get("reason", "")),
                     single_stage_raw=repr(record.get("single_stage_raw", "")),
+                    structured_diagnosis_raw=repr(record.get("structured_diagnosis_raw", "")),
+                    repair_raw=repr(record.get("repair_raw", "")),
                     problem_raw=repr(record.get("problem_raw", "")),
                     direction_raw=repr(record.get("direction_raw", "")),
                     reason_raw=repr(record.get("reason_raw", "")),
@@ -2759,6 +2867,10 @@ class Sa2VAOPSDModelV2(BaseModel):
                     teacher_direction_valid=record.get("teacher_direction_valid"),
                     teacher_reason_valid=record.get("teacher_reason_valid"),
                     teacher_reason_is_coarse=record.get("teacher_reason_is_coarse"),
+                    teacher_problem_failure_reason=record.get("teacher_problem_failure_reason"),
+                    teacher_direction_failure_reason=record.get("teacher_direction_failure_reason"),
+                    teacher_reason_failure_reason=record.get("teacher_reason_failure_reason"),
+                    teacher_diagnosis_failure_reason=record.get("teacher_diagnosis_failure_reason"),
                     teacher_pipeline_mode=record.get("teacher_pipeline_mode"),
                     teacher_diagnosis_retry_count=record.get("teacher_diagnosis_retry_count"),
                     teacher_dlc_candidate_count=record.get("teacher_dlc_candidate_count"),
@@ -4983,7 +5095,10 @@ class Sa2VAOPSDModelV2(BaseModel):
 
         selected_candidate = None
         candidate_scores = []
-        if pipeline_result.diagnosis_valid:
+        can_try_candidates = bool(
+            pipeline_result.diagnosis_valid or self._teacher_has_minimal_diagnosis_signal(pipeline_result)
+        )
+        if can_try_candidates:
             candidate_specs = (
                 {"candidate_style_hint": "Use the strongest target-only cue as the main anchor.", "do_sample": False},
                 {
@@ -5032,7 +5147,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                     }
                 )
             pipeline_result.teacher_dlc_candidate_count = len(candidates)
-            valid_candidates = [candidate for candidate in candidates if candidate["status"] == "ok" and not candidate["failure_reason"]]
+            valid_candidates = [candidate for candidate in candidates if self._teacher_candidate_is_usable(candidate)]
             pipeline_result.teacher_dlc_valid_candidate_count = len(valid_candidates)
             ranked_candidates = sorted(
                 valid_candidates,
@@ -5041,11 +5156,13 @@ class Sa2VAOPSDModelV2(BaseModel):
             )
             if ranked_candidates:
                 selected_candidate = ranked_candidates[0]
-                pipeline_result.teacher_dlc_selected_by = "candidate_score"
+                pipeline_result.teacher_dlc_selected_by = (
+                    "candidate_score" if pipeline_result.diagnosis_valid else "candidate_score_degraded"
+                )
                 pipeline_result = self._apply_teacher_dlc_candidate(
                     pipeline_result,
                     selected_candidate,
-                    "structured_candidate",
+                    "structured_candidate" if pipeline_result.diagnosis_valid else "degraded_structured_candidate",
                 )
 
         pipeline_result.teacher_dlc_candidate_scores = tuple(candidate_scores)
@@ -5112,7 +5229,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             )
         )
 
-        if pipeline_result.diagnosis_valid and not pipeline_result.gate_passed:
+        if can_try_candidates and not pipeline_result.gate_passed:
             rejected_dlc_summary = "; ".join(
                 f"score={item['score']:.3f},iou={item['reconstruct_iou']:.3f},status={item['status']},failure={item['failure_reason']},caption={item['caption']!r}"
                 for item in candidate_scores[:3]
@@ -5497,6 +5614,8 @@ class Sa2VAOPSDModelV2(BaseModel):
             "teacher_correction_direction": "",
             "teacher_reason": "",
             "teacher_single_stage_raw": "",
+            "teacher_structured_diagnosis_raw": "",
+            "teacher_repair_raw": "",
             "teacher_problem_raw": "",
             "teacher_direction_raw": "",
             "teacher_reason_raw": "",
@@ -5504,6 +5623,10 @@ class Sa2VAOPSDModelV2(BaseModel):
             "teacher_direction_valid": False,
             "teacher_reason_valid": False,
             "teacher_reason_is_coarse": False,
+            "teacher_problem_failure_reason": "",
+            "teacher_direction_failure_reason": "",
+            "teacher_reason_failure_reason": "",
+            "teacher_diagnosis_failure_reason": "",
             "teacher_pipeline_stop_stage": "difference_context",
             "teacher_pipeline_failure_reason": "",
             "teacher_pipeline_mode": "single_stage",
@@ -5559,6 +5682,8 @@ class Sa2VAOPSDModelV2(BaseModel):
         result["teacher_correction_direction"] = teacher_regenerate.correction_direction
         result["teacher_reason"] = teacher_regenerate.reason
         result["teacher_single_stage_raw"] = teacher_regenerate.single_stage_raw
+        result["teacher_structured_diagnosis_raw"] = teacher_regenerate.structured_diagnosis_raw
+        result["teacher_repair_raw"] = teacher_regenerate.repair_raw
         result["teacher_problem_raw"] = teacher_regenerate.problem_raw
         result["teacher_direction_raw"] = teacher_regenerate.direction_raw
         result["teacher_reason_raw"] = teacher_regenerate.reason_raw
@@ -5566,6 +5691,10 @@ class Sa2VAOPSDModelV2(BaseModel):
         result["teacher_direction_valid"] = bool(teacher_regenerate.direction_valid)
         result["teacher_reason_valid"] = bool(teacher_regenerate.reason_valid)
         result["teacher_reason_is_coarse"] = bool(teacher_regenerate.reason_is_coarse)
+        result["teacher_problem_failure_reason"] = str(teacher_regenerate.problem_failure_reason)
+        result["teacher_direction_failure_reason"] = str(teacher_regenerate.direction_failure_reason)
+        result["teacher_reason_failure_reason"] = str(teacher_regenerate.reason_failure_reason)
+        result["teacher_diagnosis_failure_reason"] = str(teacher_regenerate.diagnosis_failure_reason)
         result["teacher_pipeline_stop_stage"] = teacher_regenerate.stop_stage
         result["teacher_pipeline_mode"] = str(teacher_regenerate.teacher_pipeline_mode)
         result["teacher_diagnosis_retry_count"] = int(teacher_regenerate.teacher_diagnosis_retry_count)
@@ -6718,6 +6847,8 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "correction_direction": teacher_correction_direction,
                 "reason": teacher_reason,
                 "single_stage_raw": teacher_single_stage_raw,
+                "structured_diagnosis_raw": str(teacher_analysis.get("teacher_structured_diagnosis_raw", "")),
+                "repair_raw": str(teacher_analysis.get("teacher_repair_raw", "")),
                 "problem_raw": teacher_problem_raw,
                 "direction_raw": teacher_direction_raw,
                 "reason_raw": teacher_reason_raw,
@@ -6725,6 +6856,10 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "teacher_direction_valid": teacher_direction_valid,
                 "teacher_reason_valid": teacher_reason_valid,
                 "teacher_reason_is_coarse": teacher_reason_is_coarse,
+                "teacher_problem_failure_reason": str(teacher_analysis.get("teacher_problem_failure_reason", "")),
+                "teacher_direction_failure_reason": str(teacher_analysis.get("teacher_direction_failure_reason", "")),
+                "teacher_reason_failure_reason": str(teacher_analysis.get("teacher_reason_failure_reason", "")),
+                "teacher_diagnosis_failure_reason": str(teacher_analysis.get("teacher_diagnosis_failure_reason", "")),
                 "teacher_pipeline_mode": teacher_pipeline_mode,
                 "teacher_diagnosis_retry_count": teacher_diagnosis_retry_count,
                 "teacher_dlc_candidate_count": teacher_dlc_candidate_count,

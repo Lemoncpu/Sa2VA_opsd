@@ -253,6 +253,20 @@
   - Kept the old single-stage path as a final fallback and recorded fallback usage explicitly.
   - Exposed new debug/log fields for pipeline mode, diagnosis retry count, candidate counts, candidate scores, selected caption source, verification usage, and fallback usage/reason.
 
+### Follow-up Correction
+- Early training logs showed that the new structured teacher pipeline was wiring correctly but almost always fell back to the old single-stage path.
+- Root causes:
+  - structured diagnosis validators were too strict for real model outputs, especially on weak spatial differences
+  - candidate generation still required full diagnosis success, so `teacher_dlc_candidate_count` often stayed at `0`
+  - logs did not expose the raw structured diagnosis or repair outputs, making it hard to tell whether failures came from prompt non-compliance or from over-strict local validation
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py` again to:
+  - relax problem/direction/reason validators for weak-but-usable spatial evidence
+  - stop hard-failing trivial `difference_context` cases when minimal diagnosis signal exists
+  - backfill missing diagnosis fields from `likely_drift_reason` and simple local heuristics
+  - allow degraded candidate generation whenever minimal diagnosis signal exists, instead of requiring full diagnosis validity
+  - treat some imperfect DLC candidates as usable so reranking can start earlier
+  - log `structured_diagnosis_raw`, `repair_raw`, and per-field diagnosis failure reasons so the next training run can reveal whether the structured stage is actually being followed
+
 ## 2026-07-08 RefCOCO OPSD Training Fallback For Host Route-Export Environment
 
 ### Problem
