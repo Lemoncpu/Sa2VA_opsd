@@ -258,6 +258,50 @@
 - Root causes:
   - structured diagnosis validators were too strict for real model outputs, especially on weak spatial differences
   - candidate generation still required full diagnosis success, so `teacher_dlc_candidate_count` often stayed at `0`
+
+## 2026-07-09 Regenerate Candidate Selection Tightening
+
+### Problem
+- After the structured teacher pipeline was enabled, `teacher_regenerate` started entering CE again, but most accepted captions only improved reconstruction IoU by a tiny margin.
+- Training logs showed `teacher_diagnosis_valid_rate` remained near `0`, while selected teacher captions often still had `distractor_overlap` or weak `target_only` evidence.
+
+### Root Cause Notes
+- `run_teacher_regenerate_pipeline()` still treated `diagnosis_valid` as the main indicator of whether structured candidate selection was on the strong path, so weak-but-usable diagnosis outputs were effectively grouped with degraded fallback behavior.
+- `_score_teacher_dlc_candidate()` weighted absolute reconstruction IoU too heavily relative to target-only evidence retention and distractor leakage, so captions with tiny IoU gains but weak discrimination could still win reranking.
+
+### Chosen Fix Direction
+- Decouple candidate generation from strict `diagnosis_valid` by adding an actionable weak-signal check that accepts partial diagnosis plus concrete difference anchors.
+- Strengthen reranking to prefer captions that preserve target-only cues, avoid distractor-only leakage, and actually improve over the student reconstruction instead of merely matching a high absolute IoU.
+
+### Rejected Direction
+- Do not relax the final teacher IoU gate in this patch. The goal here is to improve candidate quality before the existing gate, not to make acceptance easier by lowering thresholds again.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py`:
+  - Added `_teacher_has_actionable_diagnosis_signal()` so partial diagnosis outputs with concrete target/distractor anchors can stay on the structured candidate path.
+  - Passed `student_iou` into candidate records and changed candidate scoring to reward positive IoU gain over the student.
+  - Increased rerank reward for target-only evidence retention and increased penalties for `missing_target_only_evidence` and `distractor_overlap`.
+  - Reduced the chance that weak-but-usable structured outputs are treated like pure degraded fallback during candidate selection and source tagging.
+
+## 2026-07-09 Teacher Regenerate High-IoU CE Threshold Tightening
+
+### Problem
+- The earlier regenerate gate change treated any sample with `student_iou >= iou_low_threshold` as a high-IoU case, so on RefCOCO many regenerate samples with IoU just above `0.5` could enter CE with only a tiny positive teacher gain.
+- This made the regenerate window look overly permissive, with many accepted CE samples despite very small average IoU improvement.
+
+### Root Cause Notes
+- `_teacher_regenerate_gate_passed()` used `iou_low_threshold` as the boundary for the relaxed “any positive gain passes” rule.
+- In the active 4B RefCOCO config, `iou_low_threshold=0.5` and `iou_high_threshold=0.85`, so the relaxed path started much earlier than intended.
+
+### Chosen Fix Direction
+- Use `iou_high_threshold` as the boundary for the relaxed high-IoU regenerate rule.
+- Keep the stricter low/mid-IoU regenerate gate unchanged for all samples below `0.85`.
+
+### Rejected Direction
+- Do not change the route manifest thresholds in this patch. The user asked specifically to raise the high-IoU regenerate CE threshold, not to redesign route assignment.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py` so `_teacher_regenerate_gate_passed()` now applies the “`iou_gain > 0` is enough” rule only when `student_iou >= iou_high_threshold`.
   - logs did not expose the raw structured diagnosis or repair outputs, making it hard to tell whether failures came from prompt non-compliance or from over-strict local validation
 - Updated `projects/sa2va/models/sa2va_opsd_v2.py` again to:
   - relax problem/direction/reason validators for weak-but-usable spatial evidence

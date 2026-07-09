@@ -1347,7 +1347,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         student_iou = float(student_iou)
         teacher_iou = float(teacher_iou)
         iou_gain = teacher_iou - student_iou
-        if student_iou >= float(self.iou_low_threshold):
+        if student_iou >= float(self.iou_high_threshold):
             return iou_gain > 0.0
         return iou_gain > 0.5 or (teacher_iou >= 0.6 and iou_gain >= 0.1)
 
@@ -2168,6 +2168,31 @@ class Sa2VAOPSDModelV2(BaseModel):
             )
         )
 
+    def _teacher_has_actionable_diagnosis_signal(self, result):
+        if result.diagnosis_valid:
+            return True
+        if not self._teacher_has_minimal_diagnosis_signal(result):
+            return False
+        has_difference_anchor = any(
+            self._teacher_field_is_effective(value, invalid_markers=("",))
+            for value in (
+                result.target_only_evidence,
+                result.distractor_only_evidence,
+                result.target_anchor,
+                result.distractor_anchor,
+            )
+        )
+        has_rewrite_intent = any(
+            self._teacher_field_is_effective(value, invalid_markers=("",))
+            for value in (
+                result.caption_problem,
+                result.correction_direction,
+                result.reason,
+                result.likely_drift_reason,
+            )
+        )
+        return bool(has_difference_anchor and has_rewrite_intent)
+
     @staticmethod
     def _teacher_template_prefix_hit_count(text):
         normalized = re.sub(r"\s+", " ", (text or "").strip().lower())
@@ -2221,31 +2246,42 @@ class Sa2VAOPSDModelV2(BaseModel):
         caption = candidate.get("caption", "")
         status = candidate.get("status", "empty")
         failure_reason = candidate.get("failure_reason", "")
+        reconstruct_iou = float(candidate.get("reconstruct_iou", 0.0) or 0.0)
+        student_iou = float(candidate.get("student_iou", 0.0) or 0.0)
+        iou_gain = reconstruct_iou - student_iou
         score = 0.0
         if status == "ok" and not failure_reason:
-            score += 2.0
+            score += 2.5
         elif status == "ok":
             score += 0.5
         else:
             score -= 1.0
+        if failure_reason == "teacher_dlc_invalid:missing_target_only_evidence":
+            score -= 1.0
+        elif failure_reason == "teacher_dlc_invalid:distractor_overlap":
+            score -= 1.4
         if self._teacher_field_is_effective(candidate.get("target_only_evidence", "")):
             if (
                 self._contains_any_phrase(caption, candidate.get("target_only_evidence", ""))
                 or self._difference_text_has_semantic_anchor(caption)
             ):
-                score += 0.8
+                score += 1.6
             else:
-                score -= 0.6
+                score -= 1.5
         if self._teacher_field_is_effective(candidate.get("distractor_only_evidence", "")) and self._contains_any_phrase(
             caption,
             candidate.get("distractor_only_evidence", ""),
         ):
-            score -= 0.4
+            score -= 1.2
         score -= 0.5 * float(self._teacher_template_prefix_hit_count(caption))
         if self._is_overly_generic_caption(caption):
             score -= 0.8
         score += self._teacher_candidate_length_score(caption)
-        score += 2.0 * float(candidate.get("reconstruct_iou", 0.0) or 0.0)
+        score += 1.2 * reconstruct_iou
+        if iou_gain > 0.0:
+            score += 8.0 * iou_gain
+        else:
+            score += 4.0 * iou_gain
         return float(score)
 
     def _teacher_candidate_is_usable(self, candidate):
@@ -4351,6 +4387,7 @@ class Sa2VAOPSDModelV2(BaseModel):
             "completion_ids": candidate_result.detailed_completion_ids,
             "reconstruct_status": None if reconstruct is None else reconstruct.status,
             "reconstruct_iou": float(reconstruct_iou),
+            "student_iou": float(iou),
             "target_only_evidence": pipeline_result.target_only_evidence,
             "distractor_only_evidence": pipeline_result.distractor_only_evidence,
             "style_hint": candidate_style_hint,
@@ -5102,9 +5139,8 @@ class Sa2VAOPSDModelV2(BaseModel):
 
         selected_candidate = None
         candidate_scores = []
-        can_try_candidates = bool(
-            pipeline_result.diagnosis_valid or self._teacher_has_minimal_diagnosis_signal(pipeline_result)
-        )
+        candidate_signal_is_actionable = self._teacher_has_actionable_diagnosis_signal(pipeline_result)
+        can_try_candidates = bool(candidate_signal_is_actionable or self._teacher_has_minimal_diagnosis_signal(pipeline_result))
         if can_try_candidates:
             candidate_specs = (
                 {"candidate_style_hint": "Use the strongest target-only cue as the main anchor.", "do_sample": False},
@@ -5164,12 +5200,12 @@ class Sa2VAOPSDModelV2(BaseModel):
             if ranked_candidates:
                 selected_candidate = ranked_candidates[0]
                 pipeline_result.teacher_dlc_selected_by = (
-                    "candidate_score" if pipeline_result.diagnosis_valid else "candidate_score_degraded"
+                    "candidate_score" if candidate_signal_is_actionable else "candidate_score_degraded"
                 )
                 pipeline_result = self._apply_teacher_dlc_candidate(
                     pipeline_result,
                     selected_candidate,
-                    "structured_candidate" if pipeline_result.diagnosis_valid else "degraded_structured_candidate",
+                    "structured_candidate" if candidate_signal_is_actionable else "degraded_structured_candidate",
                 )
 
         pipeline_result.teacher_dlc_candidate_scores = tuple(candidate_scores)
