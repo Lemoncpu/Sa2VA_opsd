@@ -219,6 +219,40 @@
 - Updated `tools/traindlc.sh` so the remote training command now exports:
   - `SA2VA_REFCOCO_OPSD_CONFIG`
 
+## 2026-07-09 Structured Teacher Regenerate Pipeline Stabilization
+
+### Problem
+- The RefCOCO teacher regenerate path still relied on a single privileged generation pass after programmatic `difference_context`, even though multiple stage-specific helpers already existed in code.
+- In practice this made teacher supervision brittle: diagnosis text, DLC text, and verifier text could all fail together in one shot, and logs did not reveal whether the failure came from diagnosis quality, candidate caption quality, template leakage, or gate rejection.
+
+### Root Cause Notes
+- `run_teacher_regenerate_pipeline()` in `projects/sa2va/models/sa2va_opsd_v2.py` directly used `generate_teacher_regenerate_single_stage()` as the active path.
+- Existing helper functions for diagnosis, DLC, and verification were not wired into the live pipeline, so there was no structured retry, no candidate reranking, and no explicit fallback accounting.
+- Teacher caption cleanup existed, but the active teacher DLC path still allowed template-style openings and did not score multiple caption candidates before reconstruction gating.
+
+### Chosen Fix Direction
+- Keep `difference_context` programmatic, then switch the active path to a stability-first structured pipeline:
+  - structured diagnosis with fixed labeled fields and one local retry
+  - three DLC candidates with local validation plus reranking
+  - verification caption as an explicit post-filter
+  - single repair attempt
+  - fallback to the old single-stage generator if the structured path still fails
+- Preserve the existing IoU gate and training interfaces, while exposing richer pipeline diagnostics to logs.
+
+### Rejected Direction
+- Do not enable the old free-text multi-stage chain directly. That would increase stage-to-stage breakage without adding local validation or controlled fallback behavior.
+- Do not relax route or gate strictness in the same patch. The goal of this change is pipeline stability and observability, not easier acceptance.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py`:
+  - Added structured diagnosis parsing/validation fields (`CONFIDENCE`, `TARGET_ANCHOR`, `DISTRACTOR_ANCHOR`) and local retry handling.
+  - Added internal teacher-DLC cleanup that strips template-style openings before supervision is materialized.
+  - Added three-candidate DLC generation with local scoring based on validity, target-only evidence retention, distractor leakage, template leakage, caption length, and reconstruction IoU.
+  - Added verification-caption evaluation as an explicit post-filter and allowed it to replace the DLC when it reconstructs better.
+  - Added one diagnosis-conditioned repair caption attempt before falling back to the old single-stage path.
+  - Kept the old single-stage path as a final fallback and recorded fallback usage explicitly.
+  - Exposed new debug/log fields for pipeline mode, diagnosis retry count, candidate counts, candidate scores, selected caption source, verification usage, and fallback usage/reason.
+
 ## 2026-07-08 RefCOCO OPSD Training Fallback For Host Route-Export Environment
 
 ### Problem
