@@ -840,7 +840,13 @@ class Sa2VAOPSDModelV2(BaseModel):
         return torch.tensor(float(value), device=self.device, dtype=dtype)
 
     def state_dict(self, *args, **kwargs):
-        return super().state_dict(*args, **kwargs)
+        full_state = super().state_dict(*args, **kwargs)
+        student_only_state = {
+            k: v
+            for k, v in full_state.items()
+            if k.startswith("student_model.")
+        }
+        return student_only_state
 
     def load_state_dict(self, state_dict, strict=True):
         has_teacher_state = any(k.startswith("teacher_model.") for k in state_dict)
@@ -1337,11 +1343,12 @@ class Sa2VAOPSDModelV2(BaseModel):
     def _teacher_regenerate_iou_improvement(student_iou, teacher_iou):
         return float(teacher_iou) - float(student_iou)
 
-    @staticmethod
-    def _teacher_regenerate_gate_passed(student_iou, teacher_iou):
+    def _teacher_regenerate_gate_passed(self, student_iou, teacher_iou):
         student_iou = float(student_iou)
         teacher_iou = float(teacher_iou)
         iou_gain = teacher_iou - student_iou
+        if student_iou >= float(self.iou_low_threshold):
+            return iou_gain > 0.0
         return iou_gain > 0.5 or (teacher_iou >= 0.6 and iou_gain >= 0.1)
 
     @staticmethod

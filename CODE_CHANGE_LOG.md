@@ -267,6 +267,32 @@
   - treat some imperfect DLC candidates as usable so reranking can start earlier
   - log `structured_diagnosis_raw`, `repair_raw`, and per-field diagnosis failure reasons so the next training run can reveal whether the structured stage is actually being followed
 
+## 2026-07-09 Iter-100 Checkpoint Blow-Up In 4B OPSD Training
+
+### Problem
+- The 4B RefCOCO OPSD training job repeatedly stopped around `iter=100`, right after route export and during checkpoint saving.
+
+### Root Cause Notes
+- The active model object keeps three large model replicas in memory: `student_model`, `old_policy_model`, and `teacher_model`.
+- `projects/sa2va/models/sa2va_opsd_v2.py` used the default `state_dict()` behavior, so checkpoints serialized all of those model replicas together.
+- The active 4B training config also kept `save_optimizer=True`, so the iter-100 checkpoint additionally serialized optimizer state.
+- Route export and route snapshot both finished successfully in logs before the stop point, so the checkpoint payload size was the dominant suspect rather than the route-refresh hook itself.
+
+### Chosen Fix Direction
+- Save only the main trainable student weights in checkpoint model state.
+- Disable optimizer-state saving in the active 4B RefCOCO OPSD config to keep iter-100 checkpoints lightweight.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py` so `state_dict()` now returns only `student_model.*` weights.
+- Updated `projects/sa2va/configs/sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3.py` so the checkpoint hook uses `save_optimizer=False`.
+
+### Follow-up Correction
+- Regenerate supervision still rejected many route-manifest `teacher_regenerate` samples whose current IoU was already above the low-IoU threshold.
+- Those samples are no longer true low-IoU failures, so requiring the original strict regenerate gate blocked useful positive-improvement CE targets.
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py` so regenerate gate behavior now depends on the current student IoU:
+  - if `student_iou >= iou_low_threshold`, any positive teacher IoU improvement is enough to enter CE
+  - if `student_iou < iou_low_threshold`, keep the original stricter gate for true low-IoU failures
+
 ## 2026-07-08 RefCOCO OPSD Training Fallback For Host Route-Export Environment
 
 ### Problem
