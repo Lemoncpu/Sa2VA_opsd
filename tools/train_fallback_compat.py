@@ -3,6 +3,7 @@ import importlib.machinery
 import logging
 import os
 import os.path as osp
+import runpy
 import sys
 import types
 from copy import deepcopy
@@ -234,6 +235,7 @@ def install_xtuner_fallback_modules() -> None:
 
 def load_fallback_config(config_path: str, args):
     from mmengine.config import Config
+    from mmengine.config.utils import ConfigParsingError
 
     if not osp.isfile(config_path):
         raise FileNotFoundError(
@@ -243,7 +245,17 @@ def load_fallback_config(config_path: str, args):
     patch_mmengine_adafactor_duplicate_registration()
     install_xtuner_fallback_modules()
 
-    cfg = Config.fromfile(config_path)
+    try:
+        cfg = Config.fromfile(config_path)
+    except ConfigParsingError as exc:
+        if not _should_retry_with_python_exec(config_path, exc):
+            raise
+        logging.getLogger("sa2va.train").info(
+            "Config.fromfile() rejected config syntax for fallback chain; retrying via python exec loader. config=%s error=%s",
+            config_path,
+            exc,
+        )
+        cfg = _load_config_via_python_exec(Config, config_path)
     cfg.launcher = args.launcher
 
     if args.cfg_options is not None:
@@ -260,6 +272,26 @@ def load_fallback_config(config_path: str, args):
 
     normalize_train_cfg_for_fallback(cfg)
     return cfg
+
+
+def _should_retry_with_python_exec(config_path: str, exc: Exception) -> bool:
+    basename = osp.basename(str(config_path))
+    if basename != "sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3_referring.py":
+        return False
+    message = str(exc)
+    return "from xxx import *" in message and "if base:" in message
+
+
+def _load_config_via_python_exec(config_cls, config_path: str):
+    raw_namespace = runpy.run_path(config_path, run_name="__sa2va_fallback_config__")
+    cfg_dict = {}
+    for key, value in raw_namespace.items():
+        if key.startswith("__"):
+            continue
+        if isinstance(value, types.ModuleType):
+            continue
+        cfg_dict[key] = value
+    return config_cls(cfg_dict, filename=config_path)
 
 
 def normalize_train_cfg_for_fallback(cfg) -> None:

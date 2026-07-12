@@ -219,6 +219,33 @@
 - Updated `tools/traindlc.sh` so the remote training command now exports:
   - `SA2VA_REFCOCO_OPSD_CONFIG`
 
+## 2026-07-12 Referring Config Fallback Loader Rejected Import Star
+
+### Problem
+- RefCOCO referring-caption training could not start in the host environment that relies on the local `xtuner` fallback launcher.
+- The run failed before model construction with:
+  - `mmengine.config.utils.ConfigParsingError: Illegal syntax in config! from xxx import * is not allowed to appear outside the if base: statement`
+
+### Root Cause Notes
+- `tools/train_fallback_compat.py` loaded configs through `mmengine.Config.fromfile()`.
+- The referring config `projects/sa2va/configs/sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3_referring.py` is intentionally written as a thin Python overlay on top of the base 4B config and uses a top-level `from ... import *`.
+- That syntax is valid for normal Python execution, but MMEngine's lazy config parser rejects it outside `_base_` / `if base:` patterns.
+- The main 4B config path still worked, so this only surfaced after switching the launcher to the referring config under the no-`xtuner` fallback environment.
+
+### Chosen Fix Direction
+- Keep the current referring config structure unchanged.
+- Extend the fallback launcher so it first tries `Config.fromfile()` and, only for the current referring chain plus this specific parsing failure, retries with a Python `exec` style loader.
+- Reuse the already-installed minimal `xtuner` compatibility modules before the retry so the imported base config still resolves its `xtuner.*` symbols.
+
+### Rejected Direction
+- Do not rewrite the referring config into a separate duplicated config file just to satisfy MMEngine parsing rules. That would create drift against the main 4B RefCOCO OPSD config and make future alignment harder.
+
+### Implemented Changes
+- Updated `tools/train_fallback_compat.py`:
+  - Catch `ConfigParsingError` from `Config.fromfile()`.
+  - Detect the current referring config plus the specific `import *` parser rejection.
+  - Retry loading through `runpy.run_path(...)`, filter out module objects / dunder names, and build an MMEngine `Config` from the executed namespace.
+
 ## 2026-07-09 Structured Teacher Regenerate Pipeline Stabilization
 
 ### Problem
