@@ -246,6 +246,12 @@
   - Detect the current referring config plus the specific `import *` parser rejection.
   - Retry loading through `runpy.run_path(...)`, filter out module objects / dunder names, and build an MMEngine `Config` from the executed namespace.
 
+### Follow-up Correction
+- After adding the Python `exec` loader, referring training progressed further but still failed in MMEngine startup logging.
+- `Runner._log_env()` calls `cfg.pretty_text`, and MMEngine tries to reformat the executed config namespace back into Python text.
+- The fallback-loaded namespace contains live class/function objects such as `AdamW`, hook classes, and collate functions, which are valid at runtime but not valid Python assignment literals for YAPF reformatting.
+- Updated `tools/train_fallback_compat.py` again so the local fallback path patches `Config.pretty_text` to return a stored fallback text when syntax formatting fails, instead of aborting before runner construction.
+
 ## 2026-07-09 Structured Teacher Regenerate Pipeline Stabilization
 
 ### Problem

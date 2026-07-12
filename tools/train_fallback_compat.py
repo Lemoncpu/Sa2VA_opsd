@@ -74,6 +74,30 @@ def patch_mmengine_adafactor_duplicate_registration() -> None:
     Registry._sa2va_adafactor_duplicate_patch = True
 
 
+def patch_mmengine_config_pretty_text_for_fallback() -> None:
+    try:
+        from mmengine.config import Config
+    except Exception:
+        return
+
+    if getattr(Config, "_sa2va_pretty_text_fallback_patch", False):
+        return
+
+    original_getter = Config.pretty_text.fget
+
+    def patched_pretty_text(self):
+        try:
+            return original_getter(self)
+        except SyntaxError:
+            fallback_text = getattr(self, "_sa2va_fallback_pretty_text", None)
+            if fallback_text:
+                return fallback_text
+            raise
+
+    Config.pretty_text = property(patched_pretty_text)
+    Config._sa2va_pretty_text_fallback_patch = True
+
+
 def _torch_load_compat(path: str):
     try:
         return torch.load(path, map_location="cpu", weights_only=False)
@@ -243,6 +267,7 @@ def load_fallback_config(config_path: str, args):
         )
 
     patch_mmengine_adafactor_duplicate_registration()
+    patch_mmengine_config_pretty_text_for_fallback()
     install_xtuner_fallback_modules()
 
     try:
@@ -291,7 +316,12 @@ def _load_config_via_python_exec(config_cls, config_path: str):
         if isinstance(value, types.ModuleType):
             continue
         cfg_dict[key] = value
-    return config_cls(cfg_dict, filename=config_path)
+    cfg = config_cls(cfg_dict, filename=config_path)
+    try:
+        cfg._sa2va_fallback_pretty_text = osp.abspath(config_path) + "\n# loaded via sa2va fallback python exec\n"
+    except Exception:
+        pass
+    return cfg
 
 
 def normalize_train_cfg_for_fallback(cfg) -> None:
