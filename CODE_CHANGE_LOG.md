@@ -252,6 +252,17 @@
 - The fallback-loaded namespace contains live class/function objects such as `AdamW`, hook classes, and collate functions, which are valid at runtime but not valid Python assignment literals for YAPF reformatting.
 - Updated `tools/train_fallback_compat.py` again so the local fallback path patches `Config.pretty_text` to return a stored fallback text when syntax formatting fails, instead of aborting before runner construction.
 
+### Second Follow-up Correction
+- The online short-referring training config still failed in the no-`xtuner` host environment even after the referring fallback patch.
+- Root cause:
+  - `projects/sa2va/configs/sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3_referring_online.py` uses `read_base()` plus `from ... import *` over the referring config.
+  - The earlier fallback retry only special-cased the plain referring config basename, so the online variant still went through MMEngine lazy parsing and failed with the same `import *` restriction.
+  - Using generic `runpy.run_path()` on the online config would also be brittle because of its relative-import-within-`read_base()` structure.
+- Updated `tools/train_fallback_compat.py` again so the fallback path:
+  - also recognizes the referring-online config as retryable,
+  - loads the plain referring config through the existing Python-exec fallback,
+  - then applies the online overrides (`route_mode=online`, no manifest route requirement, `DefaultSampler`, and `EMATeacherHook`-only custom hooks) synthetically in Python before runner construction.
+
 ## 2026-07-09 Structured Teacher Regenerate Pipeline Stabilization
 
 ### Problem

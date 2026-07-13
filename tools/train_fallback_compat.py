@@ -14,6 +14,8 @@ import torch
 
 TARGET_FALLBACK_CHAIN = "refcoco_opsd_4b"
 TARGET_CONFIG_BASENAME = "sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3.py"
+REFERRING_CONFIG_BASENAME = "sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3_referring.py"
+REFERRING_ONLINE_CONFIG_BASENAME = "sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3_referring_online.py"
 
 
 def is_supported_fallback_target(config_path: str) -> bool:
@@ -301,13 +303,22 @@ def load_fallback_config(config_path: str, args):
 
 def _should_retry_with_python_exec(config_path: str, exc: Exception) -> bool:
     basename = osp.basename(str(config_path))
-    if basename != "sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3_referring.py":
+    if basename not in {REFERRING_CONFIG_BASENAME, REFERRING_ONLINE_CONFIG_BASENAME}:
         return False
     message = str(exc)
     return "from xxx import *" in message and "if base:" in message
 
 
 def _load_config_via_python_exec(config_cls, config_path: str):
+    basename = osp.basename(str(config_path))
+    if basename == REFERRING_ONLINE_CONFIG_BASENAME:
+        cfg = _load_referring_online_config_via_python_exec(config_cls, config_path)
+        try:
+            cfg._sa2va_fallback_pretty_text = osp.abspath(config_path) + "\n# loaded via sa2va fallback synthetic online config\n"
+        except Exception:
+            pass
+        return cfg
+
     raw_namespace = runpy.run_path(config_path, run_name="__sa2va_fallback_config__")
     cfg_dict = {}
     for key, value in raw_namespace.items():
@@ -321,6 +332,42 @@ def _load_config_via_python_exec(config_cls, config_path: str):
         cfg._sa2va_fallback_pretty_text = osp.abspath(config_path) + "\n# loaded via sa2va fallback python exec\n"
     except Exception:
         pass
+    return cfg
+
+
+def _load_referring_online_config_via_python_exec(config_cls, config_path: str):
+    config_dir = osp.dirname(config_path)
+    base_path = osp.join(config_dir, REFERRING_CONFIG_BASENAME)
+    base_cfg = _load_config_via_python_exec(config_cls, base_path)
+
+    cfg = deepcopy(base_cfg)
+    cfg.filename = config_path
+    cfg.route_mode = "online"
+    cfg.use_manifest_routes = False
+
+    model_cfg = cfg.get("model")
+    if isinstance(model_cfg, dict):
+        model_cfg["use_online_route_for_loss"] = True
+
+    train_dataset = cfg.get("train_dataset")
+    if isinstance(train_dataset, dict):
+        train_dataset["route_manifest_path"] = None
+        train_dataset["route_manifest_required"] = False
+        train_dataset["skip_route_manifest_skip_samples"] = False
+
+    train_dataloader = cfg.get("train_dataloader")
+    if isinstance(train_dataloader, dict):
+        dataset_cfg = train_dataloader.get("dataset")
+        if isinstance(dataset_cfg, dict):
+            dataset_cfg["route_manifest_path"] = None
+            dataset_cfg["route_manifest_required"] = False
+            dataset_cfg["skip_route_manifest_skip_samples"] = False
+        train_dataloader["sampler"] = dict(
+            type="mmengine.dataset.sampler.DefaultSampler",
+            shuffle=True,
+        )
+
+    cfg.custom_hooks = [dict(type="projects.sa2va.hooks.ema_teacher_hook.EMATeacherHook")]
     return cfg
 
 
