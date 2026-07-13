@@ -274,6 +274,30 @@
   - `state_dict()` now returns the same mapping type as `super().state_dict()`, filtered to `student_model.*`.
   - Preserved `_metadata` for the root and `student_model` prefixes so MMEngine checkpoint saving remains compatible.
 
+## 2026-07-13 Online Referring Fallback Sampler Incompatibility
+
+### Problem
+- The new single-GPU online referring training run still failed before the first training iteration.
+- The fallback launcher crashed while building the dataloader with:
+  - `TypeError: DefaultSampler.__init__() got an unexpected keyword argument 'per_device_batch_size'`
+
+### Root Cause Notes
+- The repository config path still carries `per_device_batch_size` in sampler configs because the normal XTuner chain can use grouped samplers that expect it.
+- In fallback mode for the online referring config, `tools/train_fallback_compat.py` rewrites the sampler to `mmengine.dataset.sampler.DefaultSampler`, but the inherited sampler config or merged CLI override still retained `per_device_batch_size`.
+- MMEngine `DefaultSampler` does not accept that keyword, so runner initialization failed before training started.
+
+### Chosen Fix Direction
+- Keep the online fallback path using `DefaultSampler`.
+- Strip `per_device_batch_size` whenever fallback normalizes a dataloader sampler to `DefaultSampler`.
+
+### Rejected Direction
+- Do not remove `per_device_batch_size` from the main configs globally. That would risk changing the intended XTuner path and grouped-sampler behavior outside the current fallback chain.
+
+### Implemented Changes
+- Updated `tools/train_fallback_compat.py`:
+  - when synthesizing the online referring config, preserve any existing sampler fields but rewrite the sampler type to `DefaultSampler` and remove `per_device_batch_size`
+  - during generic fallback normalization, also drop `per_device_batch_size` from any sampler already resolved to `DefaultSampler`
+
 ## 2026-07-12 Referring Config Fallback Loader Rejected Import Star
 
 ### Problem

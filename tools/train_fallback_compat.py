@@ -362,10 +362,18 @@ def _load_referring_online_config_via_python_exec(config_cls, config_path: str):
             dataset_cfg["route_manifest_path"] = None
             dataset_cfg["route_manifest_required"] = False
             dataset_cfg["skip_route_manifest_skip_samples"] = False
-        train_dataloader["sampler"] = dict(
-            type="mmengine.dataset.sampler.DefaultSampler",
-            shuffle=True,
-        )
+        sampler_cfg = train_dataloader.get("sampler")
+        if isinstance(sampler_cfg, dict):
+            sampler_cfg = deepcopy(sampler_cfg)
+            sampler_cfg["type"] = "mmengine.dataset.sampler.DefaultSampler"
+            sampler_cfg["shuffle"] = True
+            sampler_cfg.pop("per_device_batch_size", None)
+            train_dataloader["sampler"] = sampler_cfg
+        else:
+            train_dataloader["sampler"] = dict(
+                type="mmengine.dataset.sampler.DefaultSampler",
+                shuffle=True,
+            )
 
     cfg.custom_hooks = [dict(type="projects.sa2va.hooks.ema_teacher_hook.EMATeacherHook")]
     return cfg
@@ -374,12 +382,25 @@ def _load_referring_online_config_via_python_exec(config_cls, config_path: str):
 def normalize_train_cfg_for_fallback(cfg) -> None:
     train_cfg = cfg.get("train_cfg")
     if not isinstance(train_cfg, dict):
-        return
+        train_cfg = None
 
-    loop_type = train_cfg.get("type")
-    loop_name = getattr(loop_type, "__name__", None)
-    if loop_name == "TrainLoop":
-        train_cfg["type"] = "EpochBasedTrainLoop"
+    if train_cfg is not None:
+        loop_type = train_cfg.get("type")
+        loop_name = getattr(loop_type, "__name__", None)
+        if loop_name == "TrainLoop":
+            train_cfg["type"] = "EpochBasedTrainLoop"
+
+    train_dataloader = cfg.get("train_dataloader")
+    if isinstance(train_dataloader, dict):
+        sampler_cfg = train_dataloader.get("sampler")
+        if isinstance(sampler_cfg, dict):
+            sampler_type = sampler_cfg.get("type")
+            sampler_type_name = getattr(sampler_type, "__name__", sampler_type)
+            if sampler_type_name in {
+                "DefaultSampler",
+                "mmengine.dataset.sampler.DefaultSampler",
+            }:
+                sampler_cfg.pop("per_device_batch_size", None)
 
 
 def build_runner_from_cfg(cfg):
