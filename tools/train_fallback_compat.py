@@ -1,5 +1,6 @@
 import importlib
 import importlib.machinery
+import inspect
 import logging
 import os
 import os.path as osp
@@ -16,6 +17,21 @@ TARGET_FALLBACK_CHAIN = "refcoco_opsd_4b"
 TARGET_CONFIG_BASENAME = "sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3.py"
 REFERRING_CONFIG_BASENAME = "sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3_referring.py"
 REFERRING_ONLINE_CONFIG_BASENAME = "sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3_referring_online.py"
+
+
+def _strip_unsupported_default_sampler_kwargs(sampler_cfg: dict) -> dict:
+    try:
+        from mmengine.dataset.sampler import DefaultSampler
+
+        valid_params = set(inspect.signature(DefaultSampler.__init__).parameters.keys())
+    except Exception:
+        valid_params = {"self", "dataset", "shuffle", "seed", "round_up"}
+
+    cleaned = {}
+    for key, value in sampler_cfg.items():
+        if key == "type" or key in valid_params:
+            cleaned[key] = value
+    return cleaned
 
 
 def is_supported_fallback_target(config_path: str) -> bool:
@@ -367,7 +383,7 @@ def _load_referring_online_config_via_python_exec(config_cls, config_path: str):
             sampler_cfg = deepcopy(sampler_cfg)
             sampler_cfg["type"] = "mmengine.dataset.sampler.DefaultSampler"
             sampler_cfg["shuffle"] = True
-            sampler_cfg.pop("per_device_batch_size", None)
+            sampler_cfg = _strip_unsupported_default_sampler_kwargs(sampler_cfg)
             train_dataloader["sampler"] = sampler_cfg
         else:
             train_dataloader["sampler"] = dict(
@@ -400,7 +416,9 @@ def normalize_train_cfg_for_fallback(cfg) -> None:
                 "DefaultSampler",
                 "mmengine.dataset.sampler.DefaultSampler",
             }:
-                sampler_cfg.pop("per_device_batch_size", None)
+                cleaned_sampler_cfg = _strip_unsupported_default_sampler_kwargs(deepcopy(sampler_cfg))
+                sampler_cfg.clear()
+                sampler_cfg.update(cleaned_sampler_cfg)
 
 
 def build_runner_from_cfg(cfg):

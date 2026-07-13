@@ -298,6 +298,10 @@
   - when synthesizing the online referring config, preserve any existing sampler fields but rewrite the sampler type to `DefaultSampler` and remove `per_device_batch_size`
   - during generic fallback normalization, also drop `per_device_batch_size` from any sampler already resolved to `DefaultSampler`
 
+### Follow-up Correction
+- The next online fallback run still failed before training started, this time because the inherited sampler config also carried `drop_last`, which the installed `mmengine==0.10.4` `DefaultSampler` does not accept.
+- Updated `tools/train_fallback_compat.py` again so fallback now filters sampler kwargs against the runtime `DefaultSampler.__init__` signature instead of hand-removing only one field. This makes the online fallback robust to both `per_device_batch_size`, `drop_last`, and similar XTuner-only sampler keys.
+
 ## 2026-07-12 Referring Config Fallback Loader Rejected Import Star
 
 ### Problem
