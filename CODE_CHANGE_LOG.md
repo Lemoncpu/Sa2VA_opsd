@@ -219,6 +219,61 @@
 - Updated `tools/traindlc.sh` so the remote training command now exports:
   - `SA2VA_REFCOCO_OPSD_CONFIG`
 
+## 2026-07-13 Referring Teacher Pipeline Simplification For 4B
+
+### Problem
+- The short-referring RefCOCO branch still reused the DLC-oriented teacher regenerate pipeline almost verbatim.
+- In practice, 4B could often rewrite short referring expressions, but the intermediate `problem / direction / reason` diagnosis fields were unstable and caused frequent fallback, even when route export and training startup were already working.
+
+### Root Cause Notes
+- `projects/sa2va/models/sa2va_opsd_referring_v3.py` only rewrote prompt wording and caption cleanup, but it did not replace the main teacher reasoning path.
+- The active base pipeline in `projects/sa2va/models/sa2va_opsd_v2.py` expects a relatively high-freedom structured diagnosis tailored to DLC-style outputs, which is a poor fit for short referring supervision on a smaller 4B model.
+- The previous referring branch also did not explicitly expose gt/ref overlap, gt-only miss, and ref-only leak as separate teacher-visible mask regions.
+
+### Chosen Fix Direction
+- Keep the validated reconstruction IoU gate, verification branch, candidate scoring, and single-stage fallback behavior.
+- Replace only the referring teacher regenerate path with a more constrained flow:
+  - richer mask prompts for `gt / ref / overlap / gt_only / ref_only`
+  - one structured fault-report prompt with finite failure labels and a direct `REFERRING` rewrite
+  - programmatic backfill for diagnosis text so training logs stay informative even if some teacher fields are sparse
+  - short referring candidate regeneration and reranking before falling back
+
+### Rejected Direction
+- Do not globally change the DLC teacher pipeline in `sa2va_opsd_v2.py`, because the user already has that chain running and this patch is only intended to improve the referring branch.
+- Do not rely on a free-form multi-stage text-only diagnosis chain, because that was the unstable part for the current 4B setup.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_referring_v3.py`:
+  - Added a referring-specific structured fault-report schema with finite failure labels and a direct `REFERRING` output.
+  - Added richer teacher prompt masks covering `gt`, `ref`, `overlap`, `gt_only`, and `ref_only`.
+  - Added programmatic diagnosis backfill so `caption_problem`, `correction_direction`, and `reason` remain usable for logging and candidate prompting.
+  - Replaced the referring `run_teacher_regenerate_pipeline()` with a constrained teacher path: fault report + direct rewrite, candidate rerank, optional repair candidate, then original single-stage fallback.
+  - Kept existing caption normalization, verification gating, and IoU-based acceptance logic aligned with the working OPSD training path.
+
+## 2026-07-13 MMEngine Checkpoint Save Failure With Student-Only state_dict
+
+### Problem
+- Training could run, but checkpoint saving failed at `iter 100` with:
+  - `AttributeError: 'dict' object has no attribute '_metadata'`
+
+### Root Cause Notes
+- `projects/sa2va/models/sa2va_opsd_v2.py` overrides `state_dict()` to save only `student_model.*` weights.
+- That override rebuilt the result as a plain Python `dict`, which dropped the `_metadata` attribute carried by the original PyTorch state dict object.
+- `mmengine.runner.checkpoint.weights_to_cpu()` expects the returned mapping to support `_metadata`, so checkpoint serialization crashed even though the actual weights were valid.
+
+### Chosen Fix Direction
+- Keep the existing “student-only checkpoint” behavior.
+- Rebuild the filtered state dict using the original state dict class and preserve filtered `_metadata` entries for the student subtree.
+
+### Rejected Direction
+- Do not switch back to saving the full model state. The user explicitly wants only the main student weights.
+- Do not patch MMEngine locally for this. The bug is in the custom `state_dict()` contract on the model side.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py`:
+  - `state_dict()` now returns the same mapping type as `super().state_dict()`, filtered to `student_model.*`.
+  - Preserved `_metadata` for the root and `student_model` prefixes so MMEngine checkpoint saving remains compatible.
+
 ## 2026-07-12 Referring Config Fallback Loader Rejected Import Star
 
 ### Problem

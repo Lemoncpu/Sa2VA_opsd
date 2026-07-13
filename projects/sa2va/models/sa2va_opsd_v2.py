@@ -841,11 +841,18 @@ class Sa2VAOPSDModelV2(BaseModel):
 
     def state_dict(self, *args, **kwargs):
         full_state = super().state_dict(*args, **kwargs)
-        student_only_state = {
-            k: v
+        student_only_state = full_state.__class__(
+            (k, v)
             for k, v in full_state.items()
             if k.startswith("student_model.")
-        }
+        )
+        full_metadata = getattr(full_state, "_metadata", None)
+        if full_metadata is not None:
+            filtered_metadata = full_metadata.__class__()
+            for key, value in full_metadata.items():
+                if key == "" or key.startswith("student_model"):
+                    filtered_metadata[key] = value
+            student_only_state._metadata = filtered_metadata
         return student_only_state
 
     def load_state_dict(self, state_dict, strict=True):
