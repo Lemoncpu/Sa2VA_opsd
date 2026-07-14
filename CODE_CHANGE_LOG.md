@@ -2067,3 +2067,24 @@
   - applied the same Adafactor duplicate-registration patch used by training
   - lazily imported `BUILDER` and installed the local `xtuner` fallback modules from `tools/train_fallback_compat.py` when needed
   - fell back to the local `guess_load_checkpoint()` implementation if `xtuner.model.utils` is unavailable
+
+## 2026-07-14 PTH RefCOCO Eval Config Auto-Recovery
+
+### Problem
+- The single-checkpoint RefCOCO evaluator could fail with:
+  - `AttributeError: 'ConfigDict' object has no attribute 'model'`
+- This happened when users passed the dedicated eval config (`refcoco_caption_to_mask_eval_4b_local.py`), which only defines dataset/output settings and has no training `model` section.
+
+### Root Cause Notes
+- `tools/pth_eval_utils.py` assumed the incoming config was always a training config and immediately read `cfg.model`.
+- In practice, the checkpoint evaluator is naturally invoked with an eval config plus a `.pth`, so it needs a way to recover the underlying training model config.
+
+### Chosen Fix Direction
+- Keep the public eval CLI unchanged.
+- If the provided config has no `model`, auto-resolve the matching training config from the checkpoint/work-dir naming pattern, with an env override for manual forcing.
+
+### Implemented Changes
+- Updated `tools/pth_eval_utils.py`:
+  - added `SA2VA_PTH_EVAL_MODEL_CONFIG` override support
+  - if the provided config has no `model`, infer the training config automatically
+  - default inference maps `referring` / `fault_report` checkpoints to the referring 4B OPSD config, otherwise to the base 4B OPSD config

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -9,6 +10,26 @@ from mmengine.config import Config
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+DEFAULT_MODEL_CONFIG = (
+    ROOT / "projects/sa2va/configs/sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3.py"
+)
+DEFAULT_REFERRING_MODEL_CONFIG = (
+    ROOT / "projects/sa2va/configs/sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3_referring.py"
+)
+
+
+def _infer_model_config_path(config_path: str, checkpoint_path: str) -> str:
+    override = os.environ.get("SA2VA_PTH_EVAL_MODEL_CONFIG")
+    if override:
+        return override
+
+    config_name = Path(config_path).name.lower()
+    checkpoint_hint = str(checkpoint_path).lower()
+    joined_hint = f"{config_name} {checkpoint_hint}"
+    if "referring" in joined_hint or "fault_report" in joined_hint:
+        return str(DEFAULT_REFERRING_MODEL_CONFIG)
+    return str(DEFAULT_MODEL_CONFIG)
 
 
 def load_opsd_model_from_pth(
@@ -42,6 +63,9 @@ def load_opsd_model_from_pth(
         guess_load_checkpoint = fallback_guess_load_checkpoint
 
     cfg = Config.fromfile(config_path)
+    if not cfg.get("model", None):
+        model_config_path = _infer_model_config_path(config_path, checkpoint_path)
+        cfg = Config.fromfile(model_config_path)
     model_cfg = cfg.model.copy()
 
     if base_model_path:
