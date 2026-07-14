@@ -9,7 +9,7 @@ tokenizer_path = _getenv("SA2VA_REFCOCO_EVAL_TOKENIZER_PATH", model_path)
 enable_teacher = False
 
 dataset_name = "refcoco"
-split = "val"
+split = _getenv("SA2VA_REFCOCO_EVAL_SPLIT", "val")
 
 # REFER-style root. The evaluator will load from <data_root>/refcoco
 data_root = _getenv(

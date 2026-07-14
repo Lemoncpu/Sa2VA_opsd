@@ -2169,3 +2169,18 @@
   - added shared intersection/union accumulation helper
   - recorded per-sample `intersection` and `union`
   - summary now includes `miou`, `ciou`, `pixel_weighted_iou`, `intersection_sum`, and `union_sum`
+
+## 2026-07-14 RefCOCO Eval Split Env Override
+
+### Problem
+- The local RefCOCO eval config hardcoded `split = "val"`, so switching to `testA` or `testB` required editing the config file by hand each time.
+
+### Root Cause Notes
+- `projects/sa2va/configs/refcoco_caption_to_mask_eval_4b_local.py` already read most eval settings from `SA2VA_REFCOCO_EVAL_*` environment variables, but `split` was still fixed in code.
+
+### Chosen Fix Direction
+- Keep `val` as the default.
+- Add an environment override so the same config can be reused for `val`, `testA`, and `testB`.
+
+### Implemented Changes
+- Updated `projects/sa2va/configs/refcoco_caption_to_mask_eval_4b_local.py` so `split` now reads from `SA2VA_REFCOCO_EVAL_SPLIT`, defaulting to `val`.
