@@ -2023,3 +2023,26 @@
 
 ### Implemented Changes
 - Updated `tools/judgedlc.sh` so the default `LLM_ENGINE` is now `gpt-5.5`.
+
+## 2026-07-14 Referring Teacher Prompt Shape Mismatch
+
+### Problem
+- The referring-caption training run could crash during teacher generation with:
+  - `Shape mismatch, selected is 552, vp embeds is 276 !!!`
+- This happened after the new structured teacher pipeline had already started training successfully, so it looked intermittent rather than a startup failure.
+
+### Root Cause Notes
+- The HF `predict_forward()` path expanded every `<image>` occurrence in the prompt into a full image token block plus the visual-prompt token block.
+- The new teacher prompts can embed fields like `reconstruction.question`, and those nested fields may still carry their own `<image>` placeholder.
+- That duplicated the text-side visual tokens, while the actual prompt-mask/image embedding path still built only one set of visual prompt embeddings, producing the exact token/embed desync.
+
+### Chosen Fix Direction
+- Normalize single-image prompts before generation so only the first `<image>` placeholder survives.
+- Also harden the HF implementation itself so it only expands the first `<image>` occurrence and removes any trailing duplicates.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py`:
+  - added `_normalize_single_image_prompt_text()` to collapse duplicate `<image>` placeholders down to one leading placeholder
+  - applied that normalization inside `_predict_forward_eval()` whenever visual input or mask prompts are present
+- Updated `projects/sa2va/hf/models/modeling_sa2va_chat.py`:
+  - `predict_forward()` now replaces only the first `<image>` with image/VP tokens and strips any later placeholders instead of duplicating the full visual token block

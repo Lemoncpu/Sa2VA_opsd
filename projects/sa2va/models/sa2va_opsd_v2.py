@@ -3026,7 +3026,10 @@ class Sa2VAOPSDModelV2(BaseModel):
                     has_visual_input = accepted_kwargs.get("image") is not None or accepted_kwargs.get("video") is not None
                     uses_mask_prompts = accepted_kwargs.get("mask_prompts") is not None
                     if (has_visual_input or uses_mask_prompts) and "<image>" not in prompt_text:
-                        accepted_kwargs["text"] = f"<image>\n{prompt_text.lstrip()}"
+                        prompt_text = f"<image>\n{prompt_text.lstrip()}"
+                    if has_visual_input or uses_mask_prompts:
+                        prompt_text = self._normalize_single_image_prompt_text(prompt_text)
+                    accepted_kwargs["text"] = prompt_text
                 generation_override_keys = (
                     "max_new_tokens",
                     "do_sample",
@@ -3116,6 +3119,18 @@ class Sa2VAOPSDModelV2(BaseModel):
     @staticmethod
     def _strip_image_placeholder(text):
         return text.replace("<image>\n", "").replace("<image>", "").strip()
+
+    @classmethod
+    def _normalize_single_image_prompt_text(cls, text):
+        if not isinstance(text, str) or "<image>" not in text:
+            return text
+        sentinel = "__SA2VA_IMAGE_PLACEHOLDER__"
+        normalized = text.replace("<image>\n", "<image>")
+        normalized = normalized.replace("<image>", sentinel, 1)
+        normalized = normalized.replace("<image>", "")
+        normalized = normalized.replace(sentinel, "<image>\n", 1)
+        normalized = re.sub(r"<image>\n+", "<image>\n", normalized, count=1)
+        return normalized
 
     def _normalize_student_question(self, student_question):
         return self._strip_image_placeholder(student_question)

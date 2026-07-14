@@ -717,7 +717,9 @@ class Sa2VAChatModel(PreTrainedModel):
 
             if '<image>' in text or mask_prompts is not None:
                 assert past_text is None or len(past_text) == 0
-            text = text.replace('<image>', image_token_str + vp_token_str)
+            text = text.replace('<image>\n', '<image>', 1)
+            text = text.replace('<image>', image_token_str + vp_token_str, 1)
+            text = text.replace('<image>', '')
             input_text = ''
             input_text += self.template['INSTRUCTION'].format(
                 input=text, round=1, bot_name=self.bot_name)
