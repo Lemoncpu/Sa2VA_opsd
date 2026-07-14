@@ -2130,3 +2130,42 @@
   - normalized `limit` at function entry
   - guarded the loop break conditions with `if limit is not None`
   - applied the same fix to both `run_caption_to_mask_eval()` and `run_mask_to_caption_to_mask_eval()`
+
+## 2026-07-14 Base RefCOCO Eval Adafactor Registry Patch
+
+### Problem
+- Direct base-model RefCOCO eval through `tools/eval_refcoco_caption_to_mask.py` could fail at startup with:
+  - `KeyError: 'Adafactor is already registered in optimizer at torch.optim'`
+
+### Root Cause Notes
+- The base eval entrypoint imported `Sa2VAOPSDModelV3` immediately.
+- That pulled in `mmengine` optimizer registration before the local duplicate-registration patch used by training/export/fallback paths had a chance to run.
+
+### Chosen Fix Direction
+- Apply the same `Adafactor` duplicate-registration patch at the top of the base RefCOCO eval entrypoint before importing the OPSD model stack.
+
+### Implemented Changes
+- Updated `tools/eval_refcoco_caption_to_mask.py`:
+  - imported `patch_mmengine_adafactor_duplicate_registration` from `tools.train_fallback_compat`
+  - executed the patch before importing `Sa2VAOPSDModelV3`
+
+## 2026-07-14 RefCOCO Eval Add Pixel-Weighted cIoU
+
+### Problem
+- The RefCOCO eval summary only exposed sample-mean IoU, which is effectively `mIoU`.
+- The user needed `cIoU` / pixel-weighted IoU, not just an unweighted sample average.
+
+### Root Cause Notes
+- `projects/sa2va/evaluation/caption_to_mask_common.py` accumulated only per-sample IoUs and reported `avg_iou`.
+- It did not accumulate per-sample intersection and union pixels across the split.
+
+### Chosen Fix Direction
+- Keep the existing `avg_iou` field for compatibility.
+- Add explicit `miou` and `ciou` fields, where `ciou = sum(intersection) / sum(union)`.
+- Also expose `intersection_sum` and `union_sum` for later verification.
+
+### Implemented Changes
+- Updated `projects/sa2va/evaluation/caption_to_mask_common.py`:
+  - added shared intersection/union accumulation helper
+  - recorded per-sample `intersection` and `union`
+  - summary now includes `miou`, `ciou`, `pixel_weighted_iou`, `intersection_sum`, and `union_sum`

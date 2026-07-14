@@ -13,6 +13,17 @@ def normalize_refcoco_caption(text):
     return text
 
 
+def _compute_mask_intersection_union(gt_mask, pred_mask):
+    gt = (np.asarray(gt_mask) > 0).astype(np.uint8)
+    if pred_mask is None:
+        pred = np.zeros_like(gt, dtype=np.uint8)
+    else:
+        pred = (np.asarray(pred_mask) > 0).astype(np.uint8)
+    intersection = int(np.logical_and(gt > 0, pred > 0).sum())
+    union = int(np.logical_or(gt > 0, pred > 0).sum())
+    return intersection, union
+
+
 def run_caption_to_mask_eval(
     *,
     model,
@@ -27,6 +38,8 @@ def run_caption_to_mask_eval(
         limit = None
     results = []
     iou_sum = 0.0
+    intersection_sum = 0
+    union_sum = 0
     success_count = 0
     reconstruct_ok_count = 0
     checked = 0
@@ -48,9 +61,12 @@ def run_caption_to_mask_eval(
                 gt_mask=gt_mask,
             )
             iou = model._compute_iou(gt_mask, reconstruction.pred_mask)
+            intersection, union = _compute_mask_intersection_union(gt_mask, reconstruction.pred_mask)
             ok = iou >= 0.5
             checked += 1
             iou_sum += iou
+            intersection_sum += intersection
+            union_sum += union
             if ok:
                 success_count += 1
             if reconstruction.status == "ok":
@@ -71,6 +87,8 @@ def run_caption_to_mask_eval(
                     if reconstruction.pred_mask is None
                     else int(np.asarray(model._to_numpy_mask(reconstruction.pred_mask)).sum()),
                     "iou": float(iou),
+                    "intersection": intersection,
+                    "union": union,
                     "success_iou_gt_0_5": bool(ok),
                 }
             )
@@ -97,6 +115,11 @@ def run_caption_to_mask_eval(
         {
             "limit": checked,
             "avg_iou": iou_sum / max(checked, 1),
+            "miou": iou_sum / max(checked, 1),
+            "ciou": intersection_sum / max(union_sum, 1),
+            "pixel_weighted_iou": intersection_sum / max(union_sum, 1),
+            "intersection_sum": intersection_sum,
+            "union_sum": union_sum,
             "reconstruct_ok_rate": reconstruct_ok_count / max(checked, 1),
             "seg_success_count_iou_gt_0_5": success_count,
             "seg_success_rate_iou_gt_0_5": success_count / max(checked, 1),
@@ -135,6 +158,8 @@ def run_mask_to_caption_to_mask_eval(
         limit = None
     results = []
     iou_sum = 0.0
+    intersection_sum = 0
+    union_sum = 0
     success_count = 0
     reconstruct_ok_count = 0
     checked = 0
@@ -172,9 +197,12 @@ def run_mask_to_caption_to_mask_eval(
                 gt_mask=gt_mask,
             )
             iou = model._compute_iou(gt_mask, reconstruction.pred_mask)
+            intersection, union = _compute_mask_intersection_union(gt_mask, reconstruction.pred_mask)
             ok = iou >= 0.5
             checked += 1
             iou_sum += iou
+            intersection_sum += intersection
+            union_sum += union
             if ok:
                 success_count += 1
             if reconstruction.status == "ok":
@@ -195,6 +223,8 @@ def run_mask_to_caption_to_mask_eval(
                     if reconstruction.pred_mask is None
                     else int(np.asarray(model._to_numpy_mask(reconstruction.pred_mask)).sum()),
                     "iou": float(iou),
+                    "intersection": intersection,
+                    "union": union,
                     "success_iou_gt_0_5": bool(ok),
                 }
             )
@@ -211,6 +241,11 @@ def run_mask_to_caption_to_mask_eval(
         {
             "limit": checked,
             "avg_iou": iou_sum / max(checked, 1),
+            "miou": iou_sum / max(checked, 1),
+            "ciou": intersection_sum / max(union_sum, 1),
+            "pixel_weighted_iou": intersection_sum / max(union_sum, 1),
+            "intersection_sum": intersection_sum,
+            "union_sum": union_sum,
             "reconstruct_ok_rate": reconstruct_ok_count / max(checked, 1),
             "seg_success_count_iou_gt_0_5": success_count,
             "seg_success_rate_iou_gt_0_5": success_count / max(checked, 1),

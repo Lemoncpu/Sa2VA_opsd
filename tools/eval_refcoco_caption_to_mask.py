@@ -6,6 +6,10 @@ import numpy as np
 from PIL import Image
 from pycocotools import mask as mask_utils
 
+from tools.train_fallback_compat import patch_mmengine_adafactor_duplicate_registration
+
+patch_mmengine_adafactor_duplicate_registration()
+
 from projects.sa2va.datasets.common import SEG_QUESTIONS
 from projects.sa2va.evaluation.caption_to_mask_common import normalize_refcoco_caption, run_caption_to_mask_eval
 from projects.sa2va.evaluation.utils.refcoco_refer import REFER
