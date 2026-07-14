@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from mmengine.config import Config
+from mmengine.config.utils import ConfigParsingError
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -30,6 +31,15 @@ def _infer_model_config_path(config_path: str, checkpoint_path: str) -> str:
     if "referring" in joined_hint or "fault_report" in joined_hint:
         return str(DEFAULT_REFERRING_MODEL_CONFIG)
     return str(DEFAULT_MODEL_CONFIG)
+
+
+def _load_config_with_fallback(config_path: str):
+    from tools.train_fallback_compat import _load_config_via_python_exec
+
+    try:
+        return Config.fromfile(config_path)
+    except ConfigParsingError:
+        return _load_config_via_python_exec(Config, config_path)
 
 
 def load_opsd_model_from_pth(
@@ -62,10 +72,10 @@ def load_opsd_model_from_pth(
     except Exception:
         guess_load_checkpoint = fallback_guess_load_checkpoint
 
-    cfg = Config.fromfile(config_path)
+    cfg = _load_config_with_fallback(config_path)
     if not cfg.get("model", None):
         model_config_path = _infer_model_config_path(config_path, checkpoint_path)
-        cfg = Config.fromfile(model_config_path)
+        cfg = _load_config_with_fallback(model_config_path)
     model_cfg = cfg.model.copy()
 
     if base_model_path:

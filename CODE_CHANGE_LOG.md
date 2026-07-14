@@ -2088,3 +2088,24 @@
   - added `SA2VA_PTH_EVAL_MODEL_CONFIG` override support
   - if the provided config has no `model`, infer the training config automatically
   - default inference maps `referring` / `fault_report` checkpoints to the referring 4B OPSD config, otherwise to the base 4B OPSD config
+
+## 2026-07-14 PTH RefCOCO Eval Lazy-Import Config Fallback
+
+### Problem
+- After auto-switching from eval config to the underlying training config, checkpoint eval could still fail on:
+  - `ConfigParsingError: Illegal syntax in config! from xxx import * is not allowed outside the if base statement`
+- This was especially likely for the referring configs that reuse star-import based config composition.
+
+### Root Cause Notes
+- `tools/pth_eval_utils.py` still used raw `Config.fromfile()` for both the outer eval config and the inferred training config.
+- The training path already had a python-exec fallback loader in `tools/train_fallback_compat.py` specifically for these mmengine lazy-import parsing failures, but eval was not reusing it yet.
+
+### Chosen Fix Direction
+- Reuse the same fallback config loader as training inside checkpoint eval.
+- Keep the command line unchanged and make the fallback automatic.
+
+### Implemented Changes
+- Updated `tools/pth_eval_utils.py`:
+  - added `_load_config_with_fallback()`
+  - when `Config.fromfile()` hits `ConfigParsingError`, it now falls back to the training-side python-exec loader from `tools/train_fallback_compat.py`
+  - applied that fallback to both the user-provided config and the inferred training config
