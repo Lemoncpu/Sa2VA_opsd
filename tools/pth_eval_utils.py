@@ -5,8 +5,6 @@ from pathlib import Path
 from typing import Optional
 
 from mmengine.config import Config
-from xtuner.registry import BUILDER
-
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -25,7 +23,23 @@ def load_opsd_model_from_pth(
     use_flash_attn: bool = True,
     min_caption_tokens: int = 4,
 ):
-    from xtuner.model.utils import guess_load_checkpoint
+    from tools.train_fallback_compat import (
+        guess_load_checkpoint as fallback_guess_load_checkpoint,
+        install_xtuner_fallback_modules,
+        patch_mmengine_adafactor_duplicate_registration,
+    )
+
+    patch_mmengine_adafactor_duplicate_registration()
+    try:
+        from xtuner.registry import BUILDER
+    except Exception:
+        install_xtuner_fallback_modules()
+        from xtuner.registry import BUILDER
+
+    try:
+        from xtuner.model.utils import guess_load_checkpoint
+    except Exception:
+        guess_load_checkpoint = fallback_guess_load_checkpoint
 
     cfg = Config.fromfile(config_path)
     model_cfg = cfg.model.copy()

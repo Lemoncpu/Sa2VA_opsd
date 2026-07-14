@@ -2046,3 +2046,24 @@
   - applied that normalization inside `_predict_forward_eval()` whenever visual input or mask prompts are present
 - Updated `projects/sa2va/hf/models/modeling_sa2va_chat.py`:
   - `predict_forward()` now replaces only the first `<image>` with image/VP tokens and strips any later placeholders instead of duplicating the full visual token block
+
+## 2026-07-14 PTH RefCOCO Eval Reuse Training Fallback Chain
+
+### Problem
+- The checkpoint-based RefCOCO evaluator loaded the OPSD model through its own minimal `xtuner` import path instead of reusing the training fallback chain that had already been made to work in the host environment.
+- That made eval more fragile than training and risked hitting separate registry / checkpoint-loader incompatibilities.
+
+### Root Cause Notes
+- `tools/pth_eval_utils.py` directly imported `xtuner.registry.BUILDER` at module import time and `xtuner.model.utils.guess_load_checkpoint` inside the loader.
+- The training path already had a local fallback compatibility layer in `tools/train_fallback_compat.py`, but the eval loader was not using it.
+
+### Chosen Fix Direction
+- Make the PTH eval loader reuse the same fallback-compatible builder/checkpoint path as training whenever native `xtuner` imports are unavailable.
+- Keep the public eval CLI unchanged so existing commands still work.
+
+### Implemented Changes
+- Updated `tools/pth_eval_utils.py`:
+  - removed the eager top-level `xtuner.registry` import
+  - applied the same Adafactor duplicate-registration patch used by training
+  - lazily imported `BUILDER` and installed the local `xtuner` fallback modules from `tools/train_fallback_compat.py` when needed
+  - fell back to the local `guess_load_checkpoint()` implementation if `xtuner.model.utils` is unavailable
