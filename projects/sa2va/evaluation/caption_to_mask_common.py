@@ -22,6 +22,9 @@ def run_caption_to_mask_eval(
     summary_prefix=None,
     sample_extra_builder=None,
 ):
+    limit = None if limit is None else max(int(limit), 0)
+    if limit == 0:
+        limit = None
     results = []
     iou_sum = 0.0
     success_count = 0
@@ -30,7 +33,7 @@ def run_caption_to_mask_eval(
 
     with torch.no_grad():
         for sample in samples:
-            if checked >= limit:
+            if limit is not None and checked >= limit:
                 break
             caption = normalize_refcoco_caption(sample.get("caption"))
             if not caption:
@@ -127,6 +130,9 @@ def run_mask_to_caption_to_mask_eval(
     student_question,
     summary_prefix=None,
 ):
+    limit = None if limit is None else max(int(limit), 0)
+    if limit == 0:
+        limit = None
     results = []
     iou_sum = 0.0
     success_count = 0
@@ -136,7 +142,7 @@ def run_mask_to_caption_to_mask_eval(
 
     with torch.no_grad():
         for sample in samples:
-            if processed >= limit:
+            if limit is not None and processed >= limit:
                 break
 
             image = _load_eval_image(sample)

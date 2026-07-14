@@ -2109,3 +2109,24 @@
   - added `_load_config_with_fallback()`
   - when `Config.fromfile()` hits `ConfigParsingError`, it now falls back to the training-side python-exec loader from `tools/train_fallback_compat.py`
   - applied that fallback to both the user-provided config and the inferred training config
+
+## 2026-07-14 Caption-to-Mask Eval Limit None Handling
+
+### Problem
+- RefCOCO checkpoint eval could crash with:
+  - `TypeError: '>=' not supported between instances of 'int' and 'NoneType'`
+- This happened when the caller intentionally left `--limit` unset to evaluate the full split.
+
+### Root Cause Notes
+- `projects/sa2va/evaluation/caption_to_mask_common.py` compared counters directly against `limit` without first normalizing the `None` case.
+- The same pattern existed in both caption-to-mask and mask-to-caption-to-mask helpers.
+
+### Chosen Fix Direction
+- Treat `limit=None` as “no truncation”.
+- Normalize non-positive limits to the same no-truncation behavior for consistency with other eval scripts.
+
+### Implemented Changes
+- Updated `projects/sa2va/evaluation/caption_to_mask_common.py`:
+  - normalized `limit` at function entry
+  - guarded the loop break conditions with `if limit is not None`
+  - applied the same fix to both `run_caption_to_mask_eval()` and `run_mask_to_caption_to_mask_eval()`
