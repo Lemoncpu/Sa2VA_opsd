@@ -1480,8 +1480,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         caption = re.sub(r"\s+", " ", (caption or "").strip())
         if not caption:
             return caption
-        caption = re.sub(r"^(a|an)\s+", "the ", caption, flags=re.IGNORECASE)
-        subject_predicate = re.match(r"^(the\s+.+?)\s+is\s+(.+)$", caption, flags=re.IGNORECASE)
+        subject_predicate = re.match(r"^((?:the|a|an)\s+.+?)\s+is\s+(.+)$", caption, flags=re.IGNORECASE)
         if subject_predicate:
             subject = subject_predicate.group(1).strip(" ,.")
             predicate = subject_predicate.group(2).strip(" ,.")
@@ -1508,11 +1507,20 @@ class Sa2VAOPSDModelV2(BaseModel):
         caption = re.sub(r"\s+", " ", (caption or "").strip())
         if not caption:
             return caption
-        caption = re.sub(r"^(a|an)\s+", "the ", caption, flags=re.IGNORECASE)
-        match = re.match(r"^(the\s+.+?)\s+\b(is|are|was|were)\b", caption, flags=re.IGNORECASE)
+        match = re.match(r"^((?:the|a|an)\s+.+?)\s+\b(is|are|was|were)\b", caption, flags=re.IGNORECASE)
         if match:
             return match.group(1).strip(" ,.")
         return caption.strip(" ,.")
+
+    def _training_loss_weight_for_sample(
+        self,
+        *,
+        loss_family,
+        student_caption="",
+        teacher_caption="",
+    ):
+        del loss_family, student_caption, teacher_caption
+        return 1.0
 
     @staticmethod
     def _append_spatial_hint_to_question(question, spatial_hint):
@@ -6883,6 +6891,11 @@ class Sa2VAOPSDModelV2(BaseModel):
             teacher_prompt = ""
             dummy_reason = None
             is_dummy = False
+            sample_loss_weight = self._training_loss_weight_for_sample(
+                loss_family=loss_family,
+                student_caption=description.clean_caption,
+                teacher_caption=teacher_dlc,
+            )
             sample_debug_record = {
                 "sample_key": sample_key,
                 "manifest_route": route_from_manifest,
@@ -6943,6 +6956,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "is_dummy": False,
                 "dummy_reason": None,
                 "entry_added": False,
+                "loss_weight": float(sample_loss_weight),
                 "loss_branch": loss_family,
                 "grpo_skip_reason": None,
                 "confuser_candidate_count": None,
@@ -6965,7 +6979,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                             "student_question": student_question,
                             "completion_ids": regen_completion,
                             "is_dummy": False,
-                            "loss_weight": 1.0,
+                            "loss_weight": sample_loss_weight,
                             "dummy_reason": None,
                         }
                     )
@@ -7016,7 +7030,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                             "teacher_prompt_masks": teacher_prompt_masks,
                             "iou": iou,
                             "is_dummy": False,
-                            "loss_weight": 1.0,
+                            "loss_weight": sample_loss_weight,
                             "dummy_reason": None,
                         }
                     )
@@ -7044,7 +7058,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                             "confuser_candidate_masks": confuser_candidate_masks,
                             "completion_ids": None,
                             "is_dummy": False,
-                            "loss_weight": 1.0,
+                            "loss_weight": sample_loss_weight,
                             "dummy_reason": None,
                             "debug_record": sample_debug_record,
                         }

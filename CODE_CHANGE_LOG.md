@@ -2184,3 +2184,35 @@
 
 ### Implemented Changes
 - Updated `projects/sa2va/configs/refcoco_caption_to_mask_eval_4b_local.py` so `split` now reads from `SA2VA_REFCOCO_EVAL_SPLIT`, defaulting to `val`.
+
+## 2026-07-14 Referring Training Style Tightening Toward RefCOCO
+
+### Problem
+- The short-referring-expression training path was still biased toward slightly longer, more natural captions than the original RefCOCO style.
+- Offline comparison against the base 4B checkpoint showed the fine-tuned `iter_1000` model mainly lagged on compositional short expressions such as ordinal, directional, relational, and body-part localization phrases.
+
+### Root Cause Notes
+- The default referring prompt still allowed broad “short natural expression” behavior instead of strongly preferring a compact RefCOCO-style noun phrase.
+- The canonicalization path forced `a/an -> the`, which nudged captions away from raw RefCOCO expression style.
+- Referring teacher candidate scoring favored `4-12` token outputs, noticeably longer than the RefCOCO distribution.
+- Training loss treated hard compositional referring expressions the same as easier short noun phrases.
+
+### Chosen Fix Direction
+- Tighten the short-referring prompt toward a compact RefCOCO-style noun phrase, usually `2-6` words.
+- Remove the forced article rewrite from referring canonicalization.
+- Shift referring teacher candidate scoring to prefer `2-6` token expressions.
+- Detect hard compositional referring expressions and increase their training loss weight.
+- For the referring path only, allow a mildly relaxed teacher gate on hard expressions when the teacher clearly improves reconstruction.
+
+### Implemented Changes
+- Updated `projects/sa2va/datasets/common.py`:
+  - tightened `DEFAULT_MASK_TO_REFERRING_QUESTION` toward compact RefCOCO-style noun phrases, usually `2-6` words
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py`:
+  - removed forced `a/an -> the` conversion in referring canonicalization helpers
+  - added a generic `_training_loss_weight_for_sample()` hook and used it when creating CE / distill / GRPO entries
+- Updated `projects/sa2va/models/sa2va_opsd_referring_v3.py`:
+  - changed referring teacher candidate length preference to strongly favor `2-6` tokens
+  - added hard referring expression detection for ordinal / directional / relational / body-part style expressions
+  - assigned a higher training loss weight to those hard referring samples
+  - tightened teacher prompts to explicitly ask for compact RefCOCO-style noun phrases
+  - used a referring-specific gate helper that keeps the original gate but allows a mild fallback for hard expressions with clear IoU improvement

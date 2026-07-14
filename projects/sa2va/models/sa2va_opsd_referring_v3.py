@@ -13,6 +13,20 @@ from projects.sa2va.models.sa2va_opsd_v3 import Sa2VAOPSDModelV3
 class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
     """Referring-expression variant that reuses the DLC OPSD training stack."""
 
+    _REFERRING_DIRECTION_WORDS = {
+        "left", "right", "top", "bottom", "middle", "center", "front", "back", "upper", "lower"
+    }
+    _REFERRING_ORDINAL_WORDS = {
+        "first", "second", "third", "fourth", "fifth", "1st", "2nd", "3rd", "4th", "5th"
+    }
+    _REFERRING_RELATION_WORDS = {
+        "behind", "beside", "near", "under", "over", "above", "below", "between", "with"
+    }
+    _REFERRING_BODYPART_WORDS = {
+        "arm", "head", "hand", "leg", "hair", "face", "tail", "wing", "foot", "feet"
+    }
+    _REFERRING_HARD_LOSS_WEIGHT = 1.35
+
     @staticmethod
     def _referring_failure_type_set():
         return {
@@ -90,11 +104,56 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
 
     def _teacher_candidate_length_score(self, caption):
         token_count = self._caption_token_count(caption)
-        if 4 <= token_count <= 12:
-            return 0.5
-        if 2 <= token_count <= 16:
-            return 0.2
-        return -0.2
+        if 2 <= token_count <= 4:
+            return 0.8
+        if 5 <= token_count <= 6:
+            return 0.45
+        if token_count == 1:
+            return 0.15
+        if 7 <= token_count <= 8:
+            return 0.05
+        return -0.35
+
+    @classmethod
+    def _tokenize_referring_expression(cls, caption):
+        return re.findall(r"[a-z0-9']+", (caption or "").lower())
+
+    @classmethod
+    def _is_hard_referring_expression(cls, caption):
+        tokens = set(cls._tokenize_referring_expression(caption))
+        if not tokens:
+            return False
+        caption_lower = (caption or "").lower()
+        has_direction = bool(tokens & cls._REFERRING_DIRECTION_WORDS)
+        has_ordinal = bool(tokens & cls._REFERRING_ORDINAL_WORDS)
+        has_relation = bool(tokens & cls._REFERRING_RELATION_WORDS) or any(
+            phrase in caption_lower for phrase in ("next to", "in front of", "on top of", "from the left", "from the right")
+        )
+        has_bodypart = bool(tokens & cls._REFERRING_BODYPART_WORDS)
+        hard_signal_count = sum((has_direction, has_ordinal, has_relation, has_bodypart))
+        return hard_signal_count >= 2 or (len(tokens) >= 7 and hard_signal_count >= 1)
+
+    def _training_loss_weight_for_sample(
+        self,
+        *,
+        loss_family,
+        student_caption="",
+        teacher_caption="",
+    ):
+        del loss_family
+        if self._is_hard_referring_expression(teacher_caption) or self._is_hard_referring_expression(student_caption):
+            return self._REFERRING_HARD_LOSS_WEIGHT
+        return 1.0
+
+    def _referring_teacher_regenerate_gate_passed(self, student_caption, student_iou, teacher_iou):
+        if self._teacher_regenerate_gate_passed(student_iou, teacher_iou):
+            return True
+        if not self._is_hard_referring_expression(student_caption):
+            return False
+        student_iou = float(student_iou)
+        teacher_iou = float(teacher_iou)
+        iou_gain = teacher_iou - student_iou
+        return teacher_iou >= 0.55 and iou_gain >= 0.08
 
     @staticmethod
     def _referring_fault_report_labels():
@@ -470,7 +529,8 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                 "- BAD_PHRASES_IN_STUDENT must be a short comma-separated phrase list or unknown.\n"
                 "- MISSING_PHRASES_NEEDED must be a short comma-separated phrase list or none.\n"
                 "- KEEPABLE_PHRASES must be a short comma-separated phrase list or none.\n"
-                "- REFERRING must be one short target-specific referring expression for region1 only, ideally 2 to 12 words.\n"
+                "- REFERRING must be one short target-specific referring expression for region1 only, ideally 2 to 6 words as a compact noun phrase.\n"
+                "- REFERRING should avoid full-sentence style unless a tiny relational phrase is absolutely necessary.\n"
                 "- REFERRING must not start with 'the target', 'the region', 'region1', or any explanation template.\n"
                 "- Do not output markdown, bullets, JSON, [SEG], or any labels beyond the 9 required field names."
             )
@@ -500,7 +560,8 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                 "Output exactly one line:\n"
                 "REFERRING: <one short target-specific referring expression>\n"
                 "Rules:\n"
-                "- Keep it short, concrete, and visually grounded.\n"
+                "- Keep it short, concrete, visually grounded, and close to a RefCOCO-style noun phrase.\n"
+                "- Prefer 2 to 6 words unless one extra relational phrase is necessary.\n"
                 "- Prefer the target-only cue over scene-level context.\n"
                 "- Avoid wording that still fits the distractor-side leak.\n"
                 "- Do not start with 'the target', 'the region', 'region1', or an explanation template.\n"
@@ -786,7 +847,7 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
             bool(teacher_reconstruct_ok)
             if caption_mode_failure
             else (
-                self._teacher_regenerate_gate_passed(iou, teacher_iou_plain)
+                self._referring_teacher_regenerate_gate_passed(student_caption, iou, teacher_iou_plain)
                 if teacher_reconstruct_ok
                 else False
             )
@@ -825,7 +886,7 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                     bool(teacher_reconstruct_ok)
                     if caption_mode_failure
                     else (
-                        self._teacher_regenerate_gate_passed(iou, repair_iou)
+                        self._referring_teacher_regenerate_gate_passed(student_caption, iou, repair_iou)
                         if teacher_reconstruct_ok
                         else False
                     )
@@ -876,7 +937,7 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                     bool(fallback_reconstruct_ok)
                     if caption_mode_failure
                     else (
-                        self._teacher_regenerate_gate_passed(iou, fallback_iou)
+                        self._referring_teacher_regenerate_gate_passed(student_caption, iou, fallback_iou)
                         if fallback_reconstruct_ok
                         else False
                     )
