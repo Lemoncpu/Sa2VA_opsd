@@ -2793,6 +2793,54 @@ class Sa2VAOPSDModelV2(BaseModel):
             f"world_size={len(gathered_payloads)}",
             flush=True,
         )
+        if getattr(self, "_short_referring_log_mode", False):
+            for item in gathered_payloads:
+                print("[Sa2VA_OPSD_V2_DDP_DEBUG] gathered_payload_begin", flush=True)
+                for key, value in (
+                    ("rank", item.get("rank")),
+                    ("batch_route", item.get("batch_route")),
+                    ("loss_family", item.get("loss_family")),
+                    ("entry_count", item.get("entry_count")),
+                    ("real_entry_count", item.get("real_entry_count")),
+                    ("dummy_entry_count", item.get("dummy_entry_count")),
+                    ("dummy_reasons", item.get("dummy_reasons")),
+                    ("regen_entries", item.get("regen_entry_count")),
+                    ("onpolicy_entries", item.get("onpolicy_entry_count")),
+                    ("grpo_entries", item.get("grpo_entry_count")),
+                    ("regen_loss_count", item.get("regen_loss_count")),
+                    ("onpolicy_loss_count", item.get("onpolicy_loss_count")),
+                    ("grpo_loss_count", item.get("grpo_loss_count")),
+                    ("optimized_count", item.get("optimized_count")),
+                ):
+                    print(f"[Sa2VA_OPSD_V2_DDP_DEBUG] {key}={value}", flush=True)
+                for record in item.get("records", []):
+                    print("[Sa2VA_OPSD_V2_DDP_DEBUG] sample_record_begin", flush=True)
+                    for key in (
+                        "sample_key",
+                        "manifest_route",
+                        "loss_family",
+                        "online_route",
+                        "reconstruct_status",
+                        "iou",
+                        "allow_teacher_ce",
+                        "teacher_reconstruct_ok",
+                        "teacher_gate_passed",
+                        "teacher_ce_eligible",
+                        "teacher_iou_plain",
+                        "teacher_completion_len",
+                        "is_dummy",
+                        "dummy_reason",
+                        "entry_added",
+                        "loss_branch",
+                        "grpo_skip_reason",
+                        "confuser_candidate_count",
+                        "selected_confuser_count",
+                        "scored_confuser_count",
+                    ):
+                        print(f"[Sa2VA_OPSD_V2_DDP_DEBUG] {key}={record.get(key)}", flush=True)
+                    print("[Sa2VA_OPSD_V2_DDP_DEBUG] sample_record_end", flush=True)
+                print("[Sa2VA_OPSD_V2_DDP_DEBUG] gathered_payload_end", flush=True)
+            return
         for item in gathered_payloads:
             records_text = []
             for record in item.get("records", []):
@@ -2868,6 +2916,81 @@ class Sa2VAOPSDModelV2(BaseModel):
         rank_debug_records,
     ):
         if not self.enable_debug_sample_logging:
+            return
+        if getattr(self, "_short_referring_log_mode", False):
+            print("[Sa2VA_OPSD_V2_PRE_RETURN_DEBUG] summary_begin", flush=True)
+            for key, value in (
+                ("rank", self._dist_rank()),
+                ("batch_route", batch_route),
+                ("last_route", last_route),
+                ("optimized_count", optimized_count),
+                ("regen_loss_count", regen_loss_count),
+                ("onpolicy_loss_count", onpolicy_loss_count),
+                ("grpo_loss_count", grpo_loss_count),
+                ("total_loss", None if total_loss is None else float(total_loss.detach().item())),
+                ("total_regen_ce", None if total_regen_ce is None else float(total_regen_ce.detach().item())),
+                ("total_onpolicy_jsd", None if total_onpolicy_jsd is None else float(total_onpolicy_jsd.detach().item())),
+                ("total_grpo", None if total_grpo is None else float(total_grpo.detach().item())),
+                ("cuda_mem", self._format_cuda_memory_stats()),
+            ):
+                print(f"[Sa2VA_OPSD_V2_PRE_RETURN_DEBUG] {key}={value}", flush=True)
+            print("[Sa2VA_OPSD_V2_PRE_RETURN_DEBUG] summary_end", flush=True)
+            for record in rank_debug_records:
+                print("[Sa2VA_OPSD_V2_PRE_RETURN_DEBUG] sample_record_begin", flush=True)
+                alias_items = (
+                    ("sample_key", record.get("sample_key")),
+                    ("loss_branch", record.get("loss_branch")),
+                    ("online_route", record.get("online_route")),
+                    ("iou", float(record.get("iou", 0.0))),
+                    ("is_dummy", record.get("is_dummy")),
+                    ("dummy_reason", record.get("dummy_reason")),
+                    ("grpo_skip_reason", record.get("grpo_skip_reason")),
+                    ("confuser_candidate_count", record.get("confuser_candidate_count")),
+                    ("selected_confuser_count", record.get("selected_confuser_count")),
+                    ("scored_confuser_count", record.get("scored_confuser_count")),
+                    ("teacher_verification_caption_status", record.get("teacher_verification_caption_status")),
+                    ("teacher_verification_caption", repr(record.get("teacher_verification_caption", ""))),
+                    ("teacher_referring", repr(record.get("teacher_dlc", ""))),
+                    ("target_summary", repr(record.get("target_summary", ""))),
+                    ("distractor_summary", repr(record.get("distractor_summary", ""))),
+                    ("shared_evidence", repr(record.get("shared_evidence", ""))),
+                    ("target_only_evidence", repr(record.get("target_only_evidence", ""))),
+                    ("distractor_only_evidence", repr(record.get("distractor_only_evidence", ""))),
+                    ("difference_focus", repr(record.get("difference_focus", ""))),
+                    ("likely_drift_reason", repr(record.get("likely_drift_reason", ""))),
+                    ("caption_problem", repr(record.get("caption_problem", ""))),
+                    ("correction_direction", repr(record.get("correction_direction", ""))),
+                    ("reason", repr(record.get("reason", ""))),
+                    ("single_stage_raw", repr(record.get("single_stage_raw", ""))),
+                    ("structured_diagnosis_raw", repr(record.get("structured_diagnosis_raw", ""))),
+                    ("repair_raw", repr(record.get("repair_raw", ""))),
+                    ("problem_raw", repr(record.get("problem_raw", ""))),
+                    ("direction_raw", repr(record.get("direction_raw", ""))),
+                    ("reason_raw", repr(record.get("reason_raw", ""))),
+                    ("teacher_problem_valid", record.get("teacher_problem_valid")),
+                    ("teacher_direction_valid", record.get("teacher_direction_valid")),
+                    ("teacher_reason_valid", record.get("teacher_reason_valid")),
+                    ("teacher_reason_is_coarse", record.get("teacher_reason_is_coarse")),
+                    ("teacher_problem_failure_reason", record.get("teacher_problem_failure_reason")),
+                    ("teacher_direction_failure_reason", record.get("teacher_direction_failure_reason")),
+                    ("teacher_reason_failure_reason", record.get("teacher_reason_failure_reason")),
+                    ("teacher_diagnosis_failure_reason", record.get("teacher_diagnosis_failure_reason")),
+                    ("teacher_pipeline_mode", record.get("teacher_pipeline_mode")),
+                    ("teacher_diagnosis_retry_count", record.get("teacher_diagnosis_retry_count")),
+                    ("teacher_referring_candidate_count", record.get("teacher_dlc_candidate_count")),
+                    ("teacher_referring_valid_candidate_count", record.get("teacher_dlc_valid_candidate_count")),
+                    ("teacher_referring_selected_by", record.get("teacher_dlc_selected_by")),
+                    ("teacher_verification_used", record.get("teacher_verification_used")),
+                    ("teacher_fallback_used", record.get("teacher_fallback_used")),
+                    ("teacher_fallback_reason", record.get("teacher_fallback_reason")),
+                    ("teacher_selected_caption_source", record.get("teacher_selected_caption_source")),
+                    ("teacher_referring_candidate_scores", repr(record.get("teacher_dlc_candidate_scores", ()))),
+                    ("teacher_pipeline_stop_stage", record.get("teacher_pipeline_stop_stage")),
+                    ("teacher_pipeline_failure_reason", record.get("teacher_pipeline_failure_reason")),
+                )
+                for key, value in alias_items:
+                    print(f"[Sa2VA_OPSD_V2_PRE_RETURN_DEBUG] {key}={value}", flush=True)
+                print("[Sa2VA_OPSD_V2_PRE_RETURN_DEBUG] sample_record_end", flush=True)
             return
         total_loss_value = None if total_loss is None else float(total_loss.detach().item())
         total_regen_value = None if total_regen_ce is None else float(total_regen_ce.detach().item())
@@ -7673,7 +7796,81 @@ class Sa2VAOPSDModelV2(BaseModel):
         batch_grpo_mcq_correct_conf_mean = grpo_mcq_correct_conf_sum / max(grpo_mcq_correct_count, 1)
         grpo_rollout_conf_text = self._format_float_list(grpo_rollout_mcq_confidences)
         grpo_rollout_rewards_text = self._format_float_list(grpo_rollout_rewards)
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
+        if getattr(self, "_short_referring_log_mode", False):
+            print("[Sa2VA_OPSD_V2] batch_summary_begin", flush=True)
+            for key, value in (
+                ("last_sample_key", repr(last_sample_key)),
+                ("last_route", last_route),
+                ("batch_avg_iou", f"{total_iou / max(routed_count, 1):.4f}"),
+                ("batch_seg_correct_rate", f"{seg_correct_count / max(routed_count, 1):.4f}"),
+                ("batch_regen_rate", f"{batch_teacher_regenerate_rate:.4f}"),
+                ("batch_onpolicy_rate", f"{batch_on_policy_distill_rate:.4f}"),
+                ("batch_grpo_rate", f"{batch_grpo_positive_rate:.4f}"),
+                ("teacher_regen_verified", teacher_regenerate_verified_count),
+                ("teacher_regen_rejected", teacher_regenerate_rejected_count),
+                ("teacher_regen_gate_pass_rate", f"{batch_teacher_regenerate_gate_pass_rate:.4f}"),
+                ("teacher_regen_verified_iou_mean", f"{batch_teacher_regenerate_verified_iou_mean:.4f}"),
+                ("teacher_regenerate_ce_applied", teacher_regenerate_ce_applied_count),
+                ("teacher_regenerate_suppressed", teacher_regenerate_suppressed_count),
+                ("window_teacher_difference_context_nontrivial_rate", f"{window_teacher_difference_context_nontrivial_rate:.4f}"),
+                ("window_teacher_problem_valid_rate", f"{window_teacher_problem_valid_rate:.4f}"),
+                ("window_teacher_direction_valid_rate", f"{window_teacher_direction_valid_rate:.4f}"),
+                ("window_teacher_reason_valid_rate", f"{window_teacher_reason_valid_rate:.4f}"),
+                ("window_teacher_reason_coarse_rate", f"{window_teacher_reason_coarse_rate:.4f}"),
+                ("window_teacher_regenerate_verification_caption_valid_rate", f"{window_teacher_regenerate_verification_caption_valid_rate:.4f}"),
+                ("window_teacher_regenerate_verification_iou_mean", f"{window_teacher_regenerate_verification_iou_mean:.4f}"),
+                ("window_teacher_diagnosis_valid_rate", f"{window_teacher_diagnosis_valid_rate:.4f}"),
+                ("window_teacher_referring_valid_rate", f"{window_teacher_dlc_valid_rate:.4f}"),
+                ("window_teacher_verification_gate_pass_rate", f"{window_teacher_verification_gate_pass_rate:.4f}"),
+                ("teacher_verification_caption", repr(teacher_verification_caption)),
+                ("teacher_referring", repr(teacher_dlc)),
+                ("teacher_caption_problem", repr(teacher_caption_problem)),
+                ("teacher_correction_direction", repr(teacher_correction_direction)),
+                ("teacher_reason", repr(teacher_reason)),
+                ("teacher_single_stage_raw", repr(teacher_single_stage_raw)),
+                ("teacher_difference_focus", repr(teacher_difference_focus)),
+                ("teacher_problem_raw", repr(teacher_problem_raw)),
+                ("teacher_direction_raw", repr(teacher_direction_raw)),
+                ("teacher_reason_raw", repr(teacher_reason_raw)),
+                ("teacher_problem_valid", teacher_problem_valid),
+                ("teacher_direction_valid", teacher_direction_valid),
+                ("teacher_reason_valid", teacher_reason_valid),
+                ("window_avg_caption_tokens", f"{window_avg_caption_tokens:.2f}"),
+                ("window_caption_seg_style_rate_raw", f"{window_caption_seg_style_rate_raw:.4f}"),
+                ("window_caption_mode_failure_rate", f"{window_caption_mode_failure_rate:.4f}"),
+                ("window_onpolicy_blocked_by_seg_style_count", window_totals['onpolicy_blocked_by_seg_style_count']),
+                ("window_grpo_blocked_by_seg_style_count", window_totals['grpo_blocked_by_seg_style_count']),
+                ("window_teacher_recovery_seg_style_count", window_totals['teacher_recovery_seg_style_count']),
+                ("window_teacher_recovery_seg_style_success_count", window_totals['teacher_recovery_seg_style_success_count']),
+                ("cumulative_teacher_difference_context_nontrivial_rate", f"{cumulative_teacher_difference_context_nontrivial_rate:.4f}"),
+                ("cumulative_teacher_problem_valid_rate", f"{cumulative_teacher_problem_valid_rate:.4f}"),
+                ("cumulative_teacher_direction_valid_rate", f"{cumulative_teacher_direction_valid_rate:.4f}"),
+                ("cumulative_teacher_reason_valid_rate", f"{cumulative_teacher_reason_valid_rate:.4f}"),
+                ("cumulative_teacher_reason_coarse_rate", f"{cumulative_teacher_reason_coarse_rate:.4f}"),
+                ("cumulative_teacher_regenerate_verification_caption_valid_rate", f"{cumulative_teacher_regenerate_verification_caption_valid_rate:.4f}"),
+                ("cumulative_teacher_regenerate_verification_iou_mean", f"{cumulative_teacher_regenerate_verification_iou_mean:.4f}"),
+                ("cumulative_teacher_diagnosis_valid_rate", f"{cumulative_teacher_diagnosis_valid_rate:.4f}"),
+                ("cumulative_teacher_referring_valid_rate", f"{cumulative_teacher_dlc_valid_rate:.4f}"),
+                ("cumulative_teacher_verification_caption_valid_rate", f"{cumulative_teacher_verification_caption_valid_rate:.4f}"),
+                ("cumulative_teacher_verification_gate_pass_rate", f"{cumulative_teacher_verification_gate_pass_rate:.4f}"),
+                ("cumulative_teacher_regenerate_referring_ce_applied_count", self._cumulative_teacher_regenerate_ce_applied_count),
+                ("window_teacher_positive_gain_rate", f"{window_teacher_positive_gain_rate:.4f}"),
+                ("window_teacher_iou_gain_mean", f"{window_teacher_iou_gain_mean:.4f}"),
+                ("window_grpo_zero_reward_variance_rate", f"{window_grpo_zero_reward_variance_rate:.4f}"),
+                ("window_grpo_nonzero_reward_rate", f"{window_grpo_nonzero_reward_rate:.4f}"),
+                ("window_grpo_missing_confuser_rate", f"{window_grpo_missing_confuser_rate:.4f}"),
+                ("window_grpo_reward_raw_mean", f"{window_grpo_reward_raw_mean:.4f}"),
+                ("window_grpo_gt_prob_mean", f"{window_grpo_gt_prob_mean:.4f}"),
+                ("window_grpo_confuser_penalty_mean", f"{window_grpo_confuser_penalty_mean:.4f}"),
+                ("grpo_mcq_acc", f"{batch_grpo_mcq_acc:.4f}"),
+                ("grpo_mcq_correct_conf_mean", f"{batch_grpo_mcq_correct_conf_mean:.4f}"),
+                ("grpo_rollout_confidences", grpo_rollout_conf_text),
+                ("grpo_rollout_rewards", grpo_rollout_rewards_text),
+                ("cuda_mem", self._format_cuda_memory_stats()),
+            ):
+                print(f"[Sa2VA_OPSD_V2] {key}={value}", flush=True)
+            print("[Sa2VA_OPSD_V2] batch_summary_end", flush=True)
+        if not getattr(self, "_short_referring_log_mode", False) and torch.distributed.is_available() and torch.distributed.is_initialized():
             if torch.distributed.get_rank() == 0:
                 print(
                     f"[Sa2VA_OPSD_V2] last_sample_key={last_sample_key!r} last_route={last_route} "
@@ -7744,7 +7941,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                     f"grpo_rollout_rewards={grpo_rollout_rewards_text} "
                     f"{self._format_cuda_memory_stats()}"
                 )
-        else:
+        elif not getattr(self, "_short_referring_log_mode", False):
             print(
                 f"[Sa2VA_OPSD_V2] last_sample_key={last_sample_key!r} last_route={last_route} "
                 f"batch_avg_iou={total_iou / max(routed_count, 1):.4f} "

@@ -2318,3 +2318,61 @@
   - overrode referring single-stage fallback parsing so it extracts `REFERRING:` first, only falls back to `DLC:` second, and hard-clips the final text into short referring style
   - extended hard post-cleaning to strip lingering `DLC:` prefixes
   - added a final fallback style gate so unusable long/sentence-like captions fail locally instead of silently re-entering the referring pipeline
+
+## 2026-07-15 Referring Teacher Diagnosis Reduced To Four Error Types And Four Fields
+
+### Problem
+- The short-referring branch still asked the teacher for a diagnosis schema that was too rich for the actual supervision target.
+- The user clarified that this branch only needs short referring expressions about the target subject itself, not scene-level cue analysis or DLC-style narrative diagnosis.
+- The previous schema still encouraged extra explanation fields and broader cue taxonomies, which made the teacher drift into long descriptions and unstable labels.
+
+### Root Cause Notes
+- `projects/sa2va/models/sa2va_opsd_referring_v3.py` still used an expanded fault taxonomy and diagnosis prompt structure inherited from a more expressive analysis setting.
+- Even after earlier fallback hardening, the teacher was still asked to separate multiple fine-grained failure modes such as relation-anchor and coarse-caption cases that are unnecessary for this short-referring objective.
+- The diagnosis prompt mixed subject cues, distractor cues, and broad scene-style summaries, which overburdened the 4B teacher and encouraged off-style generations.
+
+### Chosen Fix Direction
+- Shrink the short-referring diagnosis to the minimum actionable target:
+  - only 4 failure types: `wrong_subject`, `missing_attribute`, `wrong_attribute`, `missing_position`
+  - only 4 output fields: `ERROR_TYPE`, `KEEP_CUE`, `DROP_CUE`, `REFERRING`
+- Keep the rest of the referring pipeline intact, but reinterpret existing internal compatibility fields from these minimal outputs.
+
+### Rejected Direction
+- Do not keep the larger previous taxonomy with optional pruning. The user explicitly wanted the short-referring diagnosis itself to be simplified, not merely post-processed.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_referring_v3.py`:
+  - replaced the referring failure taxonomy with the 4 requested types
+  - changed both structured and light diagnosis schemas to emit only `ERROR_TYPE / KEEP_CUE / DROP_CUE / REFERRING`
+  - updated parser, validator, and backfill logic to derive compatibility fields from the new 4-field diagnosis
+  - added a minimal heuristic fallback that infers one of the 4 diagnosis types when the teacher leaves the type invalid
+  - simplified candidate rewrite prompts so they only condition on subject-focused keep/drop cues rather than the previous broader diagnosis bundle
+
+## 2026-07-15 Short-Referring Training Logs Should Not Expose DLC Terminology
+
+### Problem
+- After the short-referring branch had already switched away from DLC supervision semantics, its training logs still printed many `teacher_dlc*` fields and packed large sample debug payloads into single long lines.
+- This made the logs misleading for the referring branch and hard to inspect sample-by-sample.
+
+### Root Cause Notes
+- The base OPSD trainer in `projects/sa2va/models/sa2va_opsd_v2.py` owns the common debug and batch-summary logging paths, and those paths still use DLC-era field names.
+- The short-referring subclass reused those base loggers without overriding the output format, so even correct referring runs still exposed `teacher_dlc`, `teacher_dlc_valid_rate`, and `teacher_regenerate_dlc_ce_applied_count`.
+
+### Chosen Fix Direction
+- Keep the internal training state and compatibility keys unchanged, but change only the short-referring branch log surface:
+  - enable a short-referring log mode in the subclass
+  - print sample debug records in multi-line `key=value` form instead of single packed `records=[...]` lines
+  - alias displayed DLC field names to referring-oriented names in the short-referring branch
+  - rename returned metric keys in the short-referring subclass so the mmengine iter logs no longer show `teacher_dlc*`
+
+### Rejected Direction
+- Do not globally rename the base trainer’s internal DLC compatibility fields, because the main DLC branch still depends on those names and workflows.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py`:
+  - added a short-referring-only multi-line format for DDP debug and pre-return debug logs
+  - changed the short-referring batch summary log to print one field per line and to expose `teacher_referring`-style labels instead of `teacher_dlc` labels
+- Updated `projects/sa2va/models/sa2va_opsd_referring_v3.py`:
+  - enabled short-referring log mode on construction
+  - renamed returned metric keys from `teacher_dlc_valid_rate` to `teacher_referring_valid_rate`
+  - renamed returned metric keys from `teacher_regenerate_dlc_ce_applied_count` to `teacher_regenerate_referring_ce_applied_count`
