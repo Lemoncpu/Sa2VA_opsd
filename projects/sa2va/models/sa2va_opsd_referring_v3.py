@@ -1,6 +1,8 @@
 import re
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 
 from projects.sa2va.datasets.common import DEFAULT_MASK_TO_REFERRING_QUESTION
 from projects.sa2va.evaluation.teacher_diagnosis_common import (
@@ -14,30 +16,77 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
     """Referring-expression variant that reuses the DLC OPSD training stack."""
 
     _REFERRING_DIRECTION_WORDS = {
-        "left", "right", "top", "bottom", "middle", "center", "front", "back", "upper", "lower"
+        "left", "right", "top", "bottom", "middle", "center", "front", "back", "upper", "lower",
+        "leftmost", "rightmost", "topmost", "bottommost",
     }
     _REFERRING_ORDINAL_WORDS = {
         "first", "second", "third", "fourth", "fifth", "1st", "2nd", "3rd", "4th", "5th"
     }
     _REFERRING_RELATION_WORDS = {
-        "behind", "beside", "near", "under", "over", "above", "below", "between", "with"
+        "behind", "beside", "near", "under", "over", "above", "below", "between", "with",
+        "next", "holding", "wearing", "carrying", "by"
     }
     _REFERRING_BODYPART_WORDS = {
         "arm", "head", "hand", "leg", "hair", "face", "tail", "wing", "foot", "feet"
     }
-    _REFERRING_HARD_LOSS_WEIGHT = 1.35
+    _REFERRING_COLOR_WORDS = {
+        "red", "blue", "green", "yellow", "black", "white", "brown", "gray", "grey", "orange", "pink", "purple"
+    }
+    _REFERRING_TEMPLATE_PREFIXES = (
+        "the target",
+        "the region",
+        "region1",
+        "this is",
+        "there is",
+        "it is",
+    )
+    _REFERRING_STYLE_FORBIDDEN_PHRASES = (
+        "appears to",
+        "seems to",
+        "in the image",
+        "in this image",
+        "visible in",
+    )
+    _REFERRING_GENERIC_CATEGORY_WORDS = {
+        "person", "people", "man", "woman", "boy", "girl", "dog", "cat", "chair", "table", "car", "bus", "bike",
+    }
+
+    def __init__(
+        self,
+        *args,
+        referring_hard_loss_weight_base=1.2,
+        referring_hard_loss_weight_compound=1.4,
+        referring_hard_loss_weight_max=1.55,
+        enable_referring_direct_mask_loss=True,
+        referring_direct_mask_loss_weight=0.7,
+        referring_teacher_direct_mask_loss_weight=0.35,
+        referring_confuser_separation_loss_weight=0.15,
+        referring_direct_mask_loss_min_iou_gate=0.0,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.referring_hard_loss_weight_base = float(referring_hard_loss_weight_base)
+        self.referring_hard_loss_weight_compound = float(referring_hard_loss_weight_compound)
+        self.referring_hard_loss_weight_max = float(referring_hard_loss_weight_max)
+        self.enable_referring_direct_mask_loss = bool(enable_referring_direct_mask_loss)
+        self.referring_direct_mask_loss_weight = float(referring_direct_mask_loss_weight)
+        self.referring_teacher_direct_mask_loss_weight = float(referring_teacher_direct_mask_loss_weight)
+        self.referring_confuser_separation_loss_weight = float(referring_confuser_separation_loss_weight)
+        self.referring_direct_mask_loss_min_iou_gate = float(referring_direct_mask_loss_min_iou_gate)
 
     @staticmethod
     def _referring_failure_type_set():
         return {
-            "too_generic",
-            "wrong_attribute",
-            "wrong_part_focus",
-            "wrong_spatial_anchor",
-            "distractor_leak",
-            "scene_spill",
-            "mixed_target",
-            "underspecified_local_detail",
+            "spatial_direction_error",
+            "instance_order_error",
+            "relation_anchor_error",
+            "target_attribute_missing",
+            "distractor_attribute_confusion",
+            "category_too_coarse",
+            "over_broad_region_error",
+            "non_discriminative_caption",
+            "hallucinated_detail_error",
+            "mixed_error",
             "empty_or_malformed",
             "unknown",
         }
@@ -50,6 +99,76 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         if "detailed, localized caption" in clean_question.lower():
             return DEFAULT_MASK_TO_REFERRING_QUESTION
         return f"<image>{clean_question}" if not clean_question.startswith("<image>") else clean_question
+
+    @classmethod
+    def _has_referring_template_prefix(cls, caption):
+        caption_lower = (caption or "").strip().lower()
+        return any(caption_lower.startswith(prefix) for prefix in cls._REFERRING_TEMPLATE_PREFIXES)
+
+    @classmethod
+    def _looks_like_full_sentence(cls, caption):
+        caption = (caption or "").strip()
+        if not caption:
+            return False
+        token_count = len(cls._tokenize_referring_expression(caption))
+        caption_lower = caption.lower()
+        return token_count >= 8 or any(phrase in caption_lower for phrase in cls._REFERRING_STYLE_FORBIDDEN_PHRASES)
+
+    @classmethod
+    def _is_referring_category_only_expression(cls, caption):
+        tokens = cls._tokenize_referring_expression(caption)
+        if not tokens:
+            return False
+        cue_words = (
+            cls._REFERRING_DIRECTION_WORDS
+            | cls._REFERRING_ORDINAL_WORDS
+            | cls._REFERRING_RELATION_WORDS
+            | cls._REFERRING_BODYPART_WORDS
+            | cls._REFERRING_COLOR_WORDS
+        )
+        has_cue = bool(set(tokens) & cue_words) or any(
+            phrase in (caption or "").lower()
+            for phrase in ("next to", "in front of", "on top of", "from the left", "from the right")
+        )
+        if has_cue:
+            return False
+        filtered = [token for token in tokens if token not in {"the", "a", "an"}]
+        return len(filtered) <= 2 and all(token in cls._REFERRING_GENERIC_CATEGORY_WORDS for token in filtered)
+
+    def _referring_style_is_usable(self, caption):
+        token_count = self._caption_token_count(caption)
+        if token_count < 2 or token_count > 9:
+            return False
+        if self._has_referring_template_prefix(caption):
+            return False
+        if self._looks_like_full_sentence(caption):
+            return False
+        if self._caption_scene_spill_hit_count(caption) >= 2:
+            return False
+        if self._is_referring_category_only_expression(caption):
+            return False
+        return True
+
+    def _referring_style_score(self, caption):
+        token_count = self._caption_token_count(caption)
+        score = 0.0
+        if 2 <= token_count <= 4:
+            score += 1.0
+        elif 5 <= token_count <= 6:
+            score += 0.7
+        elif 7 <= token_count <= 9:
+            score += 0.2
+        else:
+            score -= 0.8
+        if self._has_referring_template_prefix(caption):
+            score -= 0.8
+        if self._looks_like_full_sentence(caption):
+            score -= 0.6
+        if self._caption_scene_spill_hit_count(caption) >= 2:
+            score -= 0.5
+        if self._is_referring_category_only_expression(caption):
+            score -= 0.7
+        return score
 
     def _normalize_referring_expression(self, caption):
         caption = self._clean_caption_text(caption)
@@ -95,6 +214,8 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         return self._normalize_referring_expression(normalized)
 
     def _is_caption_content_sufficient(self, caption):
+        if not self._referring_style_is_usable(caption):
+            return False
         token_count = self._caption_token_count(caption)
         if token_count >= 2 and self._is_np_like_caption(caption):
             return not self._is_overly_generic_caption(caption)
@@ -105,14 +226,14 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
     def _teacher_candidate_length_score(self, caption):
         token_count = self._caption_token_count(caption)
         if 2 <= token_count <= 4:
-            return 0.8
+            return 1.0
         if 5 <= token_count <= 6:
-            return 0.45
-        if token_count == 1:
+            return 0.6
+        if 7 <= token_count <= 9:
             return 0.15
-        if 7 <= token_count <= 8:
-            return 0.05
-        return -0.35
+        if token_count == 1:
+            return -0.1
+        return -0.7
 
     @classmethod
     def _tokenize_referring_expression(cls, caption):
@@ -120,9 +241,12 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
 
     @classmethod
     def _is_hard_referring_expression(cls, caption):
+        tags = cls._analyze_referring_difficulty(caption)
+        return bool(tags["hard_sample"])
+
+    @classmethod
+    def _analyze_referring_difficulty(cls, caption):
         tokens = set(cls._tokenize_referring_expression(caption))
-        if not tokens:
-            return False
         caption_lower = (caption or "").lower()
         has_direction = bool(tokens & cls._REFERRING_DIRECTION_WORDS)
         has_ordinal = bool(tokens & cls._REFERRING_ORDINAL_WORDS)
@@ -130,8 +254,18 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
             phrase in caption_lower for phrase in ("next to", "in front of", "on top of", "from the left", "from the right")
         )
         has_bodypart = bool(tokens & cls._REFERRING_BODYPART_WORDS)
-        hard_signal_count = sum((has_direction, has_ordinal, has_relation, has_bodypart))
-        return hard_signal_count >= 2 or (len(tokens) >= 7 and hard_signal_count >= 1)
+        same_category_like = bool(tokens & cls._REFERRING_GENERIC_CATEGORY_WORDS) and (has_direction or has_ordinal or has_relation)
+        compound = sum((has_direction, has_ordinal, has_relation)) >= 2
+        hard_sample = compound or has_bodypart or (same_category_like and (has_direction or has_ordinal))
+        return {
+            "spatial_required": bool(has_direction),
+            "ordinal_required": bool(has_ordinal),
+            "relation_required": bool(has_relation),
+            "bodypart_required": bool(has_bodypart),
+            "same_category_multi_instance_like": bool(same_category_like),
+            "hard_sample": bool(hard_sample),
+            "compound_hard_sample": bool(compound or (has_direction and has_ordinal)),
+        }
 
     def _training_loss_weight_for_sample(
         self,
@@ -141,8 +275,30 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         teacher_caption="",
     ):
         del loss_family
-        if self._is_hard_referring_expression(teacher_caption) or self._is_hard_referring_expression(student_caption):
-            return self._REFERRING_HARD_LOSS_WEIGHT
+        student_tags = self._analyze_referring_difficulty(student_caption)
+        teacher_tags = self._analyze_referring_difficulty(teacher_caption)
+        active = {
+            key: bool(student_tags[key] or teacher_tags[key])
+            for key in (
+                "spatial_required",
+                "ordinal_required",
+                "relation_required",
+                "bodypart_required",
+                "same_category_multi_instance_like",
+                "compound_hard_sample",
+                "hard_sample",
+            )
+        }
+        cue_count = sum(
+            int(active[key])
+            for key in ("spatial_required", "ordinal_required", "relation_required", "bodypart_required")
+        )
+        if active["compound_hard_sample"]:
+            return self.referring_hard_loss_weight_max
+        if cue_count >= 2 or active["same_category_multi_instance_like"]:
+            return self.referring_hard_loss_weight_compound
+        if active["hard_sample"]:
+            return self.referring_hard_loss_weight_base
         return 1.0
 
     def _referring_teacher_regenerate_gate_passed(self, student_caption, student_iou, teacher_iou):
@@ -163,9 +319,11 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
             "MISSING_EVIDENCE",
             "DISTRACTOR_EVIDENCE",
             "PRIMARY_FAILURE_TYPE",
+            "SECONDARY_FAILURE_TYPE",
             "BAD_PHRASES_IN_STUDENT",
             "MISSING_PHRASES_NEEDED",
             "KEEPABLE_PHRASES",
+            "MUST_AVOID_PHRASES",
             "REFERRING",
         )
 
@@ -189,14 +347,16 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
     def _humanize_referring_failure_type(self, failure_type):
         failure_type = self._normalize_teacher_field_text(failure_type).lower()
         mapping = {
-            "too_generic": "The student caption is too generic for stable reconstruction.",
-            "wrong_attribute": "The student caption anchors on a wrong or misleading visual attribute.",
-            "wrong_part_focus": "The student caption focuses on the wrong local part of the target.",
-            "wrong_spatial_anchor": "The student caption uses a weak or wrong spatial anchor.",
-            "distractor_leak": "The student caption still fits the distractor-side region.",
-            "scene_spill": "The student caption spills into broader scene context instead of the target.",
-            "mixed_target": "The student caption mixes target evidence with another nearby region.",
-            "underspecified_local_detail": "The student caption misses the local detail needed to isolate the target.",
+            "spatial_direction_error": "The student caption uses a wrong or incomplete spatial direction cue.",
+            "instance_order_error": "The student caption uses a wrong instance order or extremum cue.",
+            "relation_anchor_error": "The student caption anchors the target to the wrong nearby object or relation.",
+            "target_attribute_missing": "The student caption misses the target-only visual attribute needed for disambiguation.",
+            "distractor_attribute_confusion": "The student caption uses an attribute that fits the distractor better than the target.",
+            "category_too_coarse": "The student caption is too coarse and does not isolate the target from similar instances.",
+            "over_broad_region_error": "The student caption points to a broader surrounding region instead of the exact target.",
+            "non_discriminative_caption": "The student caption is locally plausible but still does not exclude nearby confusers.",
+            "hallucinated_detail_error": "The student caption adds a misleading detail that is not a reliable visual cue.",
+            "mixed_error": "The student caption mixes multiple failure types and needs a cleaner target-only anchor.",
             "empty_or_malformed": "The student caption is empty or malformed for reconstruction.",
             "unknown": "The student caption does not give a stable target-specific anchor.",
         }
@@ -243,6 +403,10 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
     ):
         if result.primary_failure_type not in self._referring_failure_type_set():
             result.primary_failure_type = "unknown"
+        secondary_type = self._normalize_teacher_field_text(getattr(result, "secondary_failure_type", "")).lower()
+        if secondary_type in {"none", result.primary_failure_type}:
+            secondary_type = ""
+        result.secondary_failure_type = secondary_type
         if not self._teacher_field_is_effective(result.target_summary, invalid_markers=("",)):
             result.target_summary = self._normalize_teacher_field_text(relation_context.get("gt_summary", ""))
         if not self._teacher_field_is_effective(result.distractor_summary, invalid_markers=("",)):
@@ -260,6 +424,10 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
             )
         if not self._teacher_field_is_effective(result.keepable_phrases):
             result.keepable_phrases = "none"
+        if not self._teacher_field_is_effective(getattr(result, "must_avoid_phrases", "")):
+            result.must_avoid_phrases = (
+                result.distractor_only_evidence if self._teacher_field_is_effective(result.distractor_only_evidence) else "none"
+            )
         if not self._teacher_field_is_effective(result.caption_problem, invalid_markers=("",)):
             base_problem = self._humanize_referring_failure_type(result.primary_failure_type)
             if self._teacher_field_is_effective(result.bad_phrases_in_student):
@@ -291,6 +459,9 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         result.primary_failure_type = self._normalize_teacher_field_text(
             sections.get("PRIMARY_FAILURE_TYPE", "")
         ).lower()
+        result.secondary_failure_type = self._normalize_teacher_field_text(
+            sections.get("SECONDARY_FAILURE_TYPE", "")
+        ).lower()
         result.bad_phrases_in_student = self._clean_teacher_phrase_list_text(
             sections.get("BAD_PHRASES_IN_STUDENT", "")
         )
@@ -299,6 +470,9 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         )
         result.keepable_phrases = self._clean_teacher_phrase_list_text(
             sections.get("KEEPABLE_PHRASES", "")
+        )
+        result.must_avoid_phrases = self._clean_teacher_phrase_list_text(
+            sections.get("MUST_AVOID_PHRASES", "")
         )
         referring_text = self._normalize_teacher_field_text(sections.get("REFERRING", ""))
         result.caption_problem = self._humanize_referring_failure_type(result.primary_failure_type)
@@ -335,8 +509,103 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
             )
         ):
             return False, "referring_fault_report_invalid:no_phrase_level_signal"
+        lower_text = " ".join(
+            part.lower()
+            for part in (
+                result.target_only_evidence,
+                result.missing_phrases_needed,
+                result.bad_phrases_in_student,
+                getattr(result, "must_avoid_phrases", ""),
+                result.distractor_only_evidence,
+            )
+            if part
+        )
+        if result.primary_failure_type == "spatial_direction_error" and not any(
+            token in lower_text for token in self._REFERRING_DIRECTION_WORDS
+        ):
+            return False, "referring_fault_report_invalid:missing_spatial_cue"
+        if result.primary_failure_type == "instance_order_error" and not any(
+            token in lower_text for token in self._REFERRING_ORDINAL_WORDS | {"leftmost", "rightmost", "middle"}
+        ):
+            return False, "referring_fault_report_invalid:missing_ordinal_cue"
+        if result.primary_failure_type == "relation_anchor_error" and not any(
+            phrase in lower_text
+            for phrase in ("next to", "in front of", "on top of", "behind", "beside", "near", "with", "holding", "wearing")
+        ):
+            return False, "referring_fault_report_invalid:missing_relation_anchor"
+        if result.primary_failure_type == "category_too_coarse" and not self._teacher_field_is_effective(
+            result.missing_phrases_needed
+        ):
+            return False, "referring_fault_report_invalid:missing_disambiguating_phrase"
         result.diagnosis_valid = True
         return True, ""
+
+    def _referring_type_specific_style_hint(self, failure_type, *, repair_mode=False):
+        action = "Repair the expression" if repair_mode else "Rewrite the expression"
+        mapping = {
+            "spatial_direction_error": f"{action} with the correct spatial word and keep the noun phrase short.",
+            "instance_order_error": f"{action} with the correct order or extremum cue like leftmost, rightmost, or second.",
+            "relation_anchor_error": f"{action} around the correct nearby anchor object and remove unrelated detail.",
+            "target_attribute_missing": f"{action} by adding one target-only visible attribute and nothing extra.",
+            "distractor_attribute_confusion": f"{action} by dropping distractor attributes and keeping only target-only evidence.",
+            "category_too_coarse": f"{action} with at least one discriminative local cue beyond the coarse category.",
+            "non_discriminative_caption": f"{action} so one target-only cue clearly excludes nearby similar instances.",
+        }
+        return mapping.get(failure_type, f"{action} as one short RefCOCO-style noun phrase with one target-only cue.")
+
+    def _referring_candidate_cue_score(self, caption, pipeline_result):
+        caption_lower = (caption or "").lower()
+        score = 0.0
+        target_text = " ".join(
+            item.lower()
+            for item in (
+                pipeline_result.target_only_evidence,
+                getattr(pipeline_result, "missing_phrases_needed", ""),
+                getattr(pipeline_result, "keepable_phrases", ""),
+            )
+            if self._teacher_field_is_effective(item)
+        )
+        distractor_text = " ".join(
+            item.lower()
+            for item in (
+                pipeline_result.distractor_only_evidence,
+                getattr(pipeline_result, "must_avoid_phrases", ""),
+                getattr(pipeline_result, "bad_phrases_in_student", ""),
+            )
+            if self._teacher_field_is_effective(item)
+        )
+        for token in self._split_teacher_field_list(target_text):
+            if token and token.lower() in caption_lower:
+                score += 0.25
+        for token in self._split_teacher_field_list(distractor_text):
+            if token and token.lower() in caption_lower:
+                score -= 0.3
+        return score
+
+    def _referring_candidate_type_constraint_passed(self, caption, pipeline_result):
+        failure_type = getattr(pipeline_result, "primary_failure_type", "")
+        caption_lower = (caption or "").lower()
+        if failure_type == "spatial_direction_error":
+            return any(token in caption_lower for token in self._REFERRING_DIRECTION_WORDS)
+        if failure_type == "instance_order_error":
+            return any(token in caption_lower for token in (self._REFERRING_ORDINAL_WORDS | {"leftmost", "rightmost", "middle"}))
+        if failure_type == "relation_anchor_error":
+            return any(
+                phrase in caption_lower
+                for phrase in ("next to", "in front of", "on top of", "behind", "beside", "near", "with", "holding", "wearing")
+            )
+        if failure_type in {"target_attribute_missing", "category_too_coarse", "non_discriminative_caption"}:
+            return self._teacher_field_is_effective(getattr(pipeline_result, "missing_phrases_needed", "")) and any(
+                token.lower() in caption_lower
+                for token in self._split_teacher_field_list(getattr(pipeline_result, "missing_phrases_needed", ""))
+            )
+        if failure_type == "distractor_attribute_confusion":
+            must_avoid = getattr(pipeline_result, "must_avoid_phrases", "")
+            return not any(
+                token.lower() in caption_lower
+                for token in self._split_teacher_field_list(must_avoid)
+            )
+        return True
 
     def _evaluate_referring_candidate(
         self,
@@ -378,8 +647,16 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
             "target_only_evidence": pipeline_result.target_only_evidence,
             "distractor_only_evidence": pipeline_result.distractor_only_evidence,
             "style_hint": style_hint,
+            "style_score": self._referring_style_score(candidate_result.detailed_caption),
+            "cue_score": self._referring_candidate_cue_score(candidate_result.detailed_caption, pipeline_result),
+            "cue_passed": bool(self._referring_candidate_type_constraint_passed(candidate_result.detailed_caption, pipeline_result)),
         }
-        candidate["score"] = self._score_teacher_dlc_candidate(candidate)
+        candidate["score"] = (
+            float(candidate["style_score"])
+            + float(candidate["cue_score"])
+            + float(candidate["reconstruct_iou"])
+            - (0.75 if failure_reason else 0.0)
+        )
         return candidate
 
     def _generate_referring_candidate_record(
@@ -415,6 +692,8 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                 "correction_direction": pipeline_result.correction_direction,
                 "reason": pipeline_result.reason,
                 "candidate_style_hint": candidate_style_hint,
+                "secondary_failure_type": getattr(pipeline_result, "secondary_failure_type", ""),
+                "must_avoid_phrases": getattr(pipeline_result, "must_avoid_phrases", ""),
             }
         )
         generation_mode = "referring_repair" if repair_mode else "referring_rewrite_candidate"
@@ -449,6 +728,13 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
             source="referring_candidate_repair" if repair_mode else "referring_candidate",
             style_hint=candidate_style_hint,
         )
+
+    def _teacher_candidate_is_usable(self, candidate):
+        if not super()._teacher_candidate_is_usable(candidate):
+            return False
+        if not self._referring_style_is_usable(candidate.get("caption", "")):
+            return False
+        return bool(candidate.get("cue_passed", True))
 
     def generate_description_with_model(
         self,
@@ -511,28 +797,32 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                 f"Distractor-side leak summary from mask stats: {ref_only_summary}\n"
                 f"Difference focus: {teacher_fields.get('difference_focus', '')}\n"
                 f"Likely drift reason: {teacher_fields.get('likely_drift_reason', '')}\n"
-                "Output exactly these 9 lines and nothing else:\n"
+                "Output exactly these 11 lines and nothing else:\n"
                 "GTMASK_DESC:\n"
                 "REFMASK_DESC:\n"
                 "MISSING_EVIDENCE:\n"
                 "DISTRACTOR_EVIDENCE:\n"
                 "PRIMARY_FAILURE_TYPE:\n"
+                "SECONDARY_FAILURE_TYPE:\n"
                 "BAD_PHRASES_IN_STUDENT:\n"
                 "MISSING_PHRASES_NEEDED:\n"
                 "KEEPABLE_PHRASES:\n"
+                "MUST_AVOID_PHRASES:\n"
                 "REFERRING:\n"
                 "Rules:\n"
-                "- PRIMARY_FAILURE_TYPE must be exactly one of: too_generic, wrong_attribute, wrong_part_focus, wrong_spatial_anchor, distractor_leak, scene_spill, mixed_target, underspecified_local_detail, empty_or_malformed, unknown.\n"
+                "- PRIMARY_FAILURE_TYPE must be exactly one of: spatial_direction_error, instance_order_error, relation_anchor_error, target_attribute_missing, distractor_attribute_confusion, category_too_coarse, over_broad_region_error, non_discriminative_caption, hallucinated_detail_error, mixed_error, empty_or_malformed, unknown.\n"
+                "- SECONDARY_FAILURE_TYPE must be one extra failure type from the same list or none.\n"
                 "- GTMASK_DESC and REFMASK_DESC must describe only visible content, not masks or labels.\n"
                 "- MISSING_EVIDENCE must name what region1 contains that region2 still misses.\n"
                 "- DISTRACTOR_EVIDENCE must name what region2 wrongly includes.\n"
                 "- BAD_PHRASES_IN_STUDENT must be a short comma-separated phrase list or unknown.\n"
                 "- MISSING_PHRASES_NEEDED must be a short comma-separated phrase list or none.\n"
                 "- KEEPABLE_PHRASES must be a short comma-separated phrase list or none.\n"
+                "- MUST_AVOID_PHRASES must be a short comma-separated phrase list or none.\n"
                 "- REFERRING must be one short target-specific referring expression for region1 only, ideally 2 to 6 words as a compact noun phrase.\n"
                 "- REFERRING should avoid full-sentence style unless a tiny relational phrase is absolutely necessary.\n"
                 "- REFERRING must not start with 'the target', 'the region', 'region1', or any explanation template.\n"
-                "- Do not output markdown, bullets, JSON, [SEG], or any labels beyond the 9 required field names."
+                "- Do not output markdown, bullets, JSON, [SEG], or any labels beyond the 11 required field names."
             )
         if generation_mode in {"referring_rewrite_candidate", "referring_repair"}:
             clean_question = self._strip_image_placeholder(self._referring_prompt_text(student_question))
@@ -549,9 +839,11 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                 f"Missing target-side evidence: {teacher_fields.get('target_only_evidence', '')}\n"
                 f"Distractor-side leak evidence: {teacher_fields.get('distractor_only_evidence', '')}\n"
                 f"PRIMARY_FAILURE_TYPE: {teacher_fields.get('primary_failure_type', '')}\n"
+                f"SECONDARY_FAILURE_TYPE: {teacher_fields.get('secondary_failure_type', '')}\n"
                 f"BAD_PHRASES_IN_STUDENT: {teacher_fields.get('bad_phrases_in_student', '')}\n"
                 f"MISSING_PHRASES_NEEDED: {teacher_fields.get('missing_phrases_needed', '')}\n"
                 f"KEEPABLE_PHRASES: {teacher_fields.get('keepable_phrases', '')}\n"
+                f"MUST_AVOID_PHRASES: {teacher_fields.get('must_avoid_phrases', '')}\n"
                 f"CAPTION_PROBLEM: {teacher_fields.get('caption_problem', '')}\n"
                 f"CORRECTION_DIRECTION: {teacher_fields.get('correction_direction', '')}\n"
                 f"REASON: {teacher_fields.get('reason', '')}\n"
@@ -599,6 +891,251 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
             teacher_fields=teacher_fields,
         )
         return self._rewrite_caption_prompt_for_referring(prompt)
+
+    def _metric_tensor_like(self, value, reference):
+        return self._metric_tensor(float(value), reference.dtype)
+
+    def _build_grounding_pixel_values(self, image):
+        g_image = np.array(image)
+        g_image = self.student_model.extra_image_processor.apply_image(g_image)
+        g_pixel = torch.from_numpy(g_image).permute(2, 0, 1).contiguous().to(self.student_model.torch_dtype)
+        return torch.stack([
+            self.student_model.grounding_encoder.preprocess_image(g_pixel)
+        ]).to(self.student_model.torch_dtype)
+
+    def _encode_completion_from_raw_prediction(self, raw_prediction):
+        text = "" if raw_prediction is None else str(raw_prediction).strip()
+        if not text:
+            return torch.empty((1, 0), dtype=torch.long, device=self.device)
+        ids = self.tokenizer.encode(text, add_special_tokens=False)
+        if not ids:
+            return torch.empty((1, 0), dtype=torch.long, device=self.device)
+        return torch.tensor(ids, dtype=torch.long, device=self.device).unsqueeze(0)
+
+    def _compute_referring_mask_losses_from_caption(
+        self,
+        *,
+        image,
+        caption,
+        gt_mask_np,
+        confuser_candidate_masks=None,
+    ):
+        reconstruct_question = self._resolve_reconstruct_questions(caption)[0]
+        with torch.no_grad():
+            reconstruction = self.reconstruct_mask(
+                image=image,
+                caption=caption,
+                description_status="ok",
+                gt_mask=gt_mask_np,
+            )
+        raw_prediction = reconstruction.raw_prediction if reconstruction is not None else ""
+        completion_ids = self._encode_completion_from_raw_prediction(raw_prediction)
+        if completion_ids.shape[1] == 0:
+            return None
+        model_outputs = self._forward_sequence_multi_sample_with_model(
+            self.student_model,
+            [
+                {
+                    "image": image,
+                    "prompt_masks": None,
+                    "prompt_text": reconstruct_question,
+                    "completion_ids": completion_ids,
+                    "apply_mask_focus": False,
+                }
+            ],
+            output_hidden_states=True,
+        )
+        completion_hidden_states = model_outputs.get("completion_hidden_states")
+        if completion_hidden_states is None or completion_hidden_states.shape[1] == 0:
+            return None
+        seg_mask = completion_ids[0] == self.student_model.seg_token_idx
+        if int(seg_mask.sum().item()) == 0:
+            return None
+        seg_hidden_states = completion_hidden_states[0][seg_mask]
+        all_seg_hidden_states = self.student_model.text_hidden_fcs(seg_hidden_states)
+        if all_seg_hidden_states.ndim == 1:
+            all_seg_hidden_states = all_seg_hidden_states.unsqueeze(0)
+        g_pixel_values = self._build_grounding_pixel_values(image)
+        sam_states = self.student_model.grounding_encoder.get_sam2_embeddings(g_pixel_values)
+        mask_logits = self.student_model.grounding_encoder.language_embd_inference(
+            sam_states,
+            [all_seg_hidden_states[0].unsqueeze(0)],
+        )
+        mask_logits = F.interpolate(
+            mask_logits,
+            size=gt_mask_np.shape,
+            mode="bilinear",
+            align_corners=False,
+        )[:, 0]
+        gt_mask_t = torch.from_numpy(gt_mask_np.astype(np.float32)).to(device=mask_logits.device, dtype=mask_logits.dtype).unsqueeze(0)
+        bce = F.binary_cross_entropy_with_logits(mask_logits, gt_mask_t)
+        probs = torch.sigmoid(mask_logits)
+        intersection = (probs * gt_mask_t).sum(dim=(-2, -1))
+        denom = probs.sum(dim=(-2, -1)) + gt_mask_t.sum(dim=(-2, -1))
+        dice = 1.0 - ((2.0 * intersection + 1.0) / (denom + 1.0))
+        dice = dice.mean()
+        confuser_penalty = mask_logits.new_zeros(())
+        if confuser_candidate_masks:
+            scored_masks = sorted(
+                confuser_candidate_masks,
+                key=lambda candidate_mask: self._score_confuser_candidate(gt_mask_np, candidate_mask),
+                reverse=True,
+            )[:3]
+            penalty_terms = []
+            for candidate_mask in scored_masks:
+                prepared = self._prepare_mask_like_gt(gt_mask_np, candidate_mask)
+                confuser_t = torch.from_numpy(prepared.astype(np.float32)).to(device=mask_logits.device, dtype=mask_logits.dtype)
+                confuser_overlap = (probs[0] * confuser_t).sum() / confuser_t.sum().clamp_min(1.0)
+                penalty_terms.append(confuser_overlap)
+            if penalty_terms:
+                confuser_penalty = torch.stack(penalty_terms).mean()
+        return {
+            "bce": bce,
+            "dice": dice,
+            "loss": bce + dice,
+            "confuser_penalty": confuser_penalty,
+            "reconstruction": reconstruction,
+        }
+
+    def _compute_referring_aux_losses(self, data):
+        zero = self._zero_scalar(requires_grad=False)
+        student_losses = []
+        teacher_losses = []
+        confuser_penalties = []
+        hard_sample_count = 0
+        spatial_count = 0
+        ordinal_count = 0
+        relation_count = 0
+        same_category_like_count = 0
+        last_failure_type = "none"
+        last_secondary_type = "none"
+        last_cue_passed = False
+        routes = data.get("routes") or []
+        for idx, (image, prompt_masks, student_question, gt_mask, confuser_candidate_masks) in enumerate(
+            zip(
+                data["images"],
+                data["prompt_masks"],
+                data["student_questions"],
+                data["gt_masks"],
+                data["confuser_candidate_masks"],
+            )
+        ):
+            gt_mask_np = self._to_numpy_mask(gt_mask)
+            with torch.no_grad():
+                description = self.generate_description(image=image, mask_prompts=prompt_masks, student_question=student_question)
+            difficulty = self._analyze_referring_difficulty(description.clean_caption)
+            hard_sample_count += int(difficulty["hard_sample"])
+            spatial_count += int(difficulty["spatial_required"])
+            ordinal_count += int(difficulty["ordinal_required"])
+            relation_count += int(difficulty["relation_required"])
+            same_category_like_count += int(difficulty["same_category_multi_instance_like"])
+            if description.status == "ok" and self._caption_token_count(description.clean_caption) >= 2:
+                student_mask_result = self._compute_referring_mask_losses_from_caption(
+                    image=image,
+                    caption=description.clean_caption,
+                    gt_mask_np=gt_mask_np,
+                    confuser_candidate_masks=confuser_candidate_masks,
+                )
+                if student_mask_result is not None:
+                    reconstruction = student_mask_result["reconstruction"]
+                    pred_mask = None if reconstruction is None else reconstruction.pred_mask
+                    iou = self._compute_iou(gt_mask_np, pred_mask) if pred_mask is not None else 0.0
+                    if iou >= self.referring_direct_mask_loss_min_iou_gate:
+                        student_losses.append(student_mask_result["loss"])
+                        confuser_penalties.append(student_mask_result["confuser_penalty"])
+                else:
+                    reconstruction = self._invalid_reconstruction_placeholder("referring_direct_mask_unavailable")
+            else:
+                reconstruction = self._invalid_reconstruction_placeholder("referring_caption_invalid")
+            pred_mask = None if reconstruction is None else reconstruction.pred_mask
+            iou = self._compute_iou(gt_mask_np, pred_mask) if pred_mask is not None else 0.0
+            route_from_manifest = routes[idx] if idx < len(routes) else None
+            online_route = self._route_from_iou(iou)
+            loss_family = self._resolve_loss_family(None, route_from_manifest=route_from_manifest, online_route=online_route)
+            with torch.no_grad():
+                teacher_analysis = self._attempt_teacher_regenerate_analysis(
+                    image=image,
+                    gt_mask_np=gt_mask_np,
+                    ref_mask_np=self._zero_ref_mask_like(gt_mask_np) if pred_mask is None else self._to_numpy_mask(pred_mask),
+                    student_question=student_question,
+                    description=description,
+                    reconstruction=reconstruction,
+                    iou=iou,
+                    allow_teacher_ce=True,
+                )
+            teacher_regenerate = teacher_analysis.get("teacher_regenerate")
+            if teacher_regenerate is not None:
+                last_failure_type = getattr(teacher_regenerate, "primary_failure_type", "none") or "none"
+                last_secondary_type = getattr(teacher_regenerate, "secondary_failure_type", "none") or "none"
+                last_cue_passed = bool(getattr(teacher_regenerate, "cue_passed", False))
+            if (
+                loss_family == "teacher_regenerate"
+                and teacher_analysis.get("teacher_reconstruct_ok")
+                and teacher_analysis.get("teacher_gate_passed")
+                and teacher_regenerate is not None
+                and self._teacher_field_is_effective(teacher_regenerate.detailed_caption, invalid_markers=("",))
+            ):
+                teacher_mask_result = self._compute_referring_mask_losses_from_caption(
+                    image=image,
+                    caption=teacher_regenerate.detailed_caption,
+                    gt_mask_np=gt_mask_np,
+                    confuser_candidate_masks=confuser_candidate_masks,
+                )
+                if teacher_mask_result is not None:
+                    teacher_losses.append(teacher_mask_result["loss"])
+        batch_count = max(len(data["images"]), 1)
+        student_loss = torch.stack(student_losses).mean() if student_losses else zero
+        teacher_loss = torch.stack(teacher_losses).mean() if teacher_losses else zero
+        confuser_penalty = torch.stack(confuser_penalties).mean() if confuser_penalties else zero
+        return {
+            "student_loss": student_loss,
+            "teacher_loss": teacher_loss,
+            "confuser_penalty": confuser_penalty,
+            "hard_sample_rate": hard_sample_count / batch_count,
+            "spatial_rate": spatial_count / batch_count,
+            "ordinal_rate": ordinal_count / batch_count,
+            "relation_rate": relation_count / batch_count,
+            "same_category_like_rate": same_category_like_count / batch_count,
+            "last_failure_type": last_failure_type,
+            "last_secondary_type": last_secondary_type,
+            "last_cue_passed": last_cue_passed,
+        }
+
+    def forward(self, data, data_samples=None, mode="loss"):
+        metrics = super().forward(data, data_samples=data_samples, mode=mode)
+        if (
+            mode != "loss"
+            or not self.training
+            or not self.enable_referring_direct_mask_loss
+            or not isinstance(metrics, dict)
+            or "loss_opsd_total" not in metrics
+        ):
+            return metrics
+        aux = self._compute_referring_aux_losses(data)
+        total_aux = (
+            aux["student_loss"] * self.referring_direct_mask_loss_weight
+            + aux["teacher_loss"] * self.referring_teacher_direct_mask_loss_weight
+            + aux["confuser_penalty"] * self.referring_confuser_separation_loss_weight
+        )
+        metrics["loss_opsd_total"] = metrics["loss_opsd_total"] + total_aux
+        metrics["referring_direct_mask_loss"] = aux["student_loss"].detach()
+        metrics["referring_teacher_direct_mask_loss"] = aux["teacher_loss"].detach()
+        metrics["referring_confuser_separation_loss"] = aux["confuser_penalty"].detach()
+        metrics["referring_hard_sample_rate"] = self._metric_tensor_like(aux["hard_sample_rate"], metrics["loss_opsd_total"])
+        metrics["referring_spatial_sample_rate"] = self._metric_tensor_like(aux["spatial_rate"], metrics["loss_opsd_total"])
+        metrics["referring_ordinal_sample_rate"] = self._metric_tensor_like(aux["ordinal_rate"], metrics["loss_opsd_total"])
+        metrics["referring_relation_sample_rate"] = self._metric_tensor_like(aux["relation_rate"], metrics["loss_opsd_total"])
+        metrics["referring_same_category_like_rate"] = self._metric_tensor_like(
+            aux["same_category_like_rate"], metrics["loss_opsd_total"]
+        )
+        print(
+            "[Sa2VA_REFERRING_V3] "
+            f"teacher_primary_failure_type={aux['last_failure_type']} "
+            f"teacher_secondary_failure_type={aux['last_secondary_type']} "
+            f"teacher_cue_passed={int(aux['last_cue_passed'])}",
+            flush=True,
+        )
+        return metrics
 
     def run_teacher_regenerate_pipeline(
         self,
@@ -733,19 +1270,23 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
             )
 
         if pipeline_result.diagnosis_valid or self._teacher_has_minimal_diagnosis_signal(pipeline_result):
+            primary_hint = self._referring_type_specific_style_hint(
+                getattr(pipeline_result, "primary_failure_type", ""),
+                repair_mode=False,
+            )
             candidate_specs = (
                 {
-                    "candidate_style_hint": "Prefer the strongest missing target-side cue as the main anchor.",
+                    "candidate_style_hint": primary_hint,
                     "do_sample": False,
                 },
                 {
-                    "candidate_style_hint": "Keep the expression very short but preserve one local distinguishing cue.",
+                    "candidate_style_hint": f"{primary_hint} Keep it to 2 to 5 words if possible.",
                     "do_sample": True,
                     "temperature": 0.35,
                     "top_p": 0.9,
                 },
                 {
-                    "candidate_style_hint": "Avoid distractor-compatible wording and keep only the most target-specific phrase.",
+                    "candidate_style_hint": f"{primary_hint} Remove every distractor-compatible phrase.",
                     "do_sample": True,
                     "temperature": 0.55,
                     "top_p": 0.92,
@@ -842,8 +1383,11 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
             and float(teacher_iou_plain) > 0.0
             and not pipeline_result.detailed_failure_reason
         )
+        pipeline_result.cue_passed = bool(
+            selected_candidate is not None and bool(selected_candidate.get("cue_passed", False))
+        )
         pipeline_result.verification_iou = float(teacher_iou_plain)
-        pipeline_result.gate_passed = (
+        iou_gate_passed = (
             bool(teacher_reconstruct_ok)
             if caption_mode_failure
             else (
@@ -852,6 +1396,7 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                 else False
             )
         )
+        pipeline_result.gate_passed = bool(iou_gate_passed and pipeline_result.cue_passed)
 
         if (pipeline_result.diagnosis_valid or self._teacher_has_minimal_diagnosis_signal(pipeline_result)) and not pipeline_result.gate_passed:
             repair_candidate = self._generate_referring_candidate_record(
@@ -866,7 +1411,10 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                 teacher_prompt_masks=teacher_prompt_masks,
                 teacher_fields=teacher_fields,
                 pipeline_result=pipeline_result,
-                candidate_style_hint="Use only one target-only cue and remove every distractor-compatible phrase.",
+                candidate_style_hint=self._referring_type_specific_style_hint(
+                    getattr(pipeline_result, "primary_failure_type", ""),
+                    repair_mode=True,
+                ),
                 generation_kwargs={"do_sample": False},
                 repair_mode=True,
             )
@@ -882,7 +1430,8 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                 teacher_reconstruct_ok = bool(
                     pipeline_result.detailed_status == "ok" and not pipeline_result.detailed_failure_reason and repair_iou > 0.0
                 )
-                pipeline_result.gate_passed = (
+                pipeline_result.cue_passed = bool(repair_candidate.get("cue_passed", False))
+                iou_gate_passed = (
                     bool(teacher_reconstruct_ok)
                     if caption_mode_failure
                     else (
@@ -891,6 +1440,7 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                         else False
                     )
                 )
+                pipeline_result.gate_passed = bool(iou_gate_passed and pipeline_result.cue_passed)
             pipeline_result.stop_stage = "repair"
 
         if not pipeline_result.gate_passed:
@@ -942,6 +1492,11 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                         else False
                     )
                 )
+                fallback_result.cue_passed = self._referring_candidate_type_constraint_passed(
+                    fallback_result.detailed_caption,
+                    fallback_result,
+                )
+                fallback_result.gate_passed = bool(fallback_result.gate_passed and fallback_result.cue_passed)
                 fallback_result.stop_stage = "passed" if fallback_result.gate_passed else "gate"
                 if fallback_result.gate_passed:
                     fallback_result.teacher_selected_caption_source = "single_stage_fallback"

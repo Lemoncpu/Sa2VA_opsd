@@ -14,6 +14,14 @@ model["description_max_new_tokens"] = 24
 model["grpo_sample_max_new_tokens"] = 24
 model["min_caption_tokens"] = 2
 model["caption_low_density_length_threshold"] = 12
+model["referring_hard_loss_weight_base"] = 1.2
+model["referring_hard_loss_weight_compound"] = 1.4
+model["referring_hard_loss_weight_max"] = 1.55
+model["enable_referring_direct_mask_loss"] = True
+model["referring_direct_mask_loss_weight"] = 0.7
+model["referring_teacher_direct_mask_loss_weight"] = 0.35
+model["referring_confuser_separation_loss_weight"] = 0.15
+model["referring_direct_mask_loss_min_iou_gate"] = 0.0
 
 train_dataset["student_question"] = DEFAULT_MASK_TO_REFERRING_QUESTION
 train_dataset["route_manifest_path"] = route_manifest_path if use_manifest_routes else None
@@ -22,4 +30,3 @@ train_dataset["sam_confuser_pool_dir"] = sam_confuser_pool_dir
 train_dataloader["dataset"]["student_question"] = DEFAULT_MASK_TO_REFERRING_QUESTION
 train_dataloader["dataset"]["route_manifest_path"] = route_manifest_path if use_manifest_routes else None
 train_dataloader["dataset"]["sam_confuser_pool_dir"] = sam_confuser_pool_dir
-

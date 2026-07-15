@@ -2246,3 +2246,44 @@
   - restricted regenerate CE counters and suppression accounting to the actual regenerate loss branch
   - switched regenerate entry admission from raw `teacher_gate_passed` to route-aware `teacher_ce_eligible`
   - extended DDP debug sample logs with `teacher_ce_eligible`
+
+## 2026-07-15 Referring Branch Tightened To RefCOCO Style With Type-Aware Teacher And Direct Mask Aux Loss
+
+### Problem
+- The short referring RefCOCO branch could already run, but it still mixed several weak behaviors:
+  - student and teacher outputs sometimes drifted toward longer caption-like phrasing instead of compact RefCOCO-style noun phrases
+  - hard referring cases such as spatial, ordinal, and relation-driven expressions were only weakly emphasized
+  - referring teacher diagnosis still used a coarse failure taxonomy that was not precise enough for the frequent spatial / instance-order mistakes
+  - training only used caption-side supervision plus reconstruction gating, so the referring branch had no explicit auxiliary loss that directly pulled caption-conditioned mask prediction toward the GT mask
+
+### Root Cause Notes
+- `projects/sa2va/models/sa2va_opsd_referring_v3.py` already overrode prompts and teacher flow, but the style validator, candidate rerank, and hard-sample weighting were still relatively shallow.
+- The existing fault-report schema used earlier coarse labels such as `too_generic` and `wrong_spatial_anchor`, which did not cleanly separate direction errors, order errors, relation-anchor errors, and coarse-category failures.
+- The main OPSD training loop still treated reconstruction mostly as a verifier signal, not an auxiliary differentiable objective for the referring branch.
+
+### Chosen Fix Direction
+- Keep all changes isolated to the RefCOCO referring branch:
+  - tighten the referring prompt and style heuristics toward short RefCOCO-style noun phrases
+  - replace the referring teacher taxonomy with a more specific finite error set
+  - make rewrite / repair prompts conditional on the diagnosed failure type
+  - add a referring-only auxiliary mask objective by reusing the generated reconstruction text, running a differentiable caption-conditioned SAM2 mask path, and supervising it with BCE + Dice plus a light confuser overlap penalty
+- Do not modify the DLC branch or the shared OPSD base training logic.
+
+### Rejected Direction
+- Do not introduce a new decoder or a second segmentation head just for the referring branch.
+- Do not broaden these changes to `Sa2VAOPSDModelV2/V3`, because the user explicitly wanted the DLC chain to remain untouched.
+
+### Implemented Changes
+- Updated `projects/sa2va/datasets/common.py`:
+  - tightened `DEFAULT_MASK_TO_REFERRING_QUESTION` toward compact RefCOCO-style noun phrases and explicitly discouraged full-sentence / template outputs
+- Updated `projects/sa2va/models/sa2va_opsd_referring_v3.py`:
+  - added stricter referring style validation and scoring
+  - expanded hard-sample analysis into explicit spatial / ordinal / relation / bodypart / same-category-like tags
+  - changed referring sample loss weighting to a tiered scheme for harder expressions
+  - replaced the referring failure taxonomy with more RefCOCO-specific error types
+  - expanded the fault-report schema with `SECONDARY_FAILURE_TYPE` and `MUST_AVOID_PHRASES`
+  - added type-aware candidate prompting, cue-aware candidate scoring, and cue-aware gate checks
+  - added a referring-only auxiliary mask loss path using differentiable caption-conditioned mask logits with BCE + Dice and a light confuser overlap penalty
+  - surfaced referring-specific training metrics and debug prints for hard-sample rates and latest teacher failure type / cue pass state
+- Updated `projects/sa2va/configs/sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3_referring.py` and its online variant:
+  - added referring-only weights and switches for hard-sample weighting and direct mask auxiliary losses
