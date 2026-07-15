@@ -2287,3 +2287,34 @@
   - surfaced referring-specific training metrics and debug prints for hard-sample rates and latest teacher failure type / cue pass state
 - Updated `projects/sa2va/configs/sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3_referring.py` and its online variant:
   - added referring-only weights and switches for hard-sample weighting and direct mask auxiliary losses
+
+## 2026-07-15 Referring Teacher Fallback Was Still Emitting DLC-Style Outputs
+
+### Problem
+- In the short-referring RefCOCO branch, the student caption stayed in compact referring style, but teacher diagnosis failures often ended up with long DLC-like teacher captions.
+- Logs showed the common failure pattern:
+  - structured diagnosis became invalid
+  - no valid referring candidate was selected
+  - single-stage fallback then emitted `DLC:`-style long captions
+
+### Root Cause Notes
+- `projects/sa2va/models/sa2va_opsd_referring_v3.py` had already rewritten the single-stage fallback prompt toward `REFERRING:`, but the inherited parser path still primarily extracted `DLC`, so fallback decoding remained caption-oriented.
+- The referring branch only retried the same strong structured schema, which was brittle for weaker 4B teacher generations.
+- Final fallback acceptance did not enforce one more hard short-referring style gate after clipping, so long or sentence-like fallback captions could still survive into reconstruction and logs.
+
+### Chosen Fix Direction
+- Keep the DLC base branch unchanged and only harden the referring subclass:
+  - change the referring fallback parse path to prefer `REFERRING:`
+  - add a weaker 5-field structured diagnosis retry before single-stage fallback
+  - force candidate and fallback teacher captions through a final short-referring normalization plus style gate
+
+### Rejected Direction
+- Do not weaken the shared DLC fallback implementation in `Sa2VAOPSDModelV2/V3`, because that would risk breaking the DLC training branch the user already has running.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_referring_v3.py`:
+  - added a light 5-field referring fault-report schema validator
+  - changed structured diagnosis retry from the same heavy schema to `referring_fault_report_rewrite_light`
+  - overrode referring single-stage fallback parsing so it extracts `REFERRING:` first, only falls back to `DLC:` second, and hard-clips the final text into short referring style
+  - extended hard post-cleaning to strip lingering `DLC:` prefixes
+  - added a final fallback style gate so unusable long/sentence-like captions fail locally instead of silently re-entering the referring pipeline

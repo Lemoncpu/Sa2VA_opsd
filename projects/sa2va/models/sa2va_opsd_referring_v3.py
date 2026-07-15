@@ -184,6 +184,30 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         caption = self._canonicalize_referring_expression(caption)
         return re.sub(r"\s+", " ", caption).strip(" ,.")
 
+    def _force_short_referring_expression(self, caption):
+        caption = self._normalize_referring_expression(caption)
+        caption = re.sub(r"^(?:referring|caption|description|dlc)\s*:\s*", "", caption, flags=re.IGNORECASE)
+        caption = re.sub(
+            r"\bstanding on the (left|right|top|bottom) side of the image\b",
+            r"\1",
+            caption,
+            flags=re.IGNORECASE,
+        )
+        caption = re.sub(
+            r"\bon the (left|right|top|bottom) side of the image\b",
+            r"\1",
+            caption,
+            flags=re.IGNORECASE,
+        )
+        caption = re.sub(r"\b(?:in|on|at)\s+the image\b", "", caption, flags=re.IGNORECASE)
+        caption = re.sub(r"\bof the image\b", "", caption, flags=re.IGNORECASE)
+        caption = re.sub(r"\bthat is\b.*$", "", caption, flags=re.IGNORECASE)
+        caption = re.sub(r"[,.].*$", "", caption).strip(" ,.")
+        tokens = self._tokenize_referring_expression(caption)
+        if len(tokens) > 9:
+            caption = " ".join(tokens[:9])
+        return re.sub(r"\s+", " ", caption).strip(" ,.")
+
     def _rewrite_caption_prompt_for_referring(self, prompt):
         replacements = (
             ("one natural and complete detailed localized caption", "one short, concrete, visually grounded referring expression"),
@@ -211,7 +235,14 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
 
     def _clean_teacher_dlc_caption_text(self, caption):
         normalized = super()._clean_teacher_dlc_caption_text(caption)
-        return self._normalize_referring_expression(normalized)
+        return self._force_short_referring_expression(normalized)
+
+    def _materialize_teacher_caption_result(self, result, caption, source):
+        return super()._materialize_teacher_caption_result(
+            result,
+            self._force_short_referring_expression(caption),
+            source,
+        )
 
     def _is_caption_content_sufficient(self, caption):
         if not self._referring_style_is_usable(caption):
@@ -323,6 +354,16 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
             "BAD_PHRASES_IN_STUDENT",
             "MISSING_PHRASES_NEEDED",
             "KEEPABLE_PHRASES",
+            "MUST_AVOID_PHRASES",
+            "REFERRING",
+        )
+
+    @staticmethod
+    def _referring_light_fault_report_labels():
+        return (
+            "PRIMARY_FAILURE_TYPE",
+            "BAD_PHRASES_IN_STUDENT",
+            "MISSING_PHRASES_NEEDED",
             "MUST_AVOID_PHRASES",
             "REFERRING",
         )
@@ -487,6 +528,53 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                 "structured_referring_direct",
             )
         return result
+
+    def _parse_referring_light_fault_report(self, raw_prediction, base_result=None):
+        result = base_result or self._build_empty_teacher_regenerate_pipeline_result()
+        text = "" if raw_prediction is None else str(raw_prediction)
+        result.structured_diagnosis_raw = text
+        result.diagnosis_raw = text
+        sections = self._parse_teacher_labeled_sections(text, self._referring_light_fault_report_labels())
+        result.primary_failure_type = self._normalize_teacher_field_text(
+            sections.get("PRIMARY_FAILURE_TYPE", "")
+        ).lower()
+        result.bad_phrases_in_student = self._clean_teacher_phrase_list_text(
+            sections.get("BAD_PHRASES_IN_STUDENT", "")
+        )
+        result.missing_phrases_needed = self._clean_teacher_phrase_list_text(
+            sections.get("MISSING_PHRASES_NEEDED", "")
+        )
+        result.must_avoid_phrases = self._clean_teacher_phrase_list_text(
+            sections.get("MUST_AVOID_PHRASES", "")
+        )
+        result.keepable_phrases = "none"
+        referring_text = self._normalize_teacher_field_text(sections.get("REFERRING", ""))
+        result.caption_problem = self._humanize_referring_failure_type(result.primary_failure_type)
+        result.correction_direction = ""
+        result.reason = ""
+        if referring_text:
+            result = self._materialize_teacher_caption_result(
+                result,
+                referring_text,
+                "structured_referring_light_direct",
+            )
+        return result
+
+    def validate_referring_light_fault_report(self, result):
+        if result.primary_failure_type not in self._referring_failure_type_set():
+            return False, "referring_light_fault_report_invalid:bad_primary_type"
+        if not any(
+            self._teacher_field_is_effective(value, invalid_markers=("",))
+            for value in (
+                result.bad_phrases_in_student,
+                result.missing_phrases_needed,
+                getattr(result, "must_avoid_phrases", ""),
+                result.detailed_caption,
+            )
+        ):
+            return False, "referring_light_fault_report_invalid:no_phrase_signal"
+        result.diagnosis_valid = True
+        return True, ""
 
     def validate_referring_fault_report(self, result):
         if result.primary_failure_type not in self._referring_failure_type_set():
@@ -824,6 +912,33 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                 "- REFERRING must not start with 'the target', 'the region', 'region1', or any explanation template.\n"
                 "- Do not output markdown, bullets, JSON, [SEG], or any labels beyond the 11 required field names."
             )
+        if generation_mode == "referring_fault_report_rewrite_light":
+            clean_question = self._strip_image_placeholder(self._referring_prompt_text(student_question))
+            student_caption = self._normalize_teacher_field_text(student_caption)
+            return (
+                "<image>\n"
+                "You are supervising a short referring expression reconstruction task.\n"
+                "Student prompt: {question}\n"
+                "Student referring expression: {caption}\n"
+                "Target-only evidence: {target_only}\n"
+                "Distractor-only evidence: {distractor_only}\n"
+                "Output exactly these 5 lines and nothing else:\n"
+                "PRIMARY_FAILURE_TYPE:\n"
+                "BAD_PHRASES_IN_STUDENT:\n"
+                "MISSING_PHRASES_NEEDED:\n"
+                "MUST_AVOID_PHRASES:\n"
+                "REFERRING:\n"
+                "Rules:\n"
+                "- PRIMARY_FAILURE_TYPE must be exactly one of: spatial_direction_error, instance_order_error, relation_anchor_error, target_attribute_missing, distractor_attribute_confusion, category_too_coarse, over_broad_region_error, non_discriminative_caption, hallucinated_detail_error, mixed_error, empty_or_malformed, unknown.\n"
+                "- Each phrase field must be a short comma-separated phrase list or none.\n"
+                "- REFERRING must be one short target-specific noun phrase with 2 to 6 words when possible.\n"
+                "- Do not write a sentence, explanation, markdown, bullets, JSON, [SEG], or extra labels."
+            ).format(
+                question=clean_question,
+                caption=student_caption,
+                target_only=teacher_fields.get("target_only_evidence", ""),
+                distractor_only=teacher_fields.get("distractor_only_evidence", ""),
+            )
         if generation_mode in {"referring_rewrite_candidate", "referring_repair"}:
             clean_question = self._strip_image_placeholder(self._referring_prompt_text(student_question))
             student_caption = self._normalize_teacher_field_text(student_caption)
@@ -890,7 +1005,119 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
             iou=iou,
             teacher_fields=teacher_fields,
         )
-        return self._rewrite_caption_prompt_for_referring(prompt)
+        prompt = self._rewrite_caption_prompt_for_referring(prompt)
+        prompt = prompt.replace(
+            "Your answer must start immediately with 'DLC:' on the first line.\n",
+            "Your answer must start immediately with 'REFERRING:' on the first line.\n",
+        )
+        prompt = prompt.replace(
+            "DLC: <one natural and complete detailed localized caption>\n",
+            "REFERRING: <one short target-specific referring expression>\n",
+        )
+        prompt = prompt.replace(
+            "Write only one corrected detailed localized caption for region1.\n",
+            "Write only one corrected short referring expression for region1.\n",
+        )
+        return prompt
+
+    def generate_teacher_regenerate_single_stage(
+        self,
+        *,
+        image,
+        teacher_prompt_masks,
+        student_question,
+        student_caption,
+        description_status,
+        reconstruction,
+        iou,
+        gt_mask,
+        ref_mask,
+        teacher_fields,
+        pipeline_result,
+    ):
+        teacher_fields = dict(teacher_fields)
+        teacher_fields.update(
+            {
+                "target_summary": pipeline_result.target_summary,
+                "distractor_summary": pipeline_result.distractor_summary,
+                "shared_evidence": pipeline_result.shared_evidence,
+                "target_only_evidence": pipeline_result.target_only_evidence,
+                "distractor_only_evidence": pipeline_result.distractor_only_evidence,
+                "difference_focus": pipeline_result.difference_focus,
+                "target_localization_hint": pipeline_result.target_localization_hint,
+                "distractor_localization_hint": pipeline_result.distractor_localization_hint,
+                "likely_drift_reason": pipeline_result.likely_drift_reason,
+            }
+        )
+        prompt = self.build_teacher_regenerate_single_prompt(
+            student_question=student_question,
+            student_caption=student_caption,
+            description_status=description_status,
+            reconstruction=reconstruction,
+            iou=iou,
+            teacher_fields=teacher_fields,
+        )
+        teacher_fields["teacher_single_stage_prompt"] = prompt
+        raw_prediction = self._predict_teacher_privileged_text(
+            image=image,
+            teacher_prompt_masks=teacher_prompt_masks,
+            teacher_prompt=prompt,
+        )
+        pipeline_result.single_stage_raw = "" if raw_prediction is None else str(raw_prediction)
+        pipeline_result.dlc_raw = pipeline_result.single_stage_raw
+        pipeline_result.verification_raw = pipeline_result.single_stage_raw
+        pipeline_result.problem_raw = pipeline_result.single_stage_raw
+        pipeline_result.direction_raw = pipeline_result.single_stage_raw
+        pipeline_result.reason_raw = pipeline_result.single_stage_raw
+        pipeline_result.caption_problem = self._normalize_teacher_field_text(
+            self._extract_labeled_teacher_text(raw_prediction, "CAPTION_PROBLEM")
+        )
+        pipeline_result.correction_direction = self._normalize_teacher_field_text(
+            self._extract_labeled_teacher_text(raw_prediction, "CORRECTION_DIRECTION")
+        )
+        pipeline_result.reason = self._normalize_teacher_field_text(
+            self._extract_labeled_teacher_text(raw_prediction, "REASON")
+        )
+        pipeline_result.problem_valid = bool(pipeline_result.caption_problem)
+        pipeline_result.direction_valid = bool(pipeline_result.correction_direction)
+        pipeline_result.reason_valid = bool(pipeline_result.reason)
+        pipeline_result.diagnosis_valid = bool(
+            pipeline_result.problem_valid or pipeline_result.direction_valid or pipeline_result.reason_valid
+        )
+        pipeline_result.reason_is_coarse = bool(
+            pipeline_result.reason and self._teacher_reason_is_coarse(pipeline_result.reason)
+        )
+
+        detailed_caption_raw = self._extract_labeled_teacher_text(raw_prediction, "REFERRING")
+        if not detailed_caption_raw:
+            detailed_caption_raw = self._extract_labeled_teacher_text(raw_prediction, "DLC")
+        if not detailed_caption_raw:
+            fallback_caption = self._clean_caption_text(raw_prediction)
+            fallback_status = self._infer_description_status(fallback_caption)
+            if fallback_status == "ok":
+                detailed_caption_raw = fallback_caption
+        detailed_caption = self._force_short_referring_expression(detailed_caption_raw)
+        detailed_completion_ids = self._encode_completion_from_caption(detailed_caption)
+        detailed_caption, detailed_completion_ids, detailed_was_truncated = self._truncate_caption_completion(
+            detailed_caption,
+            detailed_completion_ids,
+            max_tokens=self.description_max_new_tokens,
+        )
+        detailed_caption = self._force_short_referring_expression(detailed_caption)
+        detailed_status = self._infer_description_status(detailed_caption)
+        if detailed_status == "ok" and (
+            not self._is_caption_content_sufficient(detailed_caption)
+            or not self._referring_style_is_usable(detailed_caption)
+        ):
+            detailed_status = "truncated_caption"
+        if detailed_status != "seg_style_answer" and detailed_was_truncated:
+            detailed_status = "truncated_caption"
+        pipeline_result.detailed_caption = detailed_caption
+        pipeline_result.detailed_completion_ids = detailed_completion_ids
+        pipeline_result.detailed_status = detailed_status
+        pipeline_result.verification_caption = ""
+        pipeline_result.verification_status = "empty"
+        return pipeline_result
 
     def _metric_tensor_like(self, value, reference):
         return self._metric_tensor(float(value), reference.dtype)
@@ -1214,10 +1441,7 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         if not pipeline_result.diagnosis_valid:
             pipeline_result.teacher_diagnosis_retry_count = 1
             retry_fields = dict(diagnosis_teacher_fields)
-            retry_fields["candidate_style_hint"] = (
-                "Retry with shorter fields and keep every line concrete. "
-                "Make REFERRING a compact target-only expression."
-            )
+            retry_fields["candidate_style_hint"] = "Fallback to the compact 5-field schema with one short REFERRING line."
             retry_prompt = self.build_teacher_privileged_prompt_v3(
                 student_question=student_question,
                 student_caption=student_caption,
@@ -1227,20 +1451,21 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                 gt_mask=gt_mask,
                 ref_mask=ref_mask,
                 teacher_fields=retry_fields,
-                generation_mode="referring_fault_report_rewrite",
+                generation_mode="referring_fault_report_rewrite_light",
             )
             retry_raw = self._predict_teacher_privileged_text(
                 image=image,
                 teacher_prompt_masks=teacher_prompt_masks,
                 teacher_prompt=retry_prompt,
             )
-            pipeline_result = self._parse_referring_fault_report(retry_raw, base_result=pipeline_result)
+            pipeline_result = self._parse_referring_light_fault_report(retry_raw, base_result=pipeline_result)
             pipeline_result = self._backfill_referring_fault_report(
                 pipeline_result,
                 relation_context=relation_context,
                 student_caption=student_caption,
             )
-            pipeline_result.diagnosis_valid, pipeline_result.diagnosis_failure_reason = self.validate_referring_fault_report(
+            pipeline_result.teacher_pipeline_mode = "referring_structured_fault_report_light_retry"
+            pipeline_result.diagnosis_valid, pipeline_result.diagnosis_failure_reason = self.validate_referring_light_fault_report(
                 pipeline_result
             )
         pipeline_result.stop_stage = "structured_diagnosis"
@@ -1469,38 +1694,47 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
             fallback_result.teacher_fallback_reason = pipeline_result.teacher_fallback_reason
             fallback_result.stop_stage = "single_stage_fallback"
             if self._teacher_field_is_effective(fallback_result.single_stage_raw, invalid_markers=("",)):
-                fallback_reconstruction = self.reconstruct_mask(
-                    image=image,
-                    caption=fallback_result.detailed_caption,
-                    description_status=fallback_result.detailed_status,
-                    gt_mask=gt_mask,
+                fallback_style_ok = (
+                    self._referring_style_is_usable(fallback_result.detailed_caption)
+                    and self._is_caption_content_sufficient(fallback_result.detailed_caption)
                 )
-                fallback_pred_mask = None if fallback_reconstruction is None else fallback_reconstruction.pred_mask
-                fallback_iou = self._compute_iou(gt_mask, fallback_pred_mask) if fallback_pred_mask is not None else 0.0
-                fallback_result.verification_iou = float(fallback_iou)
-                fallback_reconstruct_ok = bool(
-                    fallback_reconstruction is not None
-                    and fallback_reconstruction.status == "ok"
-                    and fallback_pred_mask is not None
-                )
-                fallback_result.gate_passed = (
-                    bool(fallback_reconstruct_ok)
-                    if caption_mode_failure
-                    else (
-                        self._referring_teacher_regenerate_gate_passed(student_caption, iou, fallback_iou)
-                        if fallback_reconstruct_ok
-                        else False
+                if not fallback_style_ok:
+                    fallback_result.detailed_failure_reason = "teacher_dlc_invalid:referring_style_gate_failed"
+                    fallback_result.cue_passed = False
+                    fallback_result.gate_passed = False
+                else:
+                    fallback_reconstruction = self.reconstruct_mask(
+                        image=image,
+                        caption=fallback_result.detailed_caption,
+                        description_status=fallback_result.detailed_status,
+                        gt_mask=gt_mask,
                     )
-                )
-                fallback_result.cue_passed = self._referring_candidate_type_constraint_passed(
-                    fallback_result.detailed_caption,
-                    fallback_result,
-                )
-                fallback_result.gate_passed = bool(fallback_result.gate_passed and fallback_result.cue_passed)
-                fallback_result.stop_stage = "passed" if fallback_result.gate_passed else "gate"
-                if fallback_result.gate_passed:
-                    fallback_result.teacher_selected_caption_source = "single_stage_fallback"
-                    return fallback_result
+                    fallback_pred_mask = None if fallback_reconstruction is None else fallback_reconstruction.pred_mask
+                    fallback_iou = self._compute_iou(gt_mask, fallback_pred_mask) if fallback_pred_mask is not None else 0.0
+                    fallback_result.verification_iou = float(fallback_iou)
+                    fallback_reconstruct_ok = bool(
+                        fallback_reconstruction is not None
+                        and fallback_reconstruction.status == "ok"
+                        and fallback_pred_mask is not None
+                    )
+                    fallback_result.gate_passed = (
+                        bool(fallback_reconstruct_ok)
+                        if caption_mode_failure
+                        else (
+                            self._referring_teacher_regenerate_gate_passed(student_caption, iou, fallback_iou)
+                            if fallback_reconstruct_ok
+                            else False
+                        )
+                    )
+                    fallback_result.cue_passed = self._referring_candidate_type_constraint_passed(
+                        fallback_result.detailed_caption,
+                        fallback_result,
+                    )
+                    fallback_result.gate_passed = bool(fallback_result.gate_passed and fallback_result.cue_passed)
+                    fallback_result.stop_stage = "passed" if fallback_result.gate_passed else "gate"
+                    if fallback_result.gate_passed:
+                        fallback_result.teacher_selected_caption_source = "single_stage_fallback"
+                        return fallback_result
             pipeline_result = fallback_result
 
         pipeline_result.stop_stage = "passed" if pipeline_result.gate_passed else "gate"
