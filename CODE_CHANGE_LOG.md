@@ -2216,3 +2216,33 @@
   - assigned a higher training loss weight to those hard referring samples
   - tightened teacher prompts to explicitly ask for compact RefCOCO-style noun phrases
   - used a referring-specific gate helper that keeps the original gate but allows a mild fallback for hard expressions with clear IoU improvement
+
+## 2026-07-15 Offline Regenerate CE Eligibility Should Not Be Inflated By GRPO
+
+### Problem
+- The training logs showed an unexpectedly high regenerate gate-pass rate.
+- In the offline / manifest route workflow, some samples are still labeled `teacher_regenerate` even when the current student reconstruction IoU has already risen above the high-IoU threshold.
+- The intended behavior is:
+  - `grpo_positive` keeps using its own GRPO loss and must not contribute to regenerate CE accounting
+  - only samples assigned to the regenerate route may use teacher CE
+  - for offline regenerate samples whose current IoU is already high, any positive teacher IoU improvement is enough to allow CE
+
+### Root Cause Notes
+- `projects/sa2va/models/sa2va_opsd_v2.py` counted `teacher_regenerate_ce_applied_count` and related regenerate counters before the per-route loss branch was enforced.
+- That let high-IoU `grpo_positive` samples inflate regenerate verification / CE metrics whenever the teacher improved IoU slightly.
+- The gate helper already treated high-IoU samples as pass-on-improvement, but there was no separate route-aware CE eligibility check.
+
+### Chosen Fix Direction
+- Keep teacher gate analysis available for debugging, but separate it from the actual CE admission rule.
+- Add a route-aware regenerate CE helper:
+  - non-regenerate loss families never use regenerate CE
+  - regenerate samples below the high-IoU threshold keep the existing gate
+  - regenerate samples already above the high-IoU threshold are allowed into CE only when their assigned offline route is still `teacher_regenerate` and the teacher strictly improves IoU
+- Expose the new `teacher_ce_eligible` flag in debug logs so gate quality and CE admission are easy to distinguish.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py`:
+  - added `_teacher_regenerate_ce_eligible()` and route normalization helpers
+  - restricted regenerate CE counters and suppression accounting to the actual regenerate loss branch
+  - switched regenerate entry admission from raw `teacher_gate_passed` to route-aware `teacher_ce_eligible`
+  - extended DDP debug sample logs with `teacher_ce_eligible`

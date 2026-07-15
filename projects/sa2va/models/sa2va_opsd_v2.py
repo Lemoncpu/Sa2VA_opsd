@@ -1359,6 +1359,32 @@ class Sa2VAOPSDModelV2(BaseModel):
         return iou_gain > 0.5 or (teacher_iou >= 0.6 and iou_gain >= 0.1)
 
     @staticmethod
+    def _normalize_route_name(route):
+        if route in {None, "", "skip"}:
+            return None
+        return str(route)
+
+    def _teacher_regenerate_ce_eligible(
+        self,
+        *,
+        loss_family,
+        batch_route,
+        route_from_manifest,
+        student_iou,
+        teacher_iou,
+        teacher_reconstruct_ok,
+        teacher_gate_passed,
+    ):
+        if loss_family != TEACHER_REGENERATE_ROUTE or not teacher_reconstruct_ok or teacher_iou is None:
+            return False
+        student_iou = float(student_iou)
+        teacher_iou = float(teacher_iou)
+        assigned_route = self._normalize_route_name(batch_route) or self._normalize_route_name(route_from_manifest)
+        if student_iou >= float(self.iou_high_threshold):
+            return assigned_route == TEACHER_REGENERATE_ROUTE and teacher_iou > student_iou
+        return bool(teacher_gate_passed)
+
+    @staticmethod
     def _window_metric_counts():
         return (
             "valid_count",
@@ -2778,7 +2804,8 @@ class Sa2VAOPSDModelV2(BaseModel):
                     "sample_key={sample_key} manifest_route={manifest_route} loss_family={loss_family} "
                     "online_route={online_route} reconstruct_status={reconstruct_status} iou={iou} "
                     "allow_teacher_ce={allow_teacher_ce} teacher_reconstruct_ok={teacher_reconstruct_ok} "
-                    "teacher_gate_passed={teacher_gate_passed} teacher_iou_plain={teacher_iou_plain} "
+                    "teacher_gate_passed={teacher_gate_passed} teacher_ce_eligible={teacher_ce_eligible} "
+                    "teacher_iou_plain={teacher_iou_plain} "
                     "teacher_completion_len={teacher_completion_len} is_dummy={is_dummy} dummy_reason={dummy_reason} "
                     "entry_added={entry_added} loss_branch={loss_branch} grpo_skip_reason={grpo_skip_reason} "
                     "confuser_candidate_count={confuser_candidate_count} "
@@ -2793,6 +2820,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                         allow_teacher_ce=record.get("allow_teacher_ce"),
                         teacher_reconstruct_ok=record.get("teacher_reconstruct_ok"),
                         teacher_gate_passed=record.get("teacher_gate_passed"),
+                        teacher_ce_eligible=record.get("teacher_ce_eligible"),
                         teacher_iou_plain=teacher_iou_text,
                         teacher_completion_len=record.get("teacher_completion_len"),
                         is_dummy=record.get("is_dummy"),
@@ -6840,7 +6868,17 @@ class Sa2VAOPSDModelV2(BaseModel):
             teacher_fallback_reason = str(teacher_analysis.get("teacher_fallback_reason", ""))
             teacher_selected_caption_source = str(teacher_analysis.get("teacher_selected_caption_source", ""))
             teacher_dlc_candidate_scores = tuple(teacher_analysis.get("teacher_dlc_candidate_scores", ()))
-            if allow_teacher_ce:
+            teacher_ce_eligible = self._teacher_regenerate_ce_eligible(
+                loss_family=loss_family,
+                batch_route=batch_route,
+                route_from_manifest=route_from_manifest,
+                student_iou=iou,
+                teacher_iou=teacher_iou_plain,
+                teacher_reconstruct_ok=teacher_reconstruct_ok,
+                teacher_gate_passed=teacher_gate_passed,
+            )
+            route_uses_teacher_regenerate_ce = loss_family == TEACHER_REGENERATE_ROUTE
+            if allow_teacher_ce and route_uses_teacher_regenerate_ce:
                 teacher_regenerate_analysis_count += 1
             if teacher_difference_context_nontrivial:
                 teacher_difference_context_nontrivial_count += 1
@@ -6870,8 +6908,8 @@ class Sa2VAOPSDModelV2(BaseModel):
             if teacher_iou_gain > 0.0:
                 teacher_positive_gain_count += 1
                 teacher_iou_gain_sum += float(teacher_iou_gain)
-            if allow_teacher_ce:
-                if teacher_reconstruct_ok and teacher_gate_passed:
+            if allow_teacher_ce and route_uses_teacher_regenerate_ce:
+                if teacher_ce_eligible:
                     teacher_regenerate_ce_applied_count += 1
                     teacher_regenerate_verified_count += 1
                     teacher_regenerate_verified_iou_sum += float(teacher_iou_plain or 0.0)
@@ -6883,7 +6921,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                     hard_reconstruct_failure_count += 1
                     if is_recovery_case:
                         recovery_suppressed_count += 1
-            elif is_recovery_case:
+            elif route_uses_teacher_regenerate_ce and is_recovery_case:
                 teacher_regenerate_suppressed_count += 1
                 hard_reconstruct_failure_count += 1
                 recovery_suppressed_count += 1
@@ -6906,6 +6944,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "allow_teacher_ce": bool(allow_teacher_ce),
                 "teacher_reconstruct_ok": teacher_reconstruct_ok,
                 "teacher_gate_passed": teacher_gate_passed,
+                "teacher_ce_eligible": bool(teacher_ce_eligible),
                 "teacher_iou_plain": teacher_iou_plain,
                 "teacher_completion_len": teacher_completion_len,
                 "teacher_difference_context_nontrivial": teacher_difference_context_nontrivial,
@@ -6969,8 +7008,8 @@ class Sa2VAOPSDModelV2(BaseModel):
                 regen_completion = None if teacher_regenerate is None else teacher_regenerate.detailed_completion_ids
                 if regen_completion is None or regen_completion.shape[1] == 0:
                     dummy_reason = "teacher_empty_completion" if teacher_regenerate is not None else "teacher_not_available"
-                elif not (teacher_reconstruct_ok and teacher_gate_passed):
-                    dummy_reason = "teacher_gate_failed"
+                elif not teacher_ce_eligible:
+                    dummy_reason = "teacher_ce_ineligible"
                 if dummy_reason is None:
                     regen_entries.append(
                         {
