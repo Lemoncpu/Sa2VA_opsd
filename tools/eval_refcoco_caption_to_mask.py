@@ -10,7 +10,7 @@ from tools.train_fallback_compat import patch_mmengine_adafactor_duplicate_regis
 
 patch_mmengine_adafactor_duplicate_registration()
 
-from projects.sa2va.datasets.common import SEG_QUESTIONS
+from projects.sa2va.datasets.task_prompts import SEG_QUESTIONS
 from projects.sa2va.evaluation.caption_to_mask_common import normalize_refcoco_caption, run_caption_to_mask_eval
 from projects.sa2va.evaluation.utils.refcoco_refer import REFER
 from projects.sa2va.models.sa2va_opsd_v3 import Sa2VAOPSDModelV3

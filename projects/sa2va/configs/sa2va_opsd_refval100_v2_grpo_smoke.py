@@ -9,7 +9,7 @@ from xtuner.engine.runner import TrainLoop
 
 from projects.sa2va.hooks.ema_teacher_hook import EMATeacherHook
 from projects.sa2va.hooks.old_policy_sync_hook import OldPolicySyncHook
-from projects.sa2va.datasets.common import DEFAULT_MASK_TO_CAPTION_QUESTION
+from projects.sa2va.datasets.caption_prompts import DEFAULT_MASK_TO_CAPTION_QUESTION
 from projects.sa2va.datasets.data_utils_opsd_v2 import sa2va_opsd_collect_fn_v2
 from projects.sa2va.datasets.refcoco_opsd import Sa2VAOpsdRefCocoDataset
 from projects.sa2va.models.sa2va_opsd_v2 import Sa2VAOPSDModelV2

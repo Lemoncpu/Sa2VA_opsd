@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from projects.sa2va.datasets.common import SEG_QUESTIONS
+from projects.sa2va.datasets.task_prompts import SEG_QUESTIONS
 from projects.sa2va.evaluation.caption_to_mask_common import normalize_refcoco_caption, run_caption_to_mask_eval
 from projects.sa2va.evaluation.utils.refcoco_refer import REFER
 from tools.pth_eval_utils import load_opsd_model_from_pth

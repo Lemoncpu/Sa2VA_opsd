@@ -8,7 +8,7 @@ import numpy as np
 from pycocotools import mask as mask_utils
 
 from .base import Sa2VABaseDataset
-from .common import VP_QUESTIONS
+from .task_prompts import VP_QUESTIONS
 
 
 class Sa2VA06VPDataset(Sa2VABaseDataset):

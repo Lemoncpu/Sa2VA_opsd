@@ -8,7 +8,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from .common import DEFAULT_MASK_TO_CAPTION_QUESTION
+from .caption_prompts import DEFAULT_MASK_TO_CAPTION_QUESTION
 
 
 DEFAULT_STUDENT_QUESTION = DEFAULT_MASK_TO_CAPTION_QUESTION

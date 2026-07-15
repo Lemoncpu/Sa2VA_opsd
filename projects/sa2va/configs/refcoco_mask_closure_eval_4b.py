@@ -1,7 +1,7 @@
 _os = __import__("os")
 _getenv = _os.getenv
 
-from projects.sa2va.datasets.common import DEFAULT_MASK_TO_CAPTION_QUESTION
+from projects.sa2va.datasets.caption_prompts import DEFAULT_MASK_TO_CAPTION_QUESTION
 
 
 model_path = _getenv(

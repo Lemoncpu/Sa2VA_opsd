@@ -1,6 +1,6 @@
 from projects.sa2va.configs.sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3 import *  # noqa: F401,F403
 
-from projects.sa2va.datasets.common import DEFAULT_MASK_TO_REFERRING_QUESTION
+from projects.sa2va.datasets.referring_prompts import DEFAULT_MASK_TO_REFERRING_QUESTION
 from projects.sa2va.models.sa2va_opsd_referring_v3 import Sa2VAOPSDReferringModelV3
 
 

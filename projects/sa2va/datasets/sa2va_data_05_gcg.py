@@ -9,7 +9,7 @@ from pycocotools import mask as mask_utils
 from pycocotools.coco import COCO
 
 from .base import Sa2VABaseDataset
-from .common import GCG_QUESTIONS
+from .task_prompts import GCG_QUESTIONS
 
 
 class Sa2VA05GCGDataset(Sa2VABaseDataset):
@@ -397,4 +397,3 @@ class Sa2VA05OpenPsgGCGDataset(Sa2VA05GCGDataset):
     def __init__(self, **kwargs):
         kwargs['dataset_type'] = 'openpsg'
         super().__init__(**kwargs)
-

@@ -4,10 +4,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from projects.sa2va.datasets.common import DEFAULT_MASK_TO_REFERRING_QUESTION
+from projects.sa2va.datasets.referring_prompts import DEFAULT_MASK_TO_REFERRING_QUESTION
 from projects.sa2va.evaluation.teacher_diagnosis_common import (
     build_mask_relation_context,
-    build_teacher_regenerate_difference_context,
 )
 from projects.sa2va.models.sa2va_opsd_v3 import Sa2VAOPSDModelV3
 
@@ -344,10 +343,6 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
             "REFERRING",
         )
 
-    @staticmethod
-    def _referring_light_fault_report_labels():
-        return Sa2VAOPSDReferringModelV3._referring_fault_report_labels()
-
     def _build_referring_teacher_prompt_masks(self, gt_mask_np, ref_mask_np):
         gt_mask = self._to_numpy_mask(gt_mask_np).astype(np.uint8)
         ref_mask = self._to_numpy_mask(ref_mask_np).astype(np.uint8)
@@ -365,23 +360,11 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
             axis=0,
         )
 
-    def _humanize_referring_failure_type(self, failure_type):
-        failure_type = self._normalize_teacher_field_text(failure_type).lower()
-        mapping = {
-            "wrong_subject": "The student caption points to the wrong main subject or to a larger nearby subject.",
-            "missing_attribute": "The student caption needs one more subject-level attribute to isolate the target.",
-            "wrong_attribute": "The student caption keeps the right subject but uses a wrong subject-level attribute.",
-            "missing_position": "The student caption needs a short left-right-middle or order cue for the target.",
-        }
-        return mapping.get(failure_type, mapping["missing_attribute"])
-
     def _infer_minimal_referring_failure_type(self, result, student_caption):
         caption_lower = (student_caption or "").lower()
         target_text = " ".join(
             part.lower()
             for part in (
-                result.target_summary,
-                result.target_only_evidence,
                 getattr(result, "keepable_phrases", ""),
             )
             if part
@@ -389,50 +372,21 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         distractor_text = " ".join(
             part.lower()
             for part in (
-                result.distractor_summary,
-                result.distractor_only_evidence,
                 getattr(result, "must_avoid_phrases", ""),
             )
             if part
         )
         has_position = any(token in " ".join((caption_lower, target_text, distractor_text)) for token in (self._REFERRING_DIRECTION_WORDS | self._REFERRING_ORDINAL_WORDS))
-        if has_position and not self._teacher_field_is_effective(getattr(result, "keepable_phrases", "")):
-            return "missing_position"
-        if self._teacher_field_is_effective(getattr(result, "must_avoid_phrases", "")) and self._teacher_field_is_effective(getattr(result, "keepable_phrases", "")):
-            return "wrong_attribute"
         if self._teacher_field_is_effective(result.distractor_only_evidence) and (
             not self._teacher_field_is_effective(getattr(result, "keepable_phrases", ""))
             or any(token in distractor_text for token in self._tokenize_referring_expression(caption_lower))
         ):
             return "wrong_subject"
+        if self._teacher_field_is_effective(getattr(result, "must_avoid_phrases", "")) and self._teacher_field_is_effective(getattr(result, "keepable_phrases", "")):
+            return "wrong_attribute"
         if has_position:
             return "missing_position"
         return "missing_attribute"
-
-    def _build_referring_programmatic_direction(self, result):
-        actions = []
-        keep_cue = getattr(result, "keepable_phrases", "")
-        drop_cue = getattr(result, "must_avoid_phrases", "")
-        if self._teacher_field_is_effective(keep_cue):
-            actions.append(f"keep {keep_cue}")
-        if self._teacher_field_is_effective(drop_cue):
-            actions.append(f"drop {drop_cue}")
-        if result.primary_failure_type == "missing_position":
-            actions.append("add one short left-right-middle or order cue")
-        if not actions:
-            actions.append("rewrite as one short subject-only referring phrase")
-        return " and ".join(actions).strip()
-
-    def _build_referring_programmatic_reason(self, result):
-        keep_cue = getattr(result, "keepable_phrases", "")
-        drop_cue = getattr(result, "must_avoid_phrases", "")
-        if result.primary_failure_type == "wrong_subject":
-            return "The current phrase is centered on the wrong nearby subject, so the rewrite must switch back to the true target."
-        if result.primary_failure_type == "wrong_attribute":
-            return f"The subject is close, but {drop_cue or 'one attribute'} is misleading and should be replaced by {keep_cue or 'the correct target cue'}."
-        if result.primary_failure_type == "missing_position":
-            return "The subject is still ambiguous among similar instances, so one short position or order cue is needed."
-        return f"The subject is mostly right, but it still needs {keep_cue or 'one more subject attribute'} to isolate the target."
 
     def _backfill_referring_fault_report(
         self,
@@ -444,17 +398,12 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         if result.primary_failure_type not in self._referring_failure_type_set():
             result.primary_failure_type = self._infer_minimal_referring_failure_type(result, student_caption)
         result.secondary_failure_type = ""
-        if not self._teacher_field_is_effective(result.target_summary, invalid_markers=("",)):
-            result.target_summary = self._normalize_teacher_field_text(relation_context.get("gt_summary", ""))
-        if not self._teacher_field_is_effective(result.distractor_summary, invalid_markers=("",)):
-            result.distractor_summary = self._normalize_teacher_field_text(relation_context.get("ref_summary", ""))
-        if not self._teacher_field_is_effective(result.target_only_evidence):
-            result.target_only_evidence = self._normalize_teacher_field_text(relation_context.get("gt_only_summary", ""))
-        if not self._teacher_field_is_effective(result.distractor_only_evidence):
-            result.distractor_only_evidence = self._normalize_teacher_field_text(relation_context.get("ref_only_summary", ""))
+        result.target_summary = self._normalize_teacher_field_text(relation_context.get("gt_summary", ""))
+        result.distractor_summary = self._normalize_teacher_field_text(relation_context.get("ref_summary", ""))
+        result.target_only_evidence = self._normalize_teacher_field_text(relation_context.get("gt_only_summary", ""))
+        result.distractor_only_evidence = self._normalize_teacher_field_text(relation_context.get("ref_only_summary", ""))
         trimmed_caption = self._clean_caption_text(student_caption)
-        if not self._teacher_field_is_effective(result.bad_phrases_in_student):
-            result.bad_phrases_in_student = trimmed_caption if trimmed_caption else "unknown"
+        result.bad_phrases_in_student = trimmed_caption if trimmed_caption else "unknown"
         if not self._teacher_field_is_effective(result.keepable_phrases):
             if result.primary_failure_type == "missing_position":
                 result.keepable_phrases = "left or right cue"
@@ -465,22 +414,17 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         if not self._teacher_field_is_effective(getattr(result, "must_avoid_phrases", "")):
             result.must_avoid_phrases = result.distractor_only_evidence if self._teacher_field_is_effective(result.distractor_only_evidence) else "none"
         result.missing_phrases_needed = result.keepable_phrases
-        if not self._teacher_field_is_effective(result.caption_problem, invalid_markers=("",)):
-            base_problem = self._humanize_referring_failure_type(result.primary_failure_type)
-            if self._teacher_field_is_effective(result.must_avoid_phrases):
-                base_problem += f" Drop cue: {result.must_avoid_phrases}."
-            result.caption_problem = base_problem
-        if not self._teacher_field_is_effective(result.correction_direction, invalid_markers=("",)):
-            result.correction_direction = self._build_referring_programmatic_direction(result)
-        if not self._teacher_field_is_effective(result.reason, invalid_markers=("",)):
-            result.reason = self._build_referring_programmatic_reason(result)
-        if not self._teacher_field_is_effective(result.target_anchor, invalid_markers=("",)):
-            result.target_anchor = self._normalize_teacher_field_text(result.missing_phrases_needed or result.target_only_evidence)
-        if not self._teacher_field_is_effective(result.distractor_anchor, invalid_markers=("",)):
-            result.distractor_anchor = self._normalize_teacher_field_text(result.distractor_only_evidence)
-        result.problem_valid = bool(self._teacher_field_is_effective(result.caption_problem, invalid_markers=("",)))
-        result.direction_valid = bool(self._teacher_field_is_effective(result.correction_direction, invalid_markers=("",)))
-        result.reason_valid = bool(self._teacher_field_is_effective(result.reason, invalid_markers=("",)))
+        result.caption_problem = ""
+        result.correction_direction = ""
+        result.reason = ""
+        result.target_anchor = ""
+        result.distractor_anchor = ""
+        result.problem_valid = False
+        result.direction_valid = False
+        result.reason_valid = False
+        result.problem_failure_reason = ""
+        result.direction_failure_reason = ""
+        result.reason_failure_reason = ""
         return result
 
     def _parse_referring_fault_report(self, raw_prediction, base_result=None):
@@ -501,11 +445,11 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         result.bad_phrases_in_student = result.must_avoid_phrases
         result.missing_phrases_needed = result.keepable_phrases
         referring_text = self._normalize_teacher_field_text(sections.get("REFERRING", ""))
-        result.caption_problem = self._humanize_referring_failure_type(result.primary_failure_type)
+        result.caption_problem = ""
         result.correction_direction = ""
         result.reason = ""
-        result.target_anchor = self._normalize_teacher_field_text(result.keepable_phrases or result.target_only_evidence)
-        result.distractor_anchor = self._normalize_teacher_field_text(result.must_avoid_phrases or result.distractor_only_evidence)
+        result.target_anchor = ""
+        result.distractor_anchor = ""
         if referring_text:
             result = self._materialize_teacher_caption_result(
                 result,
@@ -513,47 +457,6 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                 "structured_referring_direct",
             )
         return result
-
-    def _parse_referring_light_fault_report(self, raw_prediction, base_result=None):
-        result = base_result or self._build_empty_teacher_regenerate_pipeline_result()
-        text = "" if raw_prediction is None else str(raw_prediction)
-        result.structured_diagnosis_raw = text
-        result.diagnosis_raw = text
-        sections = self._parse_teacher_labeled_sections(text, self._referring_light_fault_report_labels())
-        result.primary_failure_type = self._normalize_teacher_field_text(
-            sections.get("ERROR_TYPE", "")
-        ).lower()
-        result.keepable_phrases = self._clean_teacher_phrase_list_text(sections.get("KEEP_CUE", ""))
-        result.must_avoid_phrases = self._clean_teacher_phrase_list_text(sections.get("DROP_CUE", ""))
-        result.bad_phrases_in_student = result.must_avoid_phrases
-        result.missing_phrases_needed = result.keepable_phrases
-        referring_text = self._normalize_teacher_field_text(sections.get("REFERRING", ""))
-        result.caption_problem = self._humanize_referring_failure_type(result.primary_failure_type)
-        result.correction_direction = ""
-        result.reason = ""
-        if referring_text:
-            result = self._materialize_teacher_caption_result(
-                result,
-                referring_text,
-                "structured_referring_light_direct",
-            )
-        return result
-
-    def validate_referring_light_fault_report(self, result):
-        if result.primary_failure_type not in self._referring_failure_type_set():
-            return False, "referring_light_fault_report_invalid:bad_primary_type"
-        if not any(
-            self._teacher_field_is_effective(value, invalid_markers=("",))
-            for value in (
-                result.bad_phrases_in_student,
-                result.missing_phrases_needed,
-                getattr(result, "must_avoid_phrases", ""),
-                result.detailed_caption,
-            )
-        ):
-            return False, "referring_light_fault_report_invalid:no_phrase_signal"
-        result.diagnosis_valid = True
-        return True, ""
 
     def validate_referring_fault_report(self, result):
         if result.primary_failure_type not in self._referring_failure_type_set():
@@ -705,10 +608,10 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         teacher_fields = dict(teacher_fields)
         teacher_fields.update(
             {
-                "target_summary": pipeline_result.target_summary,
-                "distractor_summary": pipeline_result.distractor_summary,
-                "target_only_evidence": pipeline_result.target_only_evidence,
-                "distractor_only_evidence": pipeline_result.distractor_only_evidence,
+                "gt_summary": pipeline_result.target_summary,
+                "ref_summary": pipeline_result.distractor_summary,
+                "gt_only_summary": pipeline_result.target_only_evidence,
+                "ref_only_summary": pipeline_result.distractor_only_evidence,
                 "primary_failure_type": getattr(pipeline_result, "primary_failure_type", ""),
                 "keepable_phrases": getattr(pipeline_result, "keepable_phrases", ""),
                 "candidate_style_hint": candidate_style_hint,
@@ -824,33 +727,6 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                 "- REFERRING must not start with 'the target', 'the region', 'region1', or any explanation template.\n"
                 "- Do not output markdown, bullets, JSON, [SEG], or any labels beyond the 4 required field names."
             )
-        if generation_mode == "referring_fault_report_rewrite_light":
-            clean_question = self._strip_image_placeholder(self._referring_prompt_text(student_question))
-            student_caption = self._normalize_teacher_field_text(student_caption)
-            return (
-                "<image>\n"
-                "You are supervising a short referring expression reconstruction task.\n"
-                "Student prompt: {question}\n"
-                "Student referring expression: {caption}\n"
-                "Target-only evidence: {target_only}\n"
-                "Distractor-only evidence: {distractor_only}\n"
-                "Output exactly these 4 lines and nothing else:\n"
-                "ERROR_TYPE:\n"
-                "KEEP_CUE:\n"
-                "DROP_CUE:\n"
-                "REFERRING:\n"
-                "Rules:\n"
-                "- ERROR_TYPE must be exactly one of: wrong_subject, missing_attribute, wrong_attribute, missing_position.\n"
-                "- KEEP_CUE and DROP_CUE must each be a very short cue or none.\n"
-                "- REFERRING must be one short target-specific noun phrase with 2 to 6 words when possible.\n"
-                "- Only care about the target subject itself, not the broader scene.\n"
-                "- Do not write a sentence, explanation, markdown, bullets, JSON, [SEG], or extra labels."
-            ).format(
-                question=clean_question,
-                caption=student_caption,
-                target_only=teacher_fields.get("target_only_evidence", ""),
-                distractor_only=teacher_fields.get("distractor_only_evidence", ""),
-            )
         if generation_mode in {"referring_rewrite_candidate", "referring_repair"}:
             clean_question = self._strip_image_placeholder(self._referring_prompt_text(student_question))
             student_caption = self._normalize_teacher_field_text(student_caption)
@@ -862,10 +738,10 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                 "region1 is the true target and region2 is the reconstructed distractor-leaning region.\n"
                 f"Student prompt: {clean_question}\n"
                 f"Student referring expression: {student_caption}\n"
-                f"Target summary: {teacher_fields.get('target_summary', '')}\n"
-                f"Reconstructed summary: {teacher_fields.get('distractor_summary', '')}\n"
-                f"Missing target-side evidence: {teacher_fields.get('target_only_evidence', '')}\n"
-                f"Distractor-side leak evidence: {teacher_fields.get('distractor_only_evidence', '')}\n"
+                f"Target summary: {teacher_fields.get('gt_summary', '')}\n"
+                f"Reconstructed summary: {teacher_fields.get('ref_summary', '')}\n"
+                f"Missing target-side evidence: {teacher_fields.get('gt_only_summary', '')}\n"
+                f"Distractor-side leak evidence: {teacher_fields.get('ref_only_summary', '')}\n"
                 f"ERROR_TYPE: {teacher_fields.get('primary_failure_type', '')}\n"
                 f"KEEP_CUE: {teacher_fields.get('keepable_phrases', '')}\n"
                 f"DROP_CUE: {teacher_fields.get('must_avoid_phrases', '')}\n"
@@ -945,15 +821,10 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         teacher_fields = dict(teacher_fields)
         teacher_fields.update(
             {
-                "target_summary": pipeline_result.target_summary,
-                "distractor_summary": pipeline_result.distractor_summary,
-                "shared_evidence": pipeline_result.shared_evidence,
-                "target_only_evidence": pipeline_result.target_only_evidence,
-                "distractor_only_evidence": pipeline_result.distractor_only_evidence,
-                "difference_focus": pipeline_result.difference_focus,
-                "target_localization_hint": pipeline_result.target_localization_hint,
-                "distractor_localization_hint": pipeline_result.distractor_localization_hint,
-                "likely_drift_reason": pipeline_result.likely_drift_reason,
+                "gt_summary": pipeline_result.target_summary,
+                "ref_summary": pipeline_result.distractor_summary,
+                "gt_only_summary": pipeline_result.target_only_evidence,
+                "ref_only_summary": pipeline_result.distractor_only_evidence,
             }
         )
         prompt = self.build_teacher_regenerate_single_prompt(
@@ -976,24 +847,14 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         pipeline_result.problem_raw = pipeline_result.single_stage_raw
         pipeline_result.direction_raw = pipeline_result.single_stage_raw
         pipeline_result.reason_raw = pipeline_result.single_stage_raw
-        pipeline_result.caption_problem = self._normalize_teacher_field_text(
-            self._extract_labeled_teacher_text(raw_prediction, "CAPTION_PROBLEM")
-        )
-        pipeline_result.correction_direction = self._normalize_teacher_field_text(
-            self._extract_labeled_teacher_text(raw_prediction, "CORRECTION_DIRECTION")
-        )
-        pipeline_result.reason = self._normalize_teacher_field_text(
-            self._extract_labeled_teacher_text(raw_prediction, "REASON")
-        )
-        pipeline_result.problem_valid = bool(pipeline_result.caption_problem)
-        pipeline_result.direction_valid = bool(pipeline_result.correction_direction)
-        pipeline_result.reason_valid = bool(pipeline_result.reason)
-        pipeline_result.diagnosis_valid = bool(
-            pipeline_result.problem_valid or pipeline_result.direction_valid or pipeline_result.reason_valid
-        )
-        pipeline_result.reason_is_coarse = bool(
-            pipeline_result.reason and self._teacher_reason_is_coarse(pipeline_result.reason)
-        )
+        pipeline_result.caption_problem = ""
+        pipeline_result.correction_direction = ""
+        pipeline_result.reason = ""
+        pipeline_result.problem_valid = False
+        pipeline_result.direction_valid = False
+        pipeline_result.reason_valid = False
+        pipeline_result.diagnosis_valid = False
+        pipeline_result.reason_is_coarse = False
 
         detailed_caption_raw = self._extract_labeled_teacher_text(raw_prediction, "REFERRING")
         if not detailed_caption_raw:
@@ -1270,7 +1131,6 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         print(
             "[Sa2VA_REFERRING_V3] "
             f"teacher_primary_failure_type={aux['last_failure_type']} "
-            f"teacher_secondary_failure_type={aux['last_secondary_type']} "
             f"teacher_cue_passed={int(aux['last_cue_passed'])}",
             flush=True,
         )
@@ -1292,37 +1152,27 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
     ):
         teacher_prompt_masks = self._build_referring_teacher_prompt_masks(gt_mask, ref_mask)
         fallback_prompt_masks = self._build_teacher_prompt_masks(gt_mask, ref_mask)
-        difference_context = build_teacher_regenerate_difference_context(
-            model=self,
-            gt_mask=gt_mask,
-            ref_mask=ref_mask,
-            image=image,
-            student_question=student_question,
-            region_model=self.require_teacher_model("Teacher regenerate difference summarization"),
-        )
         relation_context = build_mask_relation_context(model=self, gt_mask=gt_mask, ref_mask=ref_mask)
         pipeline_result = self._build_empty_teacher_regenerate_pipeline_result()
-        pipeline_result.teacher_pipeline_mode = "referring_structured_fault_report"
-        pipeline_result.target_summary = difference_context["target_summary"]
-        pipeline_result.distractor_summary = difference_context["distractor_summary"]
-        pipeline_result.shared_evidence = difference_context["shared_evidence"]
-        pipeline_result.target_only_evidence = difference_context["target_only_evidence"]
-        pipeline_result.distractor_only_evidence = difference_context["distractor_only_evidence"]
-        pipeline_result.difference_focus = difference_context.get("difference_focus", "")
-        pipeline_result.target_localization_hint = difference_context["target_localization_hint"]
-        pipeline_result.distractor_localization_hint = difference_context["distractor_localization_hint"]
-        pipeline_result.likely_drift_reason = difference_context["likely_drift_reason"]
-        pipeline_result.difference_context_nontrivial = bool(
-            self._teacher_field_is_effective(pipeline_result.target_only_evidence)
-            or self._teacher_field_is_effective(pipeline_result.distractor_only_evidence)
-        )
-        pipeline_result.stop_stage = "difference_context"
-
+        pipeline_result.teacher_pipeline_mode = "referring_minimal_4field"
+        pipeline_result.target_summary = self._normalize_teacher_field_text(relation_context.get("gt_summary", ""))
+        pipeline_result.distractor_summary = self._normalize_teacher_field_text(relation_context.get("ref_summary", ""))
+        pipeline_result.target_only_evidence = self._normalize_teacher_field_text(relation_context.get("gt_only_summary", ""))
+        pipeline_result.distractor_only_evidence = self._normalize_teacher_field_text(relation_context.get("ref_only_summary", ""))
+        pipeline_result.shared_evidence = ""
+        pipeline_result.difference_focus = ""
+        pipeline_result.target_localization_hint = ""
+        pipeline_result.distractor_localization_hint = ""
+        pipeline_result.likely_drift_reason = ""
+        pipeline_result.difference_context_nontrivial = False
+        pipeline_result.stop_stage = "minimal_relation_cues"
         diagnosis_teacher_fields = dict(teacher_fields)
         diagnosis_teacher_fields.update(
             {
-                "difference_focus": pipeline_result.difference_focus,
-                "likely_drift_reason": pipeline_result.likely_drift_reason,
+                "gt_summary": pipeline_result.target_summary,
+                "ref_summary": pipeline_result.distractor_summary,
+                "gt_only_summary": pipeline_result.target_only_evidence,
+                "ref_only_summary": pipeline_result.distractor_only_evidence,
             }
         )
         diagnosis_prompt = self.build_teacher_privileged_prompt_v3(
@@ -1350,36 +1200,6 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         pipeline_result.diagnosis_valid, pipeline_result.diagnosis_failure_reason = self.validate_referring_fault_report(
             pipeline_result
         )
-        if not pipeline_result.diagnosis_valid:
-            pipeline_result.teacher_diagnosis_retry_count = 1
-            retry_fields = dict(diagnosis_teacher_fields)
-            retry_fields["candidate_style_hint"] = "Fallback to the compact 5-field schema with one short REFERRING line."
-            retry_prompt = self.build_teacher_privileged_prompt_v3(
-                student_question=student_question,
-                student_caption=student_caption,
-                description_status=description_status,
-                reconstruction=reconstruction,
-                iou=iou,
-                gt_mask=gt_mask,
-                ref_mask=ref_mask,
-                teacher_fields=retry_fields,
-                generation_mode="referring_fault_report_rewrite_light",
-            )
-            retry_raw = self._predict_teacher_privileged_text(
-                image=image,
-                teacher_prompt_masks=teacher_prompt_masks,
-                teacher_prompt=retry_prompt,
-            )
-            pipeline_result = self._parse_referring_light_fault_report(retry_raw, base_result=pipeline_result)
-            pipeline_result = self._backfill_referring_fault_report(
-                pipeline_result,
-                relation_context=relation_context,
-                student_caption=student_caption,
-            )
-            pipeline_result.teacher_pipeline_mode = "referring_structured_fault_report_light_retry"
-            pipeline_result.diagnosis_valid, pipeline_result.diagnosis_failure_reason = self.validate_referring_light_fault_report(
-                pipeline_result
-            )
         pipeline_result.stop_stage = "structured_diagnosis"
 
         candidates = []
@@ -1471,7 +1291,8 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                 key=lambda item: (item["score"], item["reconstruct_iou"]),
                 reverse=True,
             )[0]
-            pipeline_result.teacher_dlc_selected_by = "referring_candidate_score"
+            pipeline_result.teacher_pipeline_mode = "referring_candidate_selected"
+            pipeline_result.teacher_dlc_selected_by = "candidate_score"
             pipeline_result = self._apply_teacher_dlc_candidate(
                 pipeline_result,
                 selected_candidate,
@@ -1501,6 +1322,7 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                 and float(pipeline_result.verification_iou or 0.0) > best_iou
             ):
                 pipeline_result.teacher_verification_used = True
+                pipeline_result.teacher_pipeline_mode = "referring_verification_selected"
                 pipeline_result.teacher_dlc_selected_by = "verification_iou"
                 pipeline_result = self._materialize_teacher_caption_result(
                     pipeline_result,
@@ -1562,6 +1384,7 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                     repair_candidate,
                     "referring_repair_candidate",
                 )
+                pipeline_result.teacher_pipeline_mode = "referring_candidate_selected"
                 pipeline_result.teacher_dlc_selected_by = "repair_candidate"
                 pipeline_result.verification_iou = repair_iou
                 teacher_reconstruct_ok = bool(
@@ -1601,10 +1424,10 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                 teacher_fields=teacher_fields,
                 pipeline_result=pipeline_result,
             )
-            fallback_result.teacher_pipeline_mode = "referring_structured_fault_report_with_fallback"
             fallback_result.teacher_fallback_used = True
             fallback_result.teacher_fallback_reason = pipeline_result.teacher_fallback_reason
             fallback_result.stop_stage = "single_stage_fallback"
+            fallback_result.teacher_pipeline_mode = "referring_single_stage_fallback"
             if self._teacher_field_is_effective(fallback_result.single_stage_raw, invalid_markers=("",)):
                 fallback_style_ok = (
                     self._referring_style_is_usable(fallback_result.detailed_caption)

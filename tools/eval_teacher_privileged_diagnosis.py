@@ -6,7 +6,7 @@ import sys
 import numpy as np
 import torch
 
-from projects.sa2va.datasets.common import DEFAULT_MASK_TO_CAPTION_QUESTION
+from projects.sa2va.datasets.caption_prompts import DEFAULT_MASK_TO_CAPTION_QUESTION
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))

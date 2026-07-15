@@ -1,4 +1,4 @@
-from projects.sa2va.datasets.common import DEFAULT_MASK_TO_CAPTION_QUESTION
+from projects.sa2va.datasets.caption_prompts import DEFAULT_MASK_TO_CAPTION_QUESTION
 
 model_path = "/data/xyc/Sa2va_opsd/Sa2VA/pretrained/Sa2VA-4B"
 tokenizer_path = model_path

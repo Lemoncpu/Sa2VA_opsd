@@ -9,7 +9,7 @@ import json
 import random
 import pycocotools.mask as maskUtils
 
-from .common import SEG_QUESTIONS, ANSWER_LIST
+from .task_prompts import SEG_QUESTIONS, ANSWER_LIST
 from .base import Sa2VABaseDataset
 from .data_utils import sam2_path_patch, get_video_frames, decode_masklet, opencvimg_to_pil
 

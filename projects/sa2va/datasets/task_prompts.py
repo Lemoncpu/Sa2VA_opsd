@@ -1,54 +1,21 @@
-DEFAULT_MASK_TO_CAPTION_QUESTION = (
-    "<image>"
-    "Describe the target marked by region1 with one detailed, localized caption. "
-    "Write it in the style of a precise visual object description: first identify the target category, then describe "
-    "its visible appearance in detail, such as color, shape, size, material, texture, parts, markings, clothing, pose, "
-    "facial or body attributes, and other distinctive traits that can be directly seen. "
-    "Include only the minimum nearby spatial or relational cue if it is necessary to distinguish this target from similar nearby objects. "
-    "Keep the caption focused on the target itself rather than the whole scene. Use one natural, complete sentence. "
-    "Do not mention unnecessary background, unrelated objects or people, inferred activities, emotions, or scene-level interpretation. "
-    "Describe only what is directly visible and useful for localizing the target. "
-    "Do not output segmentation tokens, tags, or placeholder text."
-)
-
-
-DEFAULT_MASK_TO_REFERRING_QUESTION = (
-    "<image>"
-    "Describe the target marked by region1 with one short RefCOCO-style referring expression. "
-    "Prefer a compact noun phrase with 2 to 6 words; only use 7 to 9 words if one extra local relation is necessary. "
-    "Focus on the target itself and keep only the minimum visible details needed to localize it among nearby similar objects. "
-    "Use directly visible category, color, clothing, parts, pose, ordinal, local spatial cue, or one short relation only when it helps disambiguation. "
-    "Do not write a full sentence, explanation, or scene description. "
-    "Do not start with templates like 'the target', 'the region', or 'region1'. "
-    "Avoid discourse fillers and unnecessary articles unless they help localization. "
-    "Do not mention segmentation tokens, tags, placeholder text, or unnecessary background."
-)
-
-
-
-# Glamm
 SEG_QUESTIONS = [
     "Can you segment the {class_name} in this image?",
     "Please segment {class_name} in this image.",
     "What is {class_name} in this image? Please respond with segmentation mask.",
     "What is {class_name} in this image? Please output segmentation mask.",
-
     "Can you segment the {class_name} in this image?",
     "Please segment {class_name} in this image.",
     "What is {class_name} in this image? Please respond with segmentation mask?",
     "What is {class_name} in this image? Please output segmentation mask?",
-
     "Could you provide a segmentation mask for the {class_name} in this image?",
     "Please identify and segment the {class_name} in this image.",
     "Where is the {class_name} in this picture? Please respond with a segmentation mask.",
     "Can you highlight the {class_name} in this image with a segmentation mask?",
-
     "Could you provide a segmentation mask for the {class_name} in this image?",
     "Please identify and segment the {class_name} in this image.",
     "Where is the {class_name} in this picture? Please respond with a segmentation mask.",
     "Can you highlight the {class_name} in this image with a segmentation mask?",
 ]
-
 
 GCG_QUESTIONS = [
     'Could you please give me a detailed description of the image? Please respond with interleaved segmentation masks for the corresponding parts of the answer.',
@@ -59,7 +26,6 @@ GCG_QUESTIONS = [
     'Could you provide me with a detailed analysis of this photo? Please output with interleaved segmentation masks for the corresponding parts of the answer.',
 ]
 
-# Glamm
 ANSWER_LIST = [
     "It is [SEG].",
     "Sure, [SEG].",
@@ -68,8 +34,6 @@ ANSWER_LIST = [
     "[SEG].",
 ]
 
-
-# Osprey
 VP_QUESTIONS = [
     'Can you provide me with a detailed description of the region in the picture marked by <region>?',
     "I'm curious about the region represented by <region> in the picture. Could you describe it in detail?",

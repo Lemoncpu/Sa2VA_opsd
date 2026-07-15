@@ -2403,3 +2403,84 @@
   - explicitly states that online routing commands must include `ROUTE_MODE=online`
 - Updated `AGENTS.md`:
   - added a workflow rule requiring `docs/command_formats.md` to be read before giving training, export, evaluation, plotting, or other runnable commands
+
+## 2026-07-15 Remove Shared Prompt Common File Between DLC And Referring Branches
+
+### Problem
+- The user wanted the short-referring training code and the DLC training code to be fully separated at the prompt-definition layer and explicitly asked to stop keeping a shared `projects/sa2va/datasets/common.py`.
+- That shared file still mixed DLC caption prompts, RefCOCO short-referring prompts, and generic task prompt lists in one place, which made the two branches continue to look coupled.
+
+### Root Cause Notes
+- `projects/sa2va/datasets/common.py` had become a catch-all file for multiple prompt families:
+  - detailed caption prompts used by DLC-style OPSD
+  - short referring prompts used by the RefCOCO referring branch
+  - segmentation / GCG / VP prompt lists used by general dataset and eval code
+- Many configs, tools, and model files imported from this shared file, so even though later training logic diverged, the prompt layer still remained coupled.
+
+### Chosen Fix Direction
+- Delete `projects/sa2va/datasets/common.py`.
+- Split the prompt definitions by function:
+  - one module for DLC/detailed caption prompts
+  - one module for short-referring prompts
+  - one module for generic segmentation / GCG / VP prompt lists
+- Update every import under the main `projects/sa2va` workflow and related tools to use the new modules.
+
+### Rejected Direction
+- Do not keep `common.py` as a thin re-export wrapper. The user explicitly asked to stop preserving that shared file, so the separation should be visible in the repository structure.
+
+### Implemented Changes
+- Added:
+  - `projects/sa2va/datasets/caption_prompts.py`
+  - `projects/sa2va/datasets/referring_prompts.py`
+  - `projects/sa2va/datasets/task_prompts.py`
+- Deleted:
+  - `projects/sa2va/datasets/common.py`
+- Updated configs, datasets, tools, and model imports under the main `projects/sa2va` path to use the new split prompt modules.
+- Left unrelated `projects/sasasa2va/.../common.py` untouched because it belongs to a separate package and was not part of the requested RefCOCO OPSD branch split.
+
+## 2026-07-15 Shrink Short-Referring Teacher Diagnosis To Minimal 4-Field Control
+
+### Problem
+- The short-referring branch still behaved like a partially renamed DLC pipeline.
+- Even after introducing `ERROR_TYPE / KEEP_CUE / DROP_CUE / REFERRING`, the referring teacher path still carried:
+  - difference-context summaries and drift prose
+  - heavy/light dual diagnosis schema
+  - `caption_problem / correction_direction / reason` style backfill
+  - short-referring logs that still printed DLC-era field names and prose diagnostics
+- This made training logs noisy and allowed the branch to drift back toward long DLC-style teacher outputs.
+
+### Root Cause Notes
+- `projects/sa2va/models/sa2va_opsd_referring_v3.py` still built the pipeline around the base DLC-oriented diagnosis result structure instead of treating the 4-field referring schema as the only control surface.
+- The referring branch still called `build_teacher_regenerate_difference_context(...)`, retried with a second light schema, and backfilled extra prose fields that were no longer semantically needed.
+- `projects/sa2va/models/sa2va_opsd_v2.py` short-referring debug paths still logged `teacher_dlc`, `caption_problem`, `correction_direction`, and related metrics even when the referring branch no longer wanted them.
+
+### Chosen Fix Direction
+- Collapse the short-referring teacher path to a single minimal 4-field diagnosis schema:
+  - `ERROR_TYPE`
+  - `KEEP_CUE`
+  - `DROP_CUE`
+  - `REFERRING`
+- Stop using difference-summary prose and light-schema retries in the referring branch.
+- Keep the base dataclass shape for compatibility, but stop writing, validating, or logging the extra DLC-style diagnosis fields in the referring path.
+- Remap short-referring logs around `teacher_referring`, `teacher_keep_cue`, `teacher_drop_cue`, and selected short-referring pipeline metadata.
+
+### Rejected Direction
+- Do not fully remove explicit diagnosis yet. The user asked to keep the 4 error types and 4 fields, but to shrink everything else around them.
+- Do not redesign the DLC branch or the base generic teacher pipeline in the same patch; only the short-referring branch should be narrowed.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_referring_v3.py`:
+  - removed the referring `light` diagnosis schema path
+  - removed referring dependence on `build_teacher_regenerate_difference_context(...)`
+  - reduced programmatic backfill to `primary_failure_type`, `keepable_phrases`, and `must_avoid_phrases`
+  - stopped writing and validating `caption_problem / correction_direction / reason` in the referring branch
+  - limited diagnosis and candidate prompts to subject-level `gt/ref` and `gt_only/ref_only` cues
+  - forced fallback and candidate outputs through short-referring style normalization and gate checks
+  - narrowed referring pipeline modes to short-referring-specific names
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py`:
+  - recorded `teacher_keep_cue`, `teacher_drop_cue`, and `teacher_referring_status` in teacher analysis
+  - changed `_short_referring_log_mode` sample and batch logs to print short-referring fields instead of DLC-era diagnosis prose fields
+
+### Validation
+- Ran:
+  - `python3 -m py_compile projects/sa2va/models/sa2va_opsd_referring_v3.py projects/sa2va/models/sa2va_opsd_v2.py`

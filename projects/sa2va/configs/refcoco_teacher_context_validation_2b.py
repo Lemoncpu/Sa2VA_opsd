@@ -2,7 +2,7 @@ _os = __import__("os")
 _getenv = _os.getenv
 _join = _os.path.join
 
-from projects.sa2va.datasets.common import DEFAULT_MASK_TO_CAPTION_QUESTION
+from projects.sa2va.datasets.caption_prompts import DEFAULT_MASK_TO_CAPTION_QUESTION
 
 
 ROOT_DIR = _os.path.abspath(_getenv("SA2VA_ROOT_DIR", _os.getcwd()))

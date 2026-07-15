@@ -16,7 +16,7 @@ from transformers import AutoModel, AutoProcessor, AutoTokenizer
 from transformers.modeling_outputs import BaseModelOutput
 from transformers.modeling_utils import PreTrainedModel
 
-from projects.sa2va.datasets.common import SEG_QUESTIONS
+from projects.sa2va.datasets.task_prompts import SEG_QUESTIONS
 from projects.sa2va.evaluation.teacher_diagnosis_common import (
     GRPO_POSITIVE_ROUTE,
     ON_POLICY_DISTILL_ROUTE,
@@ -2950,33 +2950,16 @@ class Sa2VAOPSDModelV2(BaseModel):
                     ("scored_confuser_count", record.get("scored_confuser_count")),
                     ("teacher_verification_caption_status", record.get("teacher_verification_caption_status")),
                     ("teacher_verification_caption", repr(record.get("teacher_verification_caption", ""))),
-                    ("teacher_referring", repr(record.get("teacher_dlc", ""))),
-                    ("target_summary", repr(record.get("target_summary", ""))),
-                    ("distractor_summary", repr(record.get("distractor_summary", ""))),
-                    ("shared_evidence", repr(record.get("shared_evidence", ""))),
-                    ("target_only_evidence", repr(record.get("target_only_evidence", ""))),
-                    ("distractor_only_evidence", repr(record.get("distractor_only_evidence", ""))),
-                    ("difference_focus", repr(record.get("difference_focus", ""))),
-                    ("likely_drift_reason", repr(record.get("likely_drift_reason", ""))),
-                    ("caption_problem", repr(record.get("caption_problem", ""))),
-                    ("correction_direction", repr(record.get("correction_direction", ""))),
-                    ("reason", repr(record.get("reason", ""))),
+                    ("teacher_referring", repr(record.get("teacher_referring", ""))),
+                    ("teacher_referring_status", record.get("teacher_referring_status")),
+                    ("teacher_referring_iou", record.get("teacher_verification_iou")),
+                    ("teacher_keep_cue", repr(record.get("teacher_keep_cue", ""))),
+                    ("teacher_drop_cue", repr(record.get("teacher_drop_cue", ""))),
                     ("single_stage_raw", repr(record.get("single_stage_raw", ""))),
                     ("structured_diagnosis_raw", repr(record.get("structured_diagnosis_raw", ""))),
                     ("repair_raw", repr(record.get("repair_raw", ""))),
-                    ("problem_raw", repr(record.get("problem_raw", ""))),
-                    ("direction_raw", repr(record.get("direction_raw", ""))),
-                    ("reason_raw", repr(record.get("reason_raw", ""))),
-                    ("teacher_problem_valid", record.get("teacher_problem_valid")),
-                    ("teacher_direction_valid", record.get("teacher_direction_valid")),
-                    ("teacher_reason_valid", record.get("teacher_reason_valid")),
-                    ("teacher_reason_is_coarse", record.get("teacher_reason_is_coarse")),
-                    ("teacher_problem_failure_reason", record.get("teacher_problem_failure_reason")),
-                    ("teacher_direction_failure_reason", record.get("teacher_direction_failure_reason")),
-                    ("teacher_reason_failure_reason", record.get("teacher_reason_failure_reason")),
                     ("teacher_diagnosis_failure_reason", record.get("teacher_diagnosis_failure_reason")),
                     ("teacher_pipeline_mode", record.get("teacher_pipeline_mode")),
-                    ("teacher_diagnosis_retry_count", record.get("teacher_diagnosis_retry_count")),
                     ("teacher_referring_candidate_count", record.get("teacher_dlc_candidate_count")),
                     ("teacher_referring_valid_candidate_count", record.get("teacher_dlc_valid_candidate_count")),
                     ("teacher_referring_selected_by", record.get("teacher_dlc_selected_by")),
@@ -5895,6 +5878,9 @@ class Sa2VAOPSDModelV2(BaseModel):
         result["teacher_dlc_valid"] = bool(
             teacher_regenerate.detailed_status == "ok" and not teacher_regenerate.detailed_failure_reason
         )
+        result["teacher_keep_cue"] = str(getattr(teacher_regenerate, "keepable_phrases", ""))
+        result["teacher_drop_cue"] = str(getattr(teacher_regenerate, "must_avoid_phrases", ""))
+        result["teacher_referring_status"] = str(teacher_regenerate.detailed_status)
         result["teacher_target_summary"] = teacher_regenerate.target_summary
         result["teacher_distractor_summary"] = teacher_regenerate.distractor_summary
         result["teacher_shared_evidence"] = teacher_regenerate.shared_evidence
@@ -6960,6 +6946,9 @@ class Sa2VAOPSDModelV2(BaseModel):
             teacher_verification_caption_status = str(teacher_analysis.get("teacher_verification_caption_status", "empty"))
             teacher_verification_caption = str(teacher_analysis.get("teacher_verification_caption", ""))
             teacher_dlc = str(teacher_analysis.get("teacher_dlc", ""))
+            teacher_keep_cue = str(teacher_analysis.get("teacher_keep_cue", ""))
+            teacher_drop_cue = str(teacher_analysis.get("teacher_drop_cue", ""))
+            teacher_referring_status = str(teacher_analysis.get("teacher_referring_status", "empty"))
             teacher_verification_iou = float(teacher_analysis.get("teacher_verification_iou", 0.0))
             teacher_dlc_valid = bool(teacher_analysis.get("teacher_dlc_valid", False))
             teacher_target_summary = str(teacher_analysis.get("teacher_target_summary", ""))
@@ -7075,7 +7064,10 @@ class Sa2VAOPSDModelV2(BaseModel):
                 "teacher_verification_caption_status": teacher_verification_caption_status,
                 "teacher_verification_caption": teacher_verification_caption,
                 "teacher_verification_iou": teacher_verification_iou,
-                "teacher_dlc": teacher_dlc,
+                "teacher_referring": teacher_dlc,
+                "teacher_keep_cue": teacher_keep_cue,
+                "teacher_drop_cue": teacher_drop_cue,
+                "teacher_referring_status": teacher_referring_status,
                 "target_summary": teacher_target_summary,
                 "distractor_summary": teacher_distractor_summary,
                 "shared_evidence": str(teacher_analysis.get("teacher_shared_evidence", "")),
@@ -7812,11 +7804,6 @@ class Sa2VAOPSDModelV2(BaseModel):
                 ("teacher_regen_verified_iou_mean", f"{batch_teacher_regenerate_verified_iou_mean:.4f}"),
                 ("teacher_regenerate_ce_applied", teacher_regenerate_ce_applied_count),
                 ("teacher_regenerate_suppressed", teacher_regenerate_suppressed_count),
-                ("window_teacher_difference_context_nontrivial_rate", f"{window_teacher_difference_context_nontrivial_rate:.4f}"),
-                ("window_teacher_problem_valid_rate", f"{window_teacher_problem_valid_rate:.4f}"),
-                ("window_teacher_direction_valid_rate", f"{window_teacher_direction_valid_rate:.4f}"),
-                ("window_teacher_reason_valid_rate", f"{window_teacher_reason_valid_rate:.4f}"),
-                ("window_teacher_reason_coarse_rate", f"{window_teacher_reason_coarse_rate:.4f}"),
                 ("window_teacher_regenerate_verification_caption_valid_rate", f"{window_teacher_regenerate_verification_caption_valid_rate:.4f}"),
                 ("window_teacher_regenerate_verification_iou_mean", f"{window_teacher_regenerate_verification_iou_mean:.4f}"),
                 ("window_teacher_diagnosis_valid_rate", f"{window_teacher_diagnosis_valid_rate:.4f}"),
@@ -7824,17 +7811,11 @@ class Sa2VAOPSDModelV2(BaseModel):
                 ("window_teacher_verification_gate_pass_rate", f"{window_teacher_verification_gate_pass_rate:.4f}"),
                 ("teacher_verification_caption", repr(teacher_verification_caption)),
                 ("teacher_referring", repr(teacher_dlc)),
-                ("teacher_caption_problem", repr(teacher_caption_problem)),
-                ("teacher_correction_direction", repr(teacher_correction_direction)),
-                ("teacher_reason", repr(teacher_reason)),
+                ("teacher_referring_status", teacher_referring_status),
+                ("teacher_referring_iou", f"{teacher_verification_iou:.4f}"),
+                ("teacher_keep_cue", repr(teacher_keep_cue)),
+                ("teacher_drop_cue", repr(teacher_drop_cue)),
                 ("teacher_single_stage_raw", repr(teacher_single_stage_raw)),
-                ("teacher_difference_focus", repr(teacher_difference_focus)),
-                ("teacher_problem_raw", repr(teacher_problem_raw)),
-                ("teacher_direction_raw", repr(teacher_direction_raw)),
-                ("teacher_reason_raw", repr(teacher_reason_raw)),
-                ("teacher_problem_valid", teacher_problem_valid),
-                ("teacher_direction_valid", teacher_direction_valid),
-                ("teacher_reason_valid", teacher_reason_valid),
                 ("window_avg_caption_tokens", f"{window_avg_caption_tokens:.2f}"),
                 ("window_caption_seg_style_rate_raw", f"{window_caption_seg_style_rate_raw:.4f}"),
                 ("window_caption_mode_failure_rate", f"{window_caption_mode_failure_rate:.4f}"),
@@ -7842,11 +7823,6 @@ class Sa2VAOPSDModelV2(BaseModel):
                 ("window_grpo_blocked_by_seg_style_count", window_totals['grpo_blocked_by_seg_style_count']),
                 ("window_teacher_recovery_seg_style_count", window_totals['teacher_recovery_seg_style_count']),
                 ("window_teacher_recovery_seg_style_success_count", window_totals['teacher_recovery_seg_style_success_count']),
-                ("cumulative_teacher_difference_context_nontrivial_rate", f"{cumulative_teacher_difference_context_nontrivial_rate:.4f}"),
-                ("cumulative_teacher_problem_valid_rate", f"{cumulative_teacher_problem_valid_rate:.4f}"),
-                ("cumulative_teacher_direction_valid_rate", f"{cumulative_teacher_direction_valid_rate:.4f}"),
-                ("cumulative_teacher_reason_valid_rate", f"{cumulative_teacher_reason_valid_rate:.4f}"),
-                ("cumulative_teacher_reason_coarse_rate", f"{cumulative_teacher_reason_coarse_rate:.4f}"),
                 ("cumulative_teacher_regenerate_verification_caption_valid_rate", f"{cumulative_teacher_regenerate_verification_caption_valid_rate:.4f}"),
                 ("cumulative_teacher_regenerate_verification_iou_mean", f"{cumulative_teacher_regenerate_verification_iou_mean:.4f}"),
                 ("cumulative_teacher_diagnosis_valid_rate", f"{cumulative_teacher_diagnosis_valid_rate:.4f}"),

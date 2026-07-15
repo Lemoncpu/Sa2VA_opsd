@@ -13,7 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from projects.sa2va.datasets.sa2va_opsd_npz_v2 import Sa2VAOpsdNPZDatasetV2
-from projects.sa2va.datasets.common import DEFAULT_MASK_TO_CAPTION_QUESTION
+from projects.sa2va.datasets.caption_prompts import DEFAULT_MASK_TO_CAPTION_QUESTION
 from projects.sa2va.evaluation.caption_to_mask_common import normalize_refcoco_caption
 from projects.sa2va.models.sa2va_opsd_v3 import Sa2VAOPSDModelV3
 

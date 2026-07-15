@@ -4,7 +4,7 @@ from pathlib import Path
 
 import torch
 
-from projects.sa2va.datasets.common import DEFAULT_MASK_TO_CAPTION_QUESTION
+from projects.sa2va.datasets.caption_prompts import DEFAULT_MASK_TO_CAPTION_QUESTION
 from projects.sa2va.datasets.sa2va_opsd_npz_v2 import Sa2VAOpsdNPZDatasetV2
 from projects.sa2va.models.sa2va_opsd_v3 import Sa2VAOPSDModelV3
 
