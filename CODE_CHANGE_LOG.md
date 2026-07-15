@@ -2376,3 +2376,30 @@
   - enabled short-referring log mode on construction
   - renamed returned metric keys from `teacher_dlc_valid_rate` to `teacher_referring_valid_rate`
   - renamed returned metric keys from `teacher_regenerate_dlc_ce_applied_count` to `teacher_regenerate_referring_ce_applied_count`
+
+## 2026-07-15 Command Templates Need A Single Source Of Truth
+
+### Problem
+- The user caught that a previously suggested short-referring online training command omitted `ROUTE_MODE=online`, which makes the wrapper silently fall back to manifest mode.
+- The repository had launcher scripts and notes spread across multiple places, but no single command-format reference that Codex could reliably consult before giving runnable commands.
+
+### Root Cause Notes
+- The current wrapper defaults in `tools/train_refcoco_opsd_impl.sh` are strict enough to require certain environment variables, but those requirements were not documented in one canonical command template file.
+- `AGENTS.md` told contributors how to edit code, but it did not force command generation to be validated against a repository-local command reference.
+
+### Chosen Fix Direction
+- Add one repository-local Markdown file that records the canonical command formats, required parameters, and command-specific caveats.
+- Update `AGENTS.md` so future command answers must consult that file first.
+
+### Rejected Direction
+- Do not rely on memory or on scattered wrapper usage examples in shell scripts and old chat history. The user explicitly asked for a single documented command format source.
+
+### Implemented Changes
+- Added `docs/command_formats.md`:
+  - records general command rules
+  - records required variables
+  - records short-referring online and manifest training templates
+  - records referring route export and training-curve plotting templates
+  - explicitly states that online routing commands must include `ROUTE_MODE=online`
+- Updated `AGENTS.md`:
+  - added a workflow rule requiring `docs/command_formats.md` to be read before giving training, export, evaluation, plotting, or other runnable commands

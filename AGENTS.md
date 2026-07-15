@@ -4,6 +4,7 @@
 - Read `CODE_CHANGE_LOG.md` before making any code change.
 - After each code change, append the problem, root cause, and chosen fix to `CODE_CHANGE_LOG.md`.
 - Do not replace an earlier design decision by switching to a different modification strategy without first recording the reason in `CODE_CHANGE_LOG.md`.
+- Before giving any training, export, evaluation, plotting, or other runnable command to the user, read `docs/command_formats.md` and follow its command templates and requirements exactly.
 
 ## Project Structure & Module Organization
 Core source lives under `projects/`, with the main Sa2VA implementation in `projects/sa2va/`. Use:
