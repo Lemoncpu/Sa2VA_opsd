@@ -49,6 +49,19 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
     _REFERRING_GENERIC_CATEGORY_WORDS = {
         "person", "people", "man", "woman", "boy", "girl", "dog", "cat", "chair", "table", "car", "bus", "bike",
     }
+    _REFERRING_CUE_META_PATTERNS = (
+        r"area_ratio\s*=",
+        r"\bbbox\s*=",
+        r"\bcenter\s*=",
+        r"</?p>",
+        r"\bregion\d+\b",
+        r"\bregion\s+\d+\b",
+        r"\[[0-9.,\s-]+\]",
+    )
+    _REFERRING_CUE_STOPWORDS = {
+        "a", "an", "the", "this", "that", "these", "those", "target", "region",
+        "cue", "keep", "drop", "none", "unknown",
+    }
 
     def __init__(
         self,
@@ -199,6 +212,58 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         if len(tokens) > 9:
             caption = " ".join(tokens[:9])
         return re.sub(r"\s+", " ", caption).strip(" ,.")
+
+    @classmethod
+    def _looks_like_meta_cue(cls, text):
+        lowered = (text or "").lower()
+        if not lowered:
+            return True
+        return any(re.search(pattern, lowered) for pattern in cls._REFERRING_CUE_META_PATTERNS)
+
+    def _sanitize_referring_cue(self, value, *, allow_none=True):
+        raw = self._normalize_teacher_field_text(value)
+        if not raw:
+            return "none" if allow_none else ""
+        raw = re.sub(r"(?i)\b(?:keep_cue|drop_cue|keep cue|drop cue)\s*:\s*", "", raw)
+        raw = re.sub(r"</?p>", " ", raw, flags=re.IGNORECASE)
+        candidates = []
+        for part in re.split(r"[,;\n]", raw):
+            item = self._normalize_teacher_field_text(part)
+            if not item or self._looks_like_meta_cue(item):
+                continue
+            item = self._force_short_referring_expression(item)
+            tokens = [
+                token for token in self._tokenize_referring_expression(item)
+                if token not in self._REFERRING_CUE_STOPWORDS
+            ]
+            if not tokens:
+                continue
+            if not any(re.search(r"[a-z]", token) for token in tokens):
+                continue
+            cleaned = " ".join(tokens[:6]).strip()
+            if cleaned:
+                candidates.append(cleaned)
+        if not candidates:
+            return "none" if allow_none else ""
+        return ", ".join(dict.fromkeys(candidates))
+
+    def _sanitize_referring_prompt_summary(self, value):
+        cleaned = self._sanitize_referring_cue(value, allow_none=False)
+        return cleaned
+
+    def _fallback_referring_keep_cue(self, student_caption, failure_type):
+        caption = self._force_short_referring_expression(student_caption)
+        tokens = [
+            token for token in self._tokenize_referring_expression(caption)
+            if token not in self._REFERRING_CUE_STOPWORDS
+        ]
+        if failure_type == "missing_position":
+            spatial_tokens = [
+                token for token in tokens
+                if token in (self._REFERRING_DIRECTION_WORDS | self._REFERRING_ORDINAL_WORDS)
+            ]
+            return " ".join(spatial_tokens[:3]).strip()
+        return " ".join(tokens[:4]).strip()
 
     def _rewrite_caption_prompt_for_referring(self, prompt):
         replacements = (
@@ -398,21 +463,25 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         if result.primary_failure_type not in self._referring_failure_type_set():
             result.primary_failure_type = self._infer_minimal_referring_failure_type(result, student_caption)
         result.secondary_failure_type = ""
-        result.target_summary = self._normalize_teacher_field_text(relation_context.get("gt_summary", ""))
-        result.distractor_summary = self._normalize_teacher_field_text(relation_context.get("ref_summary", ""))
-        result.target_only_evidence = self._normalize_teacher_field_text(relation_context.get("gt_only_summary", ""))
-        result.distractor_only_evidence = self._normalize_teacher_field_text(relation_context.get("ref_only_summary", ""))
+        result.target_summary = self._sanitize_referring_prompt_summary(relation_context.get("gt_summary", ""))
+        result.distractor_summary = self._sanitize_referring_prompt_summary(relation_context.get("ref_summary", ""))
+        result.target_only_evidence = self._sanitize_referring_prompt_summary(relation_context.get("gt_only_summary", ""))
+        result.distractor_only_evidence = self._sanitize_referring_prompt_summary(relation_context.get("ref_only_summary", ""))
         trimmed_caption = self._clean_caption_text(student_caption)
         result.bad_phrases_in_student = trimmed_caption if trimmed_caption else "unknown"
+        result.keepable_phrases = self._sanitize_referring_cue(result.keepable_phrases)
+        result.must_avoid_phrases = self._sanitize_referring_cue(result.must_avoid_phrases)
         if not self._teacher_field_is_effective(result.keepable_phrases):
-            if result.primary_failure_type == "missing_position":
-                result.keepable_phrases = "left or right cue"
-            elif self._teacher_field_is_effective(result.target_only_evidence):
+            fallback_keep = self._fallback_referring_keep_cue(trimmed_caption, result.primary_failure_type)
+            if self._teacher_field_is_effective(result.target_only_evidence):
                 result.keepable_phrases = result.target_only_evidence
+            elif fallback_keep:
+                result.keepable_phrases = fallback_keep
             else:
-                result.keepable_phrases = trimmed_caption if trimmed_caption else "target subject"
+                result.keepable_phrases = "none"
         if not self._teacher_field_is_effective(getattr(result, "must_avoid_phrases", "")):
             result.must_avoid_phrases = result.distractor_only_evidence if self._teacher_field_is_effective(result.distractor_only_evidence) else "none"
+        result.must_avoid_phrases = self._sanitize_referring_cue(result.must_avoid_phrases)
         result.missing_phrases_needed = result.keepable_phrases
         result.caption_problem = ""
         result.correction_direction = ""
@@ -436,10 +505,10 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         result.primary_failure_type = self._normalize_teacher_field_text(
             sections.get("ERROR_TYPE", "")
         ).lower()
-        result.keepable_phrases = self._clean_teacher_phrase_list_text(
+        result.keepable_phrases = self._sanitize_referring_cue(
             sections.get("KEEP_CUE", "")
         )
-        result.must_avoid_phrases = self._clean_teacher_phrase_list_text(
+        result.must_avoid_phrases = self._sanitize_referring_cue(
             sections.get("DROP_CUE", "")
         )
         result.bad_phrases_in_student = result.must_avoid_phrases
@@ -461,19 +530,30 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
     def validate_referring_fault_report(self, result):
         if result.primary_failure_type not in self._referring_failure_type_set():
             return False, "referring_fault_report_invalid:bad_primary_type"
-        if not any(self._teacher_field_is_effective(value, invalid_markers=("",)) for value in (result.keepable_phrases, result.must_avoid_phrases, result.detailed_caption)):
+        keep_cue = self._sanitize_referring_cue(result.keepable_phrases)
+        drop_cue = self._sanitize_referring_cue(result.must_avoid_phrases)
+        detailed_caption = self._force_short_referring_expression(result.detailed_caption)
+        if not any(self._teacher_field_is_effective(value, invalid_markers=("",)) for value in (keep_cue, drop_cue, detailed_caption)):
             return False, "referring_fault_report_invalid:no_phrase_level_signal"
-        lower_text = " ".join(part.lower() for part in (result.keepable_phrases, result.must_avoid_phrases, result.detailed_caption, result.target_only_evidence) if part)
+        lower_text = " ".join(part.lower() for part in (keep_cue, drop_cue, detailed_caption, result.target_only_evidence) if part)
         if result.primary_failure_type == "missing_position" and not any(token in lower_text for token in (self._REFERRING_DIRECTION_WORDS | self._REFERRING_ORDINAL_WORDS)):
             return False, "referring_fault_report_invalid:missing_spatial_cue"
-        if result.primary_failure_type == "wrong_subject" and not self._teacher_field_is_effective(result.must_avoid_phrases):
+        if result.primary_failure_type == "wrong_subject" and not (
+            self._teacher_field_is_effective(drop_cue) or self._teacher_field_is_effective(detailed_caption, invalid_markers=("",))
+        ):
             return False, "referring_fault_report_invalid:missing_wrong_subject_drop_cue"
-        if result.primary_failure_type == "missing_attribute" and not self._teacher_field_is_effective(result.keepable_phrases):
+        if result.primary_failure_type == "missing_attribute" and not (
+            self._teacher_field_is_effective(keep_cue) or self._teacher_field_is_effective(detailed_caption, invalid_markers=("",))
+        ):
             return False, "referring_fault_report_invalid:missing_attribute_keep_cue"
         if result.primary_failure_type == "wrong_attribute" and not (
-            self._teacher_field_is_effective(result.keepable_phrases) and self._teacher_field_is_effective(result.must_avoid_phrases)
+            (self._teacher_field_is_effective(keep_cue) and self._teacher_field_is_effective(drop_cue))
+            or self._teacher_field_is_effective(detailed_caption, invalid_markers=("",))
         ):
             return False, "referring_fault_report_invalid:missing_attribute_swap_cue"
+        result.keepable_phrases = keep_cue
+        result.must_avoid_phrases = drop_cue
+        result.detailed_caption = detailed_caption
         result.diagnosis_valid = True
         return True, ""
 
@@ -493,7 +573,6 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         target_text = " ".join(
             item.lower()
             for item in (
-                pipeline_result.target_only_evidence,
                 getattr(pipeline_result, "missing_phrases_needed", ""),
                 getattr(pipeline_result, "keepable_phrases", ""),
             )
@@ -502,9 +581,7 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         distractor_text = " ".join(
             item.lower()
             for item in (
-                pipeline_result.distractor_only_evidence,
                 getattr(pipeline_result, "must_avoid_phrases", ""),
-                getattr(pipeline_result, "bad_phrases_in_student", ""),
             )
             if self._teacher_field_is_effective(item)
         )
@@ -522,16 +599,24 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         if failure_type == "missing_position":
             return any(token in caption_lower for token in (self._REFERRING_DIRECTION_WORDS | self._REFERRING_ORDINAL_WORDS))
         if failure_type in {"wrong_subject", "missing_attribute", "wrong_attribute"}:
-            keep_cue = getattr(pipeline_result, "keepable_phrases", "")
+            keep_cue = self._sanitize_referring_cue(getattr(pipeline_result, "keepable_phrases", ""))
             keep_ok = (not self._teacher_field_is_effective(keep_cue)) or any(
                 token.lower() in caption_lower
                 for token in self._split_teacher_field_list(keep_cue)
             )
-            must_avoid = getattr(pipeline_result, "must_avoid_phrases", "")
+            must_avoid = self._sanitize_referring_cue(getattr(pipeline_result, "must_avoid_phrases", ""))
             drop_ok = not any(
                 token.lower() in caption_lower
                 for token in self._split_teacher_field_list(must_avoid)
             )
+            if failure_type == "missing_attribute":
+                return bool(keep_ok)
+            if failure_type == "wrong_subject" and not self._teacher_field_is_effective(must_avoid):
+                return True
+            if failure_type == "wrong_attribute" and not (
+                self._teacher_field_is_effective(keep_cue) or self._teacher_field_is_effective(must_avoid)
+            ):
+                return True
             return bool(keep_ok and drop_ok)
         return True
 
@@ -695,8 +780,10 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                 gt_mask=gt_mask,
                 ref_mask=ref_mask if ref_mask is not None else self._zero_ref_mask_like(gt_mask),
             )
-            gt_only_summary = relation_context["gt_only_summary"]
-            ref_only_summary = relation_context["ref_only_summary"]
+            gt_summary = self._sanitize_referring_prompt_summary(relation_context["gt_summary"]) or "none"
+            ref_summary = self._sanitize_referring_prompt_summary(relation_context["ref_summary"]) or "none"
+            gt_only_summary = self._sanitize_referring_prompt_summary(relation_context["gt_only_summary"]) or "none"
+            ref_only_summary = self._sanitize_referring_prompt_summary(relation_context["ref_only_summary"]) or "none"
             student_caption = self._normalize_teacher_field_text(student_caption)
             return (
                 "<image>\n"
@@ -709,8 +796,8 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                 f"Description status: {description_status}\n"
                 f"Reconstruction status: {reconstruction.status}\n"
                 f"IoU between region1 and region2: {iou:.4f}\n"
-                f"Target subject cue: {relation_context['gt_summary']}\n"
-                f"Reconstructed subject cue: {relation_context['ref_summary']}\n"
+                f"Target subject cue: {gt_summary}\n"
+                f"Reconstructed subject cue: {ref_summary}\n"
                 f"Target-only cue: {gt_only_summary}\n"
                 f"Distractor-only cue: {ref_only_summary}\n"
                 "Output exactly these 4 lines and nothing else:\n"

@@ -2484,3 +2484,48 @@
 ### Validation
 - Ran:
   - `python3 -m py_compile projects/sa2va/models/sa2va_opsd_referring_v3.py projects/sa2va/models/sa2va_opsd_v2.py`
+
+## 2026-07-15 Clean Referring KEEP/DROP Cues And Gate On Sanitized Cues
+
+### Problem
+- After shrinking the short-referring diagnosis to the 4-field schema, training logs still showed almost all regenerate samples falling into fallback.
+- The new logs revealed that `KEEP_CUE` and `DROP_CUE` were frequently polluted by mask-summary metadata such as:
+  - `area_ratio=...`
+  - `bbox=[...]`
+  - `center=[...]`
+  - `region2`
+  - stray `</p>` fragments
+- As a result, `teacher_cue_passed` stayed near zero and even teacher captions with high reconstruction IoU could still be rejected by the cue gate.
+
+### Root Cause Notes
+- The referring branch reused `gt_only_summary` / `ref_only_summary` and raw labeled field text directly as cue text.
+- Those upstream summaries are useful for machine-readable difference bookkeeping, but they are not guaranteed to be natural-language short referring cues.
+- The cue gate then evaluated those dirty fields literally, so malformed cues caused false gate failures.
+
+### Chosen Fix Direction
+- Add a short-referring-specific cue sanitizer that only keeps natural-language short phrases and drops geometric metadata, region tags, and markup remnants.
+- Use sanitized cues consistently for:
+  - diagnosis validation
+  - programmatic cue backfill
+  - candidate scoring
+  - cue-pass gating
+- When sanitized cues are empty, fall back to a small caption-derived cue instead of reusing raw mask-summary metadata.
+- Relax cue-gate behavior for attribute routes so empty cleaned cues do not automatically reject otherwise strong teacher captions.
+
+### Rejected Direction
+- Do not reintroduce broad prose diagnosis fields just to recover more signal. The issue was cue quality, not the absence of long explanations.
+- Do not remove cue gating entirely; instead, gate on cleaned referring cues.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_referring_v3.py`:
+  - added `_sanitize_referring_cue()` and `_sanitize_referring_prompt_summary()`
+  - filtered out `area_ratio`, `bbox`, `center`, `regionN`, coordinate lists, and HTML-like fragments from short-referring cues
+  - added `_fallback_referring_keep_cue()` to derive a minimal natural-language keep cue from the student caption when needed
+  - sanitized parsed `KEEP_CUE` / `DROP_CUE` before diagnosis validation and candidate use
+  - sanitized relation-context summaries before they are exposed in referring prompts
+  - updated cue scoring and cue-pass checks to use sanitized cues only
+  - relaxed cue constraints so missing cleaned cues do not automatically kill `wrong_subject` / `wrong_attribute` / `missing_attribute` samples
+
+### Validation
+- Ran:
+  - `python3 -m py_compile projects/sa2va/models/sa2va_opsd_referring_v3.py`
