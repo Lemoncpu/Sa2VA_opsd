@@ -2529,3 +2529,42 @@
 ### Validation
 - Ran:
   - `python3 -m py_compile projects/sa2va/models/sa2va_opsd_referring_v3.py`
+
+## 2026-07-16 Shorten Referring Teacher Captions, Stabilize Verification, And Relax Online Regenerate Gate
+
+### Problem
+- After cue cleaning, short-referring diagnosis became more readable, but regenerate pass-through still stayed low.
+- Training logs showed three recurring issues:
+  - teacher captions often ended as truncated short sentences or dangling fragments such as `... with`, `... in`, `... on`
+  - verification captions frequently failed with `verification_invalid:not_shorter_than_dlc`
+  - some online short-referring samples had high absolute teacher IoU but were still blocked by `iou_not_improved_enough`
+
+### Root Cause Notes
+- The referring branch still reused the generic teacher generation length budget, which allowed captions to drift longer than RefCOCO-style noun phrases.
+- `_force_short_referring_expression()` cleaned templates but did not remove dangling trailing fragment words, so incomplete outputs often survived as `truncated_caption`.
+- The base verification path was still optimized for DLC-style captions and did not provide a short-referring-specific fallback when the model failed to produce a shorter verifier caption.
+- The referring regenerate gate still depended too much on relative IoU improvement, which can be overly strict for online short-referring samples that already reach high absolute reconstruction IoU.
+
+### Chosen Fix Direction
+- Give short-referring teacher generation a stricter prompt and a smaller generation budget.
+- Trim dangling trailing fragment words so incomplete endings do not survive into final short-referring supervision.
+- Add a short-referring-specific verification prompt plus a fallback verifier-caption builder derived from cleaned keep cues.
+- Relax the short-referring regenerate gate for strong absolute-IoU teacher captions while keeping the stricter path for weak captions.
+
+### Rejected Direction
+- Do not lower the global `description_max_new_tokens` for the whole model in this patch. The issue is specific to short-referring teacher generation, not all caption generation.
+- Do not remove verification entirely; the better fix is to make it genuinely shorter and more stable for the short-referring branch.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_referring_v3.py`:
+  - added short-referring-specific teacher and verification max-token helpers
+  - added trailing fragment trimming for endings like `with / in / on / of / and`
+  - strengthened referring rewrite and single-stage prompts to prefer `2-5` words, never exceed `6`, and end as a clean noun phrase
+  - routed candidate and fallback teacher generation through the shorter referring-specific max-token budget
+  - added `referring_verification_caption` prompt mode with stronger shortness constraints
+  - added `_build_referring_verification_fallback()` so verification can fall back to a shorter cleaned cue-derived phrase
+  - relaxed `_referring_teacher_regenerate_gate_passed()` for high-absolute-IoU referring teachers (`>=0.8` with small tolerance, or `>=0.7` with modest positive gain)
+
+### Validation
+- Ran:
+  - `python3 -m py_compile projects/sa2va/models/sa2va_opsd_referring_v3.py`

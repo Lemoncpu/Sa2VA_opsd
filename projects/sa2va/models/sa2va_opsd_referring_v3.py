@@ -62,6 +62,11 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         "a", "an", "the", "this", "that", "these", "those", "target", "region",
         "cue", "keep", "drop", "none", "unknown",
     }
+    _REFERRING_TRAILING_FRAGMENT_WORDS = {
+        "a", "an", "the", "with", "without", "in", "on", "at", "of", "for", "from",
+        "to", "by", "near", "next", "behind", "under", "over", "above", "below",
+        "between", "and", "or",
+    }
 
     def __init__(
         self,
@@ -211,7 +216,45 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         tokens = self._tokenize_referring_expression(caption)
         if len(tokens) > 9:
             caption = " ".join(tokens[:9])
+        caption = re.sub(r"\s+", " ", caption).strip(" ,.")
+        while True:
+            trailing = self._tokenize_referring_expression(caption)
+            if not trailing or trailing[-1] not in self._REFERRING_TRAILING_FRAGMENT_WORDS:
+                break
+            caption = re.sub(rf"\b{re.escape(trailing[-1])}\b[\s,.;:!?-]*$", "", caption, flags=re.IGNORECASE).strip(" ,.")
         return re.sub(r"\s+", " ", caption).strip(" ,.")
+
+    def _referring_teacher_max_new_tokens(self):
+        return max(8, min(int(self.description_max_new_tokens), 14))
+
+    def _referring_verification_max_new_tokens(self):
+        return max(6, min(int(self.description_max_new_tokens), 10))
+
+    def _build_referring_verification_fallback(self, pipeline_result):
+        detailed_tokens = self._caption_token_count(pipeline_result.detailed_caption)
+        candidates = [
+            getattr(pipeline_result, "keepable_phrases", ""),
+            getattr(pipeline_result, "target_only_evidence", ""),
+            getattr(pipeline_result, "missing_phrases_needed", ""),
+            pipeline_result.detailed_caption,
+        ]
+        for candidate in candidates:
+            candidate = self._force_short_referring_expression(candidate)
+            if not candidate:
+                continue
+            tokens = self._caption_token_count(candidate)
+            if detailed_tokens > 0 and tokens >= detailed_tokens:
+                words = self._tokenize_referring_expression(candidate)
+                if len(words) >= 2:
+                    candidate = " ".join(words[: max(2, min(len(words) - 1, 4))])
+                    candidate = self._force_short_referring_expression(candidate)
+                    tokens = self._caption_token_count(candidate)
+            if not candidate or not self._referring_style_is_usable(candidate):
+                continue
+            if detailed_tokens > 0 and tokens >= detailed_tokens:
+                continue
+            return candidate
+        return ""
 
     @classmethod
     def _looks_like_meta_cue(cls, text):
@@ -392,11 +435,15 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
     def _referring_teacher_regenerate_gate_passed(self, student_caption, student_iou, teacher_iou):
         if self._teacher_regenerate_gate_passed(student_iou, teacher_iou):
             return True
-        if not self._is_hard_referring_expression(student_caption):
-            return False
         student_iou = float(student_iou)
         teacher_iou = float(teacher_iou)
         iou_gain = teacher_iou - student_iou
+        if teacher_iou >= 0.8 and iou_gain >= -0.02:
+            return True
+        if teacher_iou >= 0.7 and iou_gain >= 0.03:
+            return True
+        if not self._is_hard_referring_expression(student_caption):
+            return False
         return teacher_iou >= 0.55 and iou_gain >= 0.08
 
     @staticmethod
@@ -720,6 +767,7 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
             image=image,
             teacher_prompt_masks=teacher_prompt_masks,
             teacher_prompt=prompt,
+            max_new_tokens=self._referring_teacher_max_new_tokens(),
             **generation_kwargs,
         )
         referring_text = self._extract_labeled_teacher_text(raw_prediction, "REFERRING")
@@ -809,8 +857,9 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                 "- ERROR_TYPE must be exactly one of: wrong_subject, missing_attribute, wrong_attribute, missing_position.\n"
                 "- KEEP_CUE must be a very short target-side cue to keep or add. Use none only if necessary.\n"
                 "- DROP_CUE must be a very short wrong cue to drop. Use none if there is no wrong cue.\n"
-                "- REFERRING must be one short target-specific referring expression for region1 only, ideally 2 to 6 words as a compact noun phrase.\n"
+                "- REFERRING must be one short target-specific referring expression for region1 only, ideally 2 to 5 words as a compact noun phrase.\n"
                 "- Focus only on the target subject, not the broader scene.\n"
+                "- REFERRING must end cleanly with a noun phrase and must not end with words like with, in, on, of, or and.\n"
                 "- REFERRING must not start with 'the target', 'the region', 'region1', or any explanation template.\n"
                 "- Do not output markdown, bullets, JSON, [SEG], or any labels beyond the 4 required field names."
             )
@@ -838,11 +887,34 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                 "REFERRING: <one short target-specific referring expression>\n"
                 "Rules:\n"
                 "- Keep it short, concrete, visually grounded, and close to a RefCOCO-style noun phrase.\n"
-                "- Prefer 2 to 6 words unless one extra relational phrase is necessary.\n"
+                "- Prefer 2 to 5 words, and never exceed 6 words.\n"
                 "- Prefer subject-level cue words over scene-level context.\n"
                 "- Keep KEEP_CUE if it helps and remove DROP_CUE if it is wrong.\n"
+                "- End with a clean noun phrase, not with dangling words like with, in, on, of, or and.\n"
                 "- Do not start with 'the target', 'the region', 'region1', or an explanation template.\n"
                 "- Do not output analysis, markdown, bullets, [SEG], or extra labels."
+            )
+        if generation_mode == "referring_verification_caption":
+            clean_question = self._strip_image_placeholder(self._referring_prompt_text(student_question))
+            student_caption = self._normalize_teacher_field_text(student_caption)
+            return (
+                "<image>\n"
+                "You are writing a very short verifier-friendly referring expression for region1.\n"
+                "Only keep the minimum subject cue that still isolates the target.\n"
+                f"Student prompt: {clean_question}\n"
+                f"Current referring expression: {student_caption}\n"
+                f"KEEP_CUE: {teacher_fields.get('keepable_phrases', '')}\n"
+                f"TARGET_ONLY_CUE: {teacher_fields.get('target_only_evidence', '')}\n"
+                f"DROP_CUE: {teacher_fields.get('must_avoid_phrases', '')}\n"
+                "Output exactly one line:\n"
+                "VERIFICATION_CAPTION: <one very short referring expression>\n"
+                "Rules:\n"
+                "- Use 2 to 4 words whenever possible, never exceed 5 words.\n"
+                "- It must be shorter than the current referring expression.\n"
+                "- Keep one target-only distinguishing cue when possible.\n"
+                "- Avoid DROP_CUE and avoid any scene description.\n"
+                "- End with a clean noun phrase, not with with, in, on, of, or and.\n"
+                "- Do not output explanations, markdown, bullets, [SEG], or extra labels."
             )
         prompt = super().build_teacher_privileged_prompt_v3(
             student_question=self._referring_prompt_text(student_question),
@@ -888,6 +960,13 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
             "Write only one corrected detailed localized caption for region1.\n",
             "Write only one corrected short referring expression for region1.\n",
         )
+        prompt += (
+            "\nExtra rules for the referring expression:\n"
+            "- Prefer 2 to 5 words, and never exceed 6 words.\n"
+            "- Write a compact noun phrase, not a full sentence.\n"
+            "- End cleanly; do not end with with, in, on, of, or and.\n"
+            "- Keep only the minimum target-specific cue needed to isolate region1.\n"
+        )
         return prompt
 
     def generate_teacher_regenerate_single_stage(
@@ -927,6 +1006,7 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
             image=image,
             teacher_prompt_masks=teacher_prompt_masks,
             teacher_prompt=prompt,
+            max_new_tokens=self._referring_teacher_max_new_tokens(),
         )
         pipeline_result.single_stage_raw = "" if raw_prediction is None else str(raw_prediction)
         pipeline_result.dlc_raw = pipeline_result.single_stage_raw
@@ -972,6 +1052,75 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         pipeline_result.detailed_status = detailed_status
         pipeline_result.verification_caption = ""
         pipeline_result.verification_status = "empty"
+        return pipeline_result
+
+    def generate_teacher_verification_caption(
+        self,
+        *,
+        image,
+        teacher_prompt_masks,
+        student_question,
+        description_status,
+        reconstruction,
+        iou,
+        gt_mask,
+        ref_mask,
+        teacher_fields,
+        pipeline_result,
+    ):
+        teacher_fields = dict(teacher_fields)
+        teacher_fields.update(
+            {
+                "detailed_caption": pipeline_result.detailed_caption,
+                "target_only_evidence": pipeline_result.target_only_evidence,
+                "distractor_only_evidence": pipeline_result.distractor_only_evidence,
+                "keepable_phrases": getattr(pipeline_result, "keepable_phrases", ""),
+                "must_avoid_phrases": getattr(pipeline_result, "must_avoid_phrases", ""),
+            }
+        )
+        prompt = self.build_teacher_privileged_prompt_v3(
+            student_question=student_question,
+            student_caption=pipeline_result.detailed_caption,
+            description_status=description_status,
+            reconstruction=reconstruction,
+            iou=iou,
+            gt_mask=gt_mask,
+            ref_mask=ref_mask,
+            teacher_fields=teacher_fields,
+            generation_mode="referring_verification_caption",
+        )
+        raw_prediction = self._predict_teacher_privileged_text(
+            image=image,
+            teacher_prompt_masks=teacher_prompt_masks,
+            teacher_prompt=prompt,
+            max_new_tokens=self._referring_verification_max_new_tokens(),
+        )
+        pipeline_result.verification_raw = raw_prediction
+        verification_caption = self._clean_teacher_dlc_caption_text(
+            self._extract_labeled_teacher_text(raw_prediction, "VERIFICATION_CAPTION")
+        )
+        verification_caption = self._force_short_referring_expression(verification_caption)
+        verification_status = self._infer_description_status(verification_caption)
+        if verification_status == "ok" and (
+            not self._is_caption_content_sufficient(verification_caption)
+            or self._is_overly_generic_caption(verification_caption)
+        ):
+            verification_status = "truncated_caption"
+        pipeline_result.verification_caption = verification_caption
+        pipeline_result.verification_status = verification_status
+        failure_reason = self._validate_teacher_verification_caption(pipeline_result)
+        if failure_reason:
+            fallback_caption = self._build_referring_verification_fallback(pipeline_result)
+            if fallback_caption:
+                pipeline_result.verification_caption = fallback_caption
+                pipeline_result.verification_status = self._infer_description_status(fallback_caption)
+                retry_reason = self._validate_teacher_verification_caption(pipeline_result)
+                if not retry_reason:
+                    pipeline_result.verification_failure_reason = ""
+                    return pipeline_result
+                failure_reason = retry_reason
+        if failure_reason:
+            pipeline_result.verification_failure_reason = failure_reason
         return pipeline_result
 
     def _metric_tensor_like(self, value, reference):
