@@ -2563,6 +2563,55 @@
 - Ran:
   - `python3 -m py_compile projects/sa2va/models/sa2va_opsd_referring_v3.py`
 
+## 2026-07-17 Frozen 4B Teacher Plus Type-Conditioned Referring Regenerate And On-Policy Guidance
+
+### Problem
+- The short-referring RefCOCO branch frequently produced good teacher rewrite candidates, but the front-running diagnosis type was often wrong, so cue gating and route behavior did not match the actual best caption.
+- Regenerate and on-policy routes also shared the same moving EMA teacher, which made diagnosis behavior drift while the short-referring pipeline itself was still being redesigned.
+- The user wanted two route-specific behaviors:
+  - `teacher_regenerate`: use type-conditioned candidate search and take the best caption as the off-policy CE target
+  - `on_policy_distill`: use the same posterior type result only as token-level correction guidance on the student trajectory, without replacing the student's completion
+
+### Root Cause Notes
+- The previous short-referring regenerate path still committed to a single diagnosis before candidate search, so the selected caption and the selected type could diverge.
+- The teacher update path in `projects/sa2va/models/sa2va_opsd_v2.py` only supported EMA-style synchronization from the student, which is undesirable when we want a stable privileged teacher snapshot.
+- The on-policy loss path only supported entropy-based token weighting, so there was no direct way to inject route-local type-aware edit emphasis while keeping the same student completion IDs.
+
+### Chosen Fix Direction
+- Add a `teacher_update_mode` so the short-referring configs can freeze the teacher at the initial 4B snapshot instead of EMA-updating it.
+- Replace the short-referring regenerate diagnosis path with a type-conditioned candidate-table search over the fixed five failure types, then select a posterior best type and caption locally using reconstruction quality.
+- Keep on-policy self-distillation on the original student trajectory, but add optional type-aware token weighting derived from the posterior selected type, keep cue, and drop cue.
+
+### Rejected Direction
+- Do not let on-policy short-referring silently turn into regenerate-style caption CE. That would blur the route definition and move the route away from token-prefix-conditioned self-distillation.
+- Do not generalize the new frozen-teacher behavior to every OPSD config in this patch. The change is intentionally scoped to the RefCOCO short-referring branch.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py`:
+  - added `teacher_update_mode` with `ema` and `frozen_snapshot`
+  - skipped teacher sync / EMA updates when the mode is `frozen_snapshot`
+  - exposed `should_update_teacher()` for the EMA hook
+  - let teacher analysis run even when teacher CE is not being applied so on-policy guidance can still use posterior type results
+  - added optional `type_edit_weights` support to `compute_onpolicy_distill_loss()`
+  - passed short-referring on-policy type-guidance data into on-policy batch entries and debug records
+- Updated `projects/sa2va/hooks/ema_teacher_hook.py`:
+  - skipped EMA updates when the model reports that the teacher should stay frozen
+- Updated `projects/sa2va/models/sa2va_opsd_referring_v3.py`:
+  - added the ordered short-referring failure-type set plus detailed per-type definitions
+  - added type-conditioned row generation and local parsing for `TYPE / KEEP_CUE / DROP_CUE / REFERRING`
+  - replaced the old single-diagnosis regenerate flow with a local type-conditioned candidate search and posterior selected-type choice
+  - carried posterior selected type, best caption, best IoU, and gain into the pipeline result
+  - added on-policy short-referring type guidance, including token-overlap gating and token-level edit weights
+  - added a short-referring on-policy teacher prompt mode that conditions token scoring on the selected type definition
+- Updated the short-referring configs:
+  - `projects/sa2va/configs/sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3_referring.py`
+  - `projects/sa2va/configs/sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3_referring_online.py`
+  - enabled `teacher_update_mode="frozen_snapshot"` and the new type-guidance settings
+
+### Validation
+- Ran:
+  - `python3 -m py_compile projects/sa2va/models/sa2va_opsd_v2.py projects/sa2va/models/sa2va_opsd_referring_v3.py projects/sa2va/hooks/ema_teacher_hook.py projects/sa2va/configs/sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3_referring.py projects/sa2va/configs/sa2va_opsd_refcoco_sa2va4b_in25_qwen25_3b_v3_referring_online.py`
+
 ## 2026-07-16 Shorten Referring Teacher Captions, Stabilize Verification, And Relax Online Regenerate Gate
 
 ### Problem

@@ -143,6 +143,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         teacher_model_path=None,
         enable_teacher=True,
         teacher_ema_alpha=0.999,
+        teacher_update_mode="ema",
         tokenizer_path=None,
         torch_dtype="auto",
         teacher_temperature=1.0,
@@ -214,6 +215,11 @@ class Sa2VAOPSDModelV2(BaseModel):
         self.model_path = model_path
         self.enable_teacher = bool(enable_teacher)
         self.teacher_ema_alpha = float(teacher_ema_alpha)
+        self.teacher_update_mode = str(teacher_update_mode or "ema").strip().lower()
+        if self.teacher_update_mode not in {"ema", "frozen_snapshot"}:
+            raise ValueError(
+                f"teacher_update_mode must be 'ema' or 'frozen_snapshot', got {self.teacher_update_mode!r}."
+            )
         if not (0.0 < self.teacher_ema_alpha <= 1.0):
             raise ValueError(
                 f"teacher_ema_alpha must be in (0, 1], got {self.teacher_ema_alpha}."
@@ -800,6 +806,11 @@ class Sa2VAOPSDModelV2(BaseModel):
     def _sync_teacher(self):
         if not self.has_teacher_model():
             return
+        if self.teacher_update_mode == "frozen_snapshot":
+            self.teacher_model.to(self.device)
+            self.teacher_model.requires_grad_(False)
+            self.teacher_model.eval()
+            return
         self.teacher_model.load_state_dict(self.student_model.state_dict(), strict=False)
         self.teacher_model.to(self.device)
         self.teacher_model.requires_grad_(False)
@@ -808,6 +819,10 @@ class Sa2VAOPSDModelV2(BaseModel):
     @torch.no_grad()
     def update_teacher_ema(self, alpha=None):
         if not self.has_teacher_model():
+            return False
+        if self.teacher_update_mode == "frozen_snapshot":
+            self.teacher_model.requires_grad_(False)
+            self.teacher_model.eval()
             return False
 
         ema_alpha = self.teacher_ema_alpha if alpha is None else float(alpha)
@@ -887,6 +902,9 @@ class Sa2VAOPSDModelV2(BaseModel):
         self._sync_teacher()
         self._sync_old_policy()
         return result
+
+    def should_update_teacher(self):
+        return bool(self.has_teacher_model() and self.teacher_update_mode != "frozen_snapshot")
 
     @staticmethod
     def _to_numpy_mask(mask):
@@ -5846,9 +5864,11 @@ class Sa2VAOPSDModelV2(BaseModel):
             "teacher_fallback_reason": "",
             "teacher_selected_caption_source": "",
             "teacher_dlc_candidate_scores": (),
+            "teacher_primary_failure_type": "",
+            "teacher_posterior_selected_type": "",
+            "teacher_posterior_best_iou": 0.0,
+            "teacher_posterior_gain_vs_student": 0.0,
         }
-        if not allow_teacher_ce:
-            return result
         caption_mode_failure = bool(description.raw_failure_mode == "seg_style_answer" or description.status == "seg_style_answer")
         result["caption_mode_failure"] = caption_mode_failure
 
@@ -5877,6 +5897,16 @@ class Sa2VAOPSDModelV2(BaseModel):
         result["teacher_dlc"] = teacher_regenerate.detailed_caption
         result["teacher_dlc_valid"] = bool(
             teacher_regenerate.detailed_status == "ok" and not teacher_regenerate.detailed_failure_reason
+        )
+        result["teacher_primary_failure_type"] = str(getattr(teacher_regenerate, "primary_failure_type", ""))
+        result["teacher_posterior_selected_type"] = str(
+            getattr(teacher_regenerate, "posterior_selected_type", getattr(teacher_regenerate, "primary_failure_type", ""))
+        )
+        result["teacher_posterior_best_iou"] = float(
+            getattr(teacher_regenerate, "posterior_best_iou", result["teacher_verification_iou"])
+        )
+        result["teacher_posterior_gain_vs_student"] = float(
+            getattr(teacher_regenerate, "posterior_gain_vs_student", result["teacher_posterior_best_iou"] - float(iou))
         )
         result["teacher_keep_cue"] = str(getattr(teacher_regenerate, "keepable_phrases", ""))
         result["teacher_drop_cue"] = str(getattr(teacher_regenerate, "must_avoid_phrases", ""))
@@ -6015,6 +6045,7 @@ class Sa2VAOPSDModelV2(BaseModel):
         teacher_prompt_masks=None,
         iou=0.0,
         loss_weight=1.0,
+        type_edit_weights=None,
     ):
         if completion_ids.shape[1] == 0:
             return None
@@ -6044,6 +6075,12 @@ class Sa2VAOPSDModelV2(BaseModel):
         )
         token_weights = torch.exp(-self.entropy_weight_beta * teacher_entropy)
         token_weights = token_weights / token_weights.mean(dim=-1, keepdim=True).clamp_min(1e-6)
+        if type_edit_weights is not None:
+            type_edit_weights = type_edit_weights.to(device=token_weights.device, dtype=token_weights.dtype)
+            if type_edit_weights.ndim == 1:
+                type_edit_weights = type_edit_weights.unsqueeze(0)
+            if type_edit_weights.shape == token_weights.shape:
+                token_weights = token_weights * type_edit_weights
         sample_weight = self.mid_iou_alpha * max(1.0 - float(iou), 0.0)
         return (jsd_tokens * token_weights).mean() * sample_weight * float(loss_weight)
 
@@ -6066,6 +6103,7 @@ class Sa2VAOPSDModelV2(BaseModel):
                 teacher_prompt_masks=item.get("teacher_prompt_masks", item["prompt_masks"]),
                 iou=float(item.get("iou", 0.0)),
                 loss_weight=loss_weight,
+                type_edit_weights=item.get("type_edit_weights"),
             )
             if sample_loss is not None:
                 sample_losses.append(sample_loss)
@@ -7165,6 +7203,32 @@ class Sa2VAOPSDModelV2(BaseModel):
                 )
                 teacher_prompt_masks = self._build_teacher_prompt_masks(gt_mask_np, ref_mask_np)
                 onpolicy_completion = description.completion_ids
+                onpolicy_guidance = None
+                build_onpolicy_guidance = getattr(self, "_build_onpolicy_type_guidance", None)
+                if callable(build_onpolicy_guidance):
+                    onpolicy_guidance = build_onpolicy_guidance(
+                        student_caption=description.clean_caption,
+                        completion_ids=onpolicy_completion,
+                        student_iou=iou,
+                        teacher_analysis=teacher_analysis,
+                    )
+                if onpolicy_guidance is not None and onpolicy_guidance.get("type_guidance_applied", False):
+                    teacher_prompt = self.build_teacher_privileged_prompt_v3(
+                        student_question=student_question,
+                        student_caption=description.clean_caption,
+                        description_status=description.status,
+                        reconstruction=effective_reconstruction,
+                        iou=iou,
+                        gt_mask=gt_mask_np,
+                        ref_mask=ref_mask_np,
+                        teacher_fields={
+                            "primary_failure_type": onpolicy_guidance.get("posterior_selected_type", ""),
+                            "keepable_phrases": teacher_analysis.get("teacher_keep_cue", ""),
+                            "must_avoid_phrases": teacher_analysis.get("teacher_drop_cue", ""),
+                            "target_only_evidence": teacher_analysis.get("teacher_target_only_evidence", ""),
+                        },
+                        generation_mode="referring_onpolicy_type_guidance",
+                    )
                 if onpolicy_completion.shape[1] == 0:
                     dummy_reason = "empty_completion"
                 elif not student_caption_trainable:
@@ -7186,9 +7250,20 @@ class Sa2VAOPSDModelV2(BaseModel):
                             "is_dummy": False,
                             "loss_weight": sample_loss_weight,
                             "dummy_reason": None,
+                            "type_edit_weights": None if onpolicy_guidance is None else onpolicy_guidance.get("type_edit_weights"),
                         }
                     )
                     sample_debug_record["entry_added"] = True
+                    if onpolicy_guidance is not None:
+                        sample_debug_record["onpolicy_posterior_selected_type"] = onpolicy_guidance.get("posterior_selected_type", "")
+                        sample_debug_record["onpolicy_type_guidance_applied"] = bool(onpolicy_guidance.get("type_guidance_applied", False))
+                        sample_debug_record["onpolicy_type_guidance_block_reason"] = str(onpolicy_guidance.get("type_guidance_block_reason", ""))
+                        sample_debug_record["onpolicy_posterior_best_iou"] = float(onpolicy_guidance.get("posterior_best_iou", 0.0))
+                        sample_debug_record["onpolicy_posterior_gain_vs_student"] = float(onpolicy_guidance.get("posterior_gain_vs_student", 0.0))
+                        sample_debug_record["onpolicy_token_overlap_ratio"] = float(onpolicy_guidance.get("token_overlap_ratio", 0.0))
+                        sample_debug_record["onpolicy_keep_span_hit"] = bool(onpolicy_guidance.get("keep_span_hit", False))
+                        sample_debug_record["onpolicy_drop_span_hit"] = bool(onpolicy_guidance.get("drop_span_hit", False))
+                        sample_debug_record["onpolicy_type_weight_mean"] = float(onpolicy_guidance.get("type_weight_mean", 1.0))
                 else:
                     is_dummy = True
                 sample_debug_record["is_dummy"] = bool(dummy_reason is not None)

@@ -48,6 +48,9 @@ class EMATeacherHook(Hook):
             return
 
         model = self._unwrap_model(runner)
+        should_update_teacher = getattr(model, "should_update_teacher", None)
+        if callable(should_update_teacher) and not should_update_teacher():
+            return
         update_fn = getattr(model, "update_teacher_ema", None)
         if callable(update_fn):
             update_fn()

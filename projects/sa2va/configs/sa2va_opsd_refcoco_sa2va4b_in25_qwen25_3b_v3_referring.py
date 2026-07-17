@@ -22,6 +22,16 @@ model["referring_direct_mask_loss_weight"] = 0.7
 model["referring_teacher_direct_mask_loss_weight"] = 0.35
 model["referring_confuser_separation_loss_weight"] = 0.15
 model["referring_direct_mask_loss_min_iou_gate"] = 0.0
+model["teacher_update_mode"] = "frozen_snapshot"
+model["referring_type_conditioned_candidate_count_per_type"] = 2
+model["enable_referring_onpolicy_type_guidance"] = True
+model["referring_onpolicy_min_posterior_gain"] = 0.08
+model["referring_onpolicy_min_posterior_iou"] = 0.55
+model["referring_onpolicy_min_token_overlap"] = 0.5
+model["referring_onpolicy_drop_token_weight"] = 1.6
+model["referring_onpolicy_keep_token_weight"] = 1.3
+model["referring_onpolicy_position_token_weight"] = 1.4
+model["referring_enable_posterior_type_explanation"] = True
 
 train_dataset["student_question"] = DEFAULT_MASK_TO_REFERRING_QUESTION
 train_dataset["route_manifest_path"] = route_manifest_path if use_manifest_routes else None

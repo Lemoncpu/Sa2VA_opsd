@@ -97,6 +97,15 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         referring_teacher_direct_mask_loss_weight=0.35,
         referring_confuser_separation_loss_weight=0.15,
         referring_direct_mask_loss_min_iou_gate=0.0,
+        referring_type_conditioned_candidate_count_per_type=2,
+        enable_referring_onpolicy_type_guidance=True,
+        referring_onpolicy_min_posterior_gain=0.08,
+        referring_onpolicy_min_posterior_iou=0.55,
+        referring_onpolicy_min_token_overlap=0.5,
+        referring_onpolicy_drop_token_weight=1.6,
+        referring_onpolicy_keep_token_weight=1.3,
+        referring_onpolicy_position_token_weight=1.4,
+        referring_enable_posterior_type_explanation=True,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -109,6 +118,15 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         self.referring_teacher_direct_mask_loss_weight = float(referring_teacher_direct_mask_loss_weight)
         self.referring_confuser_separation_loss_weight = float(referring_confuser_separation_loss_weight)
         self.referring_direct_mask_loss_min_iou_gate = float(referring_direct_mask_loss_min_iou_gate)
+        self.referring_type_conditioned_candidate_count_per_type = max(int(referring_type_conditioned_candidate_count_per_type), 1)
+        self.enable_referring_onpolicy_type_guidance = bool(enable_referring_onpolicy_type_guidance)
+        self.referring_onpolicy_min_posterior_gain = float(referring_onpolicy_min_posterior_gain)
+        self.referring_onpolicy_min_posterior_iou = float(referring_onpolicy_min_posterior_iou)
+        self.referring_onpolicy_min_token_overlap = float(referring_onpolicy_min_token_overlap)
+        self.referring_onpolicy_drop_token_weight = float(referring_onpolicy_drop_token_weight)
+        self.referring_onpolicy_keep_token_weight = float(referring_onpolicy_keep_token_weight)
+        self.referring_onpolicy_position_token_weight = float(referring_onpolicy_position_token_weight)
+        self.referring_enable_posterior_type_explanation = bool(referring_enable_posterior_type_explanation)
 
     @staticmethod
     def _referring_failure_type_set():
@@ -118,6 +136,46 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
             "missing_attribute",
             "wrong_attribute",
             "missing_position",
+        }
+
+    @staticmethod
+    def _referring_failure_type_order():
+        return (
+            "wrong_subject",
+            "wrong_anchor",
+            "missing_attribute",
+            "wrong_attribute",
+            "missing_position",
+        )
+
+    @classmethod
+    def _referring_failure_type_definitions(cls):
+        return {
+            "wrong_subject": (
+                "Meaning: the student points to the wrong nearby instance as the main subject.\n"
+                "Symptoms: the main noun phrase fits a confuser better than the true target.\n"
+                "Rewrite rule: switch back to the real target subject and do not keep detailing the wrong instance."
+            ),
+            "wrong_anchor": (
+                "Meaning: the core subject is roughly right but a support, container, background, or context phrase shifts reconstruction away from the true target.\n"
+                "Symptoms: phrases like on a plate, in a bowl, on the road, or next to something pull the mask toward a larger support region.\n"
+                "Rewrite rule: keep the core subject phrase and remove the support or context anchor."
+            ),
+            "missing_attribute": (
+                "Meaning: the subject category is roughly right but one short target-only attribute is missing.\n"
+                "Symptoms: the caption is too broad to separate the target from similar nearby instances.\n"
+                "Rewrite rule: add only the shortest high-value distinguishing attribute."
+            ),
+            "wrong_attribute": (
+                "Meaning: the subject category is roughly right but an included attribute matches the confuser better than the target.\n"
+                "Symptoms: a color, size, local state, clothing, or accessory phrase is wrong.\n"
+                "Rewrite rule: remove the wrong attribute and keep or restore the correct target-side cue."
+            ),
+            "missing_position": (
+                "Meaning: the subject and attributes are roughly right but the expression lacks a short spatial or ordinal cue.\n"
+                "Symptoms: multiple same-category instances remain ambiguous without left, right, front, second, smaller, or similar cues.\n"
+                "Rewrite rule: add one minimal position or order cue without expanding into scene description."
+            ),
         }
 
     @staticmethod
@@ -312,6 +370,123 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
     def _sanitize_referring_prompt_summary(self, value):
         cleaned = self._sanitize_referring_cue(value, allow_none=False)
         return cleaned
+
+    @classmethod
+    def _referring_type_definition_text(cls, failure_type):
+        return cls._referring_failure_type_definitions().get(failure_type, "")
+
+    def _build_referring_type_rows_text(self):
+        rows = []
+        for failure_type in self._referring_failure_type_order():
+            rows.append(f"Type {failure_type}:\n{self._referring_type_definition_text(failure_type)}")
+        return "\n".join(rows)
+
+    def _build_referring_type_keep_cue(self, relation_context, student_caption, failure_type):
+        target_only = self._sanitize_referring_prompt_summary(relation_context.get("gt_only_summary", ""))
+        if self._teacher_field_is_effective(target_only):
+            return target_only
+        return self._fallback_referring_keep_cue(student_caption, failure_type) or "none"
+
+    def _referring_phrase_overlap_ratio(self, text_a, text_b):
+        tokens_a = self._tokenize_referring_expression(text_a)
+        tokens_b = self._tokenize_referring_expression(text_b)
+        if not tokens_a or not tokens_b:
+            return 0.0
+        set_a = set(tokens_a)
+        set_b = set(tokens_b)
+        return float(len(set_a & set_b)) / float(max(len(set_a | set_b), 1))
+
+    def _tokenize_completion_pieces(self, completion_ids):
+        if completion_ids is None or completion_ids.numel() == 0:
+            return []
+        token_ids = completion_ids[0].detach().cpu().tolist()
+        pieces = []
+        for token_id in token_ids:
+            piece = self.tokenizer.decode([token_id], skip_special_tokens=True)
+            piece = re.sub(r"\s+", " ", piece).strip().lower()
+            pieces.append(piece)
+        return pieces
+
+    def _build_onpolicy_type_edit_weights(
+        self,
+        *,
+        completion_ids,
+        posterior_selected_type,
+        posterior_keep_cue,
+        posterior_drop_cue,
+    ):
+        pieces = self._tokenize_completion_pieces(completion_ids)
+        if not pieces:
+            return None, False, False, 1.0
+        weights = torch.ones((1, len(pieces)), dtype=torch.float32)
+        keep_tokens = set(self._tokenize_referring_expression(posterior_keep_cue))
+        drop_tokens = set(self._tokenize_referring_expression(posterior_drop_cue))
+        keep_hit = False
+        drop_hit = False
+        for idx, piece in enumerate(pieces):
+            piece_tokens = set(re.findall(r"[a-z0-9']+", piece))
+            if keep_tokens and piece_tokens & keep_tokens:
+                weights[0, idx] *= self.referring_onpolicy_keep_token_weight
+                keep_hit = True
+            if drop_tokens and piece_tokens & drop_tokens:
+                weights[0, idx] *= self.referring_onpolicy_drop_token_weight
+                drop_hit = True
+            if posterior_selected_type == "missing_position":
+                if piece_tokens & (self._REFERRING_DIRECTION_WORDS | self._REFERRING_ORDINAL_WORDS):
+                    weights[0, idx] *= self.referring_onpolicy_position_token_weight
+                    keep_hit = True
+        return weights, keep_hit, drop_hit, float(weights.mean().item())
+
+    def _build_onpolicy_type_guidance(self, *, student_caption, completion_ids, student_iou, teacher_analysis):
+        if not self.enable_referring_onpolicy_type_guidance:
+            return None
+        posterior_type = str(teacher_analysis.get("teacher_primary_failure_type", "") or "")
+        posterior_caption = str(teacher_analysis.get("teacher_dlc", "") or "")
+        posterior_keep = str(teacher_analysis.get("teacher_keep_cue", "") or "")
+        posterior_drop = str(teacher_analysis.get("teacher_drop_cue", "") or "")
+        posterior_iou = float(teacher_analysis.get("teacher_iou_plain", 0.0) or 0.0)
+        gain = posterior_iou - float(student_iou)
+        overlap = self._referring_phrase_overlap_ratio(student_caption, posterior_caption)
+        block_reason = ""
+        applied = True
+        if posterior_type not in self._referring_failure_type_set():
+            applied = False
+            block_reason = "invalid_posterior_type"
+        elif gain < self.referring_onpolicy_min_posterior_gain:
+            applied = False
+            block_reason = "low_posterior_gain"
+        elif posterior_iou < max(float(student_iou) + self.referring_onpolicy_min_posterior_gain, self.referring_onpolicy_min_posterior_iou):
+            applied = False
+            block_reason = "low_posterior_iou"
+        elif overlap < self.referring_onpolicy_min_token_overlap:
+            applied = False
+            block_reason = "low_token_overlap"
+        weights = None
+        keep_hit = False
+        drop_hit = False
+        weight_mean = 1.0
+        if applied:
+            weights, keep_hit, drop_hit, weight_mean = self._build_onpolicy_type_edit_weights(
+                completion_ids=completion_ids,
+                posterior_selected_type=posterior_type,
+                posterior_keep_cue=posterior_keep,
+                posterior_drop_cue=posterior_drop,
+            )
+            if weights is None:
+                applied = False
+                block_reason = "empty_type_weights"
+        return {
+            "posterior_selected_type": posterior_type,
+            "posterior_best_iou": posterior_iou,
+            "posterior_gain_vs_student": gain,
+            "token_overlap_ratio": overlap,
+            "type_guidance_applied": applied,
+            "type_guidance_block_reason": block_reason,
+            "type_edit_weights": weights if applied else None,
+            "keep_span_hit": keep_hit,
+            "drop_span_hit": drop_hit,
+            "type_weight_mean": weight_mean,
+        }
 
     def _fallback_referring_keep_cue(self, student_caption, failure_type):
         caption = self._force_short_referring_expression(student_caption)
@@ -850,6 +1025,80 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
             return False
         return bool(candidate.get("cue_passed", True))
 
+    def _parse_referring_type_conditioned_row(self, raw_prediction, failure_type, relation_context, student_caption):
+        sections = self._parse_teacher_labeled_sections(
+            "" if raw_prediction is None else str(raw_prediction),
+            ("TYPE", "KEEP_CUE", "DROP_CUE", "REFERRING"),
+        )
+        keep_cue = self._sanitize_referring_cue(sections.get("KEEP_CUE", ""))
+        drop_cue = self._extract_student_drop_cue(
+            student_caption,
+            preferred_text=sections.get("DROP_CUE", ""),
+            failure_type=failure_type,
+        )
+        referring = self._force_short_referring_expression(sections.get("REFERRING", ""))
+        if not self._teacher_field_is_effective(keep_cue):
+            keep_cue = self._build_referring_type_keep_cue(relation_context, student_caption, failure_type)
+        return {
+            "source_type": failure_type,
+            "keep_cue": keep_cue,
+            "drop_cue": drop_cue,
+            "caption": referring,
+            "raw_prediction": "" if raw_prediction is None else str(raw_prediction),
+        }
+
+    def _generate_referring_type_conditioned_table(
+        self,
+        *,
+        image,
+        gt_mask,
+        ref_mask,
+        student_question,
+        student_caption,
+        description_status,
+        reconstruction,
+        iou,
+        relation_context,
+        teacher_prompt_masks,
+    ):
+        rows = []
+        for failure_type in self._referring_failure_type_order():
+            prompt = self.build_teacher_privileged_prompt_v3(
+                student_question=student_question,
+                student_caption=student_caption,
+                description_status=description_status,
+                reconstruction=reconstruction,
+                iou=iou,
+                gt_mask=gt_mask,
+                ref_mask=ref_mask,
+                teacher_fields={
+                    "forced_failure_type": failure_type,
+                    "type_definition_text": self._referring_type_definition_text(failure_type),
+                    "gt_summary": self._sanitize_referring_prompt_summary(relation_context.get("gt_summary", "")),
+                    "ref_summary": self._sanitize_referring_prompt_summary(relation_context.get("ref_summary", "")),
+                    "gt_only_summary": self._sanitize_referring_prompt_summary(relation_context.get("gt_only_summary", "")),
+                    "ref_only_summary": self._sanitize_referring_prompt_summary(relation_context.get("ref_only_summary", "")),
+                    "suggested_keep_cue": self._build_referring_type_keep_cue(relation_context, student_caption, failure_type),
+                    "suggested_drop_cue": self._extract_student_drop_cue(student_caption, failure_type=failure_type),
+                },
+                generation_mode="referring_type_conditioned_table",
+            )
+            raw_prediction = self._predict_teacher_privileged_text(
+                image=image,
+                teacher_prompt_masks=teacher_prompt_masks,
+                teacher_prompt=prompt,
+                max_new_tokens=self._referring_teacher_max_new_tokens(),
+            )
+            rows.append(
+                self._parse_referring_type_conditioned_row(
+                    raw_prediction,
+                    failure_type,
+                    relation_context,
+                    student_caption,
+                )
+            )
+        return rows
+
     def generate_description_with_model(
         self,
         model,
@@ -880,6 +1129,40 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         teacher_fields,
         generation_mode="trajectory_guidance",
     ):
+        if generation_mode == "referring_type_conditioned_table":
+            clean_question = self._strip_image_placeholder(self._referring_prompt_text(student_question))
+            student_caption = self._normalize_teacher_field_text(student_caption)
+            forced_type = self._normalize_teacher_field_text(teacher_fields.get("forced_failure_type", "")).lower()
+            return (
+                "<image>\n"
+                "You are supervising a short referring expression reconstruction task.\n"
+                "Write one candidate row for exactly one forced error type.\n"
+                f"Student prompt: {clean_question}\n"
+                f"Student referring expression: {student_caption}\n"
+                f"Description status: {description_status}\n"
+                f"Reconstruction status: {reconstruction.status}\n"
+                f"IoU between region1 and region2: {iou:.4f}\n"
+                f"Target subject cue: {teacher_fields.get('gt_summary', '')}\n"
+                f"Reconstructed subject cue: {teacher_fields.get('ref_summary', '')}\n"
+                f"Target-only cue: {teacher_fields.get('gt_only_summary', '')}\n"
+                f"Distractor-only cue: {teacher_fields.get('ref_only_summary', '')}\n"
+                f"Forced type: {forced_type}\n"
+                f"Meaning and rewrite rule for this type:\n{teacher_fields.get('type_definition_text', '')}\n"
+                "Output exactly these 4 lines and nothing else:\n"
+                "TYPE:\n"
+                "KEEP_CUE:\n"
+                "DROP_CUE:\n"
+                "REFERRING:\n"
+                "Rules:\n"
+                f"- TYPE must be exactly {forced_type}.\n"
+                "- KEEP_CUE must be a very short target-side cue to keep or add.\n"
+                "- DROP_CUE must be a very short wrong cue copied from the student's actual expression. Use none if there is no removable wrong cue.\n"
+                "- REFERRING must be one short target-specific referring expression for region1 only, ideally 2 to 5 words as a compact noun phrase.\n"
+                "- Keep the core subject target-specific and do not output prose explanations.\n"
+                "- REFERRING must not start with template phrases like the target, the region, or region1.\n"
+                "- REFERRING must end cleanly and not trail with with, in, on, of, or and.\n"
+                "- Do not output JSON, bullets, markdown, or extra labels."
+            )
         if generation_mode == "referring_fault_report_rewrite":
             clean_question = self._strip_image_placeholder(self._referring_prompt_text(student_question))
             relation_context = build_mask_relation_context(
@@ -980,6 +1263,24 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                 "- Avoid DROP_CUE and avoid any scene description.\n"
                 "- End with a clean noun phrase, not with with, in, on, of, or and.\n"
                 "- Do not output explanations, markdown, bullets, [SEG], or extra labels."
+            )
+        if generation_mode == "referring_onpolicy_type_guidance":
+            clean_question = self._strip_image_placeholder(self._referring_prompt_text(student_question))
+            student_caption = self._normalize_teacher_field_text(student_caption)
+            forced_type = self._normalize_teacher_field_text(teacher_fields.get("primary_failure_type", "")).lower()
+            return (
+                "<image>\n"
+                "You are providing token-level correction guidance for a student's current short referring expression.\n"
+                "Do not rewrite the expression into a new sentence. Stay aligned to the student's current wording and decide better next-token preferences on the same trajectory.\n"
+                f"Student prompt: {clean_question}\n"
+                f"Student referring expression: {student_caption}\n"
+                f"Current error type: {forced_type}\n"
+                f"Type meaning and rewrite rule:\n{self._referring_type_definition_text(forced_type)}\n"
+                f"KEEP_CUE: {teacher_fields.get('keepable_phrases', '')}\n"
+                f"DROP_CUE: {teacher_fields.get('must_avoid_phrases', '')}\n"
+                f"Target-only cue: {teacher_fields.get('target_only_evidence', '')}\n"
+                "When scoring the student's current tokens, favor local edits that keep KEEP_CUE and suppress DROP_CUE.\n"
+                "Do not output a rewritten caption or free-form analysis."
             )
         prompt = super().build_teacher_privileged_prompt_v3(
             student_question=self._referring_prompt_text(student_question),
@@ -1455,7 +1756,7 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         fallback_prompt_masks = self._build_teacher_prompt_masks(gt_mask, ref_mask)
         relation_context = build_mask_relation_context(model=self, gt_mask=gt_mask, ref_mask=ref_mask)
         pipeline_result = self._build_empty_teacher_regenerate_pipeline_result()
-        pipeline_result.teacher_pipeline_mode = "referring_minimal_4field"
+        pipeline_result.teacher_pipeline_mode = "referring_type_conditioned_table"
         pipeline_result.target_summary = self._normalize_teacher_field_text(relation_context.get("gt_summary", ""))
         pipeline_result.distractor_summary = self._normalize_teacher_field_text(relation_context.get("ref_summary", ""))
         pipeline_result.target_only_evidence = self._normalize_teacher_field_text(relation_context.get("gt_only_summary", ""))
@@ -1466,91 +1767,67 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         pipeline_result.distractor_localization_hint = ""
         pipeline_result.likely_drift_reason = ""
         pipeline_result.difference_context_nontrivial = False
-        pipeline_result.stop_stage = "minimal_relation_cues"
-        diagnosis_teacher_fields = dict(teacher_fields)
-        diagnosis_teacher_fields.update(
-            {
-                "gt_summary": pipeline_result.target_summary,
-                "ref_summary": pipeline_result.distractor_summary,
-                "gt_only_summary": pipeline_result.target_only_evidence,
-                "ref_only_summary": pipeline_result.distractor_only_evidence,
-            }
-        )
-        diagnosis_prompt = self.build_teacher_privileged_prompt_v3(
+        pipeline_result.stop_stage = "type_conditioned_table"
+
+        type_rows = self._generate_referring_type_conditioned_table(
+            image=image,
+            gt_mask=gt_mask,
+            ref_mask=ref_mask,
             student_question=student_question,
             student_caption=student_caption,
             description_status=description_status,
             reconstruction=reconstruction,
             iou=iou,
-            gt_mask=gt_mask,
-            ref_mask=ref_mask,
-            teacher_fields=diagnosis_teacher_fields,
-            generation_mode="referring_fault_report_rewrite",
-        )
-        raw_prediction = self._predict_teacher_privileged_text(
-            image=image,
-            teacher_prompt_masks=teacher_prompt_masks,
-            teacher_prompt=diagnosis_prompt,
-        )
-        pipeline_result = self._parse_referring_fault_report(raw_prediction, base_result=pipeline_result)
-        pipeline_result = self._backfill_referring_fault_report(
-            pipeline_result,
             relation_context=relation_context,
-            student_caption=student_caption,
+            teacher_prompt_masks=teacher_prompt_masks,
         )
-        pipeline_result.diagnosis_valid, pipeline_result.diagnosis_failure_reason = self.validate_referring_fault_report(
-            pipeline_result
+        pipeline_result.structured_diagnosis_raw = "\n\n".join(
+            row.get("raw_prediction", "") for row in type_rows if row.get("raw_prediction")
         )
-        pipeline_result.stop_stage = "structured_diagnosis"
+        pipeline_result.diagnosis_raw = pipeline_result.structured_diagnosis_raw
+        pipeline_result.diagnosis_valid = len(type_rows) == len(self._referring_failure_type_order())
+        pipeline_result.diagnosis_failure_reason = "" if pipeline_result.diagnosis_valid else "referring_type_table_invalid"
 
         candidates = []
         candidate_scores = []
-        if self._teacher_field_is_effective(pipeline_result.detailed_caption, invalid_markers=("",)):
-            direct_candidate = self._evaluate_referring_candidate(
-                image=image,
-                gt_mask=gt_mask,
-                raw_prediction=pipeline_result.structured_diagnosis_raw,
-                caption_text=pipeline_result.detailed_caption,
-                pipeline_result=pipeline_result,
-                student_iou=iou,
-                source="structured_referring_direct",
-                style_hint="direct_rewrite_from_fault_report",
-            )
-            candidates.append(direct_candidate)
-            candidate_scores.append(
-                {
-                    "caption": direct_candidate["caption"],
-                    "status": direct_candidate["status"],
-                    "failure_reason": direct_candidate["failure_reason"],
-                    "reconstruct_iou": direct_candidate["reconstruct_iou"],
-                    "score": direct_candidate["score"],
-                }
-            )
-
-        if pipeline_result.diagnosis_valid or self._teacher_has_minimal_diagnosis_signal(pipeline_result):
-            primary_hint = self._referring_type_specific_style_hint(
-                getattr(pipeline_result, "primary_failure_type", ""),
-                repair_mode=False,
-            )
-            candidate_specs = (
-                {
-                    "candidate_style_hint": primary_hint,
-                    "do_sample": False,
-                },
-                {
-                    "candidate_style_hint": f"{primary_hint} Keep it to 2 to 5 words if possible.",
-                    "do_sample": True,
-                    "temperature": 0.35,
-                    "top_p": 0.9,
-                },
-                {
-                    "candidate_style_hint": f"{primary_hint} Remove every distractor-compatible phrase.",
-                    "do_sample": True,
-                    "temperature": 0.55,
-                    "top_p": 0.92,
-                },
-            )
-            for spec in candidate_specs:
+        for row in type_rows:
+            row_result = self._build_empty_teacher_regenerate_pipeline_result()
+            row_result.primary_failure_type = row["source_type"]
+            row_result.keepable_phrases = row["keep_cue"]
+            row_result.must_avoid_phrases = row["drop_cue"]
+            row_result.missing_phrases_needed = row["keep_cue"]
+            row_result.target_summary = pipeline_result.target_summary
+            row_result.distractor_summary = pipeline_result.distractor_summary
+            row_result.target_only_evidence = pipeline_result.target_only_evidence
+            row_result.distractor_only_evidence = pipeline_result.distractor_only_evidence
+            if self._teacher_field_is_effective(row.get("caption", ""), invalid_markers=("",)):
+                direct_candidate = self._evaluate_referring_candidate(
+                    image=image,
+                    gt_mask=gt_mask,
+                    raw_prediction=row.get("raw_prediction", ""),
+                    caption_text=row["caption"],
+                    pipeline_result=row_result,
+                    student_iou=iou,
+                    source=f"type_table_direct:{row['source_type']}",
+                    style_hint=f"type_table_direct:{row['source_type']}",
+                )
+                direct_candidate["source_type"] = row["source_type"]
+                direct_candidate["keep_cue"] = row["keep_cue"]
+                direct_candidate["drop_cue"] = row["drop_cue"]
+                candidates.append(direct_candidate)
+                candidate_scores.append(
+                    {
+                        "caption": direct_candidate["caption"],
+                        "status": direct_candidate["status"],
+                        "failure_reason": direct_candidate["failure_reason"],
+                        "reconstruct_iou": direct_candidate["reconstruct_iou"],
+                        "score": direct_candidate["score"],
+                    }
+                )
+            for candidate_idx in range(self.referring_type_conditioned_candidate_count_per_type):
+                style_hint = self._referring_type_specific_style_hint(row["source_type"], repair_mode=False)
+                if candidate_idx == 1:
+                    style_hint += " Keep it to 2 to 5 words if possible."
                 candidate = self._generate_referring_candidate_record(
                     image=image,
                     gt_mask=gt_mask,
@@ -1562,14 +1839,13 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                     iou=iou,
                     teacher_prompt_masks=teacher_prompt_masks,
                     teacher_fields=teacher_fields,
-                    pipeline_result=pipeline_result,
-                    candidate_style_hint=spec["candidate_style_hint"],
-                    generation_kwargs={
-                        key: value
-                        for key, value in spec.items()
-                        if key in {"do_sample", "temperature", "top_p"}
-                    },
+                    pipeline_result=row_result,
+                    candidate_style_hint=style_hint,
+                    generation_kwargs={"do_sample": bool(candidate_idx > 0), "temperature": 0.45, "top_p": 0.9},
                 )
+                candidate["source_type"] = row["source_type"]
+                candidate["keep_cue"] = row["keep_cue"]
+                candidate["drop_cue"] = row["drop_cue"]
                 candidates.append(candidate)
                 candidate_scores.append(
                     {
@@ -1589,9 +1865,13 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         if valid_candidates:
             selected_candidate = sorted(
                 valid_candidates,
-                key=lambda item: (item["score"], item["reconstruct_iou"]),
+                key=lambda item: (item["reconstruct_iou"], item["score"], -self._caption_token_count(item["caption"])),
                 reverse=True,
             )[0]
+            pipeline_result.primary_failure_type = str(selected_candidate.get("source_type", ""))
+            pipeline_result.keepable_phrases = str(selected_candidate.get("keep_cue", ""))
+            pipeline_result.must_avoid_phrases = str(selected_candidate.get("drop_cue", ""))
+            pipeline_result.missing_phrases_needed = pipeline_result.keepable_phrases
             pipeline_result.teacher_pipeline_mode = "referring_candidate_selected"
             pipeline_result.teacher_dlc_selected_by = "candidate_score"
             pipeline_result = self._apply_teacher_dlc_candidate(
@@ -1658,7 +1938,7 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         )
         pipeline_result.gate_passed = bool(iou_gate_passed and pipeline_result.cue_passed)
 
-        if (pipeline_result.diagnosis_valid or self._teacher_has_minimal_diagnosis_signal(pipeline_result)) and not pipeline_result.gate_passed:
+        if pipeline_result.diagnosis_valid and not pipeline_result.gate_passed and pipeline_result.primary_failure_type:
             repair_candidate = self._generate_referring_candidate_record(
                 image=image,
                 gt_mask=gt_mask,
@@ -1672,7 +1952,7 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                 teacher_fields=teacher_fields,
                 pipeline_result=pipeline_result,
                 candidate_style_hint=self._referring_type_specific_style_hint(
-                    getattr(pipeline_result, "primary_failure_type", ""),
+                    pipeline_result.primary_failure_type,
                     repair_mode=True,
                 ),
                 generation_kwargs={"do_sample": False},
@@ -1729,50 +2009,48 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
             fallback_result.teacher_fallback_reason = pipeline_result.teacher_fallback_reason
             fallback_result.stop_stage = "single_stage_fallback"
             fallback_result.teacher_pipeline_mode = "referring_single_stage_fallback"
-            if self._teacher_field_is_effective(fallback_result.single_stage_raw, invalid_markers=("",)):
-                fallback_style_ok = (
-                    self._referring_style_is_usable(fallback_result.detailed_caption)
-                    and self._is_caption_content_sufficient(fallback_result.detailed_caption)
+            fallback_result.primary_failure_type = pipeline_result.primary_failure_type
+            fallback_result.keepable_phrases = pipeline_result.keepable_phrases
+            fallback_result.must_avoid_phrases = pipeline_result.must_avoid_phrases
+            if self._teacher_field_is_effective(fallback_result.detailed_caption, invalid_markers=("",)):
+                fallback_reconstruction = self.reconstruct_mask(
+                    image=image,
+                    caption=fallback_result.detailed_caption,
+                    description_status=fallback_result.detailed_status,
+                    gt_mask=gt_mask,
                 )
-                if not fallback_style_ok:
-                    fallback_result.detailed_failure_reason = "teacher_dlc_invalid:referring_style_gate_failed"
-                    fallback_result.cue_passed = False
-                    fallback_result.gate_passed = False
-                else:
-                    fallback_reconstruction = self.reconstruct_mask(
-                        image=image,
-                        caption=fallback_result.detailed_caption,
-                        description_status=fallback_result.detailed_status,
-                        gt_mask=gt_mask,
+                fallback_pred_mask = None if fallback_reconstruction is None else fallback_reconstruction.pred_mask
+                fallback_iou = self._compute_iou(gt_mask, fallback_pred_mask) if fallback_pred_mask is not None else 0.0
+                fallback_result.verification_iou = float(fallback_iou)
+                fallback_result.cue_passed = self._referring_candidate_type_constraint_passed(
+                    fallback_result.detailed_caption,
+                    fallback_result,
+                )
+                fallback_reconstruct_ok = bool(
+                    fallback_reconstruction is not None
+                    and fallback_reconstruction.status == "ok"
+                    and fallback_pred_mask is not None
+                    and fallback_result.detailed_status == "ok"
+                )
+                fallback_gate = (
+                    bool(fallback_reconstruct_ok)
+                    if caption_mode_failure
+                    else (
+                        self._referring_teacher_regenerate_gate_passed(student_caption, iou, fallback_iou)
+                        if fallback_reconstruct_ok
+                        else False
                     )
-                    fallback_pred_mask = None if fallback_reconstruction is None else fallback_reconstruction.pred_mask
-                    fallback_iou = self._compute_iou(gt_mask, fallback_pred_mask) if fallback_pred_mask is not None else 0.0
-                    fallback_result.verification_iou = float(fallback_iou)
-                    fallback_reconstruct_ok = bool(
-                        fallback_reconstruction is not None
-                        and fallback_reconstruction.status == "ok"
-                        and fallback_pred_mask is not None
-                    )
-                    fallback_result.gate_passed = (
-                        bool(fallback_reconstruct_ok)
-                        if caption_mode_failure
-                        else (
-                            self._referring_teacher_regenerate_gate_passed(student_caption, iou, fallback_iou)
-                            if fallback_reconstruct_ok
-                            else False
-                        )
-                    )
-                    fallback_result.cue_passed = self._referring_candidate_type_constraint_passed(
-                        fallback_result.detailed_caption,
-                        fallback_result,
-                    )
-                    fallback_result.gate_passed = bool(fallback_result.gate_passed and fallback_result.cue_passed)
-                    fallback_result.stop_stage = "passed" if fallback_result.gate_passed else "gate"
-                    if fallback_result.gate_passed:
-                        fallback_result.teacher_selected_caption_source = "single_stage_fallback"
-                        return fallback_result
+                )
+                fallback_result.gate_passed = bool(fallback_gate and fallback_result.cue_passed)
+                if fallback_result.gate_passed:
+                    fallback_result.teacher_selected_caption_source = "single_stage_fallback"
             pipeline_result = fallback_result
 
+        pipeline_result.posterior_selected_type = pipeline_result.primary_failure_type
+        pipeline_result.posterior_best_caption = pipeline_result.detailed_caption
+        pipeline_result.posterior_best_iou = float(pipeline_result.verification_iou or 0.0)
+        pipeline_result.posterior_gain_vs_student = float((pipeline_result.verification_iou or 0.0) - float(iou))
+        pipeline_result.posterior_selected_source = pipeline_result.teacher_dlc_selected_by
         pipeline_result.stop_stage = "passed" if pipeline_result.gate_passed else "gate"
         if not teacher_reconstruct_ok and not pipeline_result.gate_passed:
             pipeline_result.diagnosis_failure_reason = "teacher_gate_failed:reconstruct_failed"
