@@ -238,6 +238,37 @@
 
 ### Rejected Direction
 - Do not widen the short-referring taxonomy back into a larger DLC-like diagnosis set. The user requested the minimal referring-specific diagnosis path to stay compact.
+
+## 2026-07-17 Referring Validation Stops Reusing DLC Target-Only Evidence Rules
+
+### Problem
+- The short-referring RefCOCO branch already produced several high-IoU teacher captions, but many of them were still rejected with `teacher_dlc_invalid:missing_target_only_evidence`.
+- This caused regenerate CE coverage to collapse again even when the caption itself was short, target-focused, and reconstructable.
+
+### Root Cause Notes
+- `projects/sa2va/models/sa2va_opsd_referring_v3.py` still called the base DLC validators for candidate scoring and verification gating.
+- Those validators require explicit `target_only_evidence` style semantics that fit DLC analysis text, but they are too strict for short RefCOCO referring expressions.
+- As a result, captions such as short noun phrases with strong reconstruction IoU were being logged as invalid for the wrong reason.
+
+### Chosen Fix Direction
+- Replace the short-referring branch candidate and verification validation with referring-specific checks only:
+  - short style usability
+  - generic/template filtering
+  - type-conditioned keep/drop cue constraints
+  - optional distractor-overlap rejection
+- Keep the DLC validators unchanged in the base model so the DLC chain is not affected.
+
+### Rejected Direction
+- Do not relax the base DLC validator globally. The issue is branch-specific, and weakening the shared validator would risk regressions in the DLC path.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_referring_v3.py`:
+  - Added `_validate_teacher_referring_caption()` for short-referring candidates.
+  - Added `_validate_teacher_referring_verification_caption()` for short-referring verification captions.
+  - Switched referring candidate evaluation away from `_validate_teacher_dlc()`.
+  - Switched referring verification away from `_validate_teacher_verification_caption()`.
+  - Tightened referring candidate usability so only clean, cue-passing, failure-free candidates can be selected.
+  - Renamed the no-candidate failure marker in the referring branch from `teacher_dlc_invalid:no_candidate_selected` to `teacher_referring_invalid:no_candidate_selected`.
 - Do not let `DROP_CUE` continue using `ref_only_summary` as a fallback, because that hides the key distinction between model-generated diagnosis and actual student wording.
 
 ### Implemented Changes

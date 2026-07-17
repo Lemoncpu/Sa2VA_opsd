@@ -920,7 +920,10 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         candidate_result.target_only_evidence = pipeline_result.target_only_evidence
         candidate_result.distractor_only_evidence = pipeline_result.distractor_only_evidence
         candidate_result = self._materialize_teacher_caption_result(candidate_result, caption, source)
-        failure_reason = self._validate_teacher_dlc(candidate_result)
+        candidate_result.primary_failure_type = pipeline_result.primary_failure_type
+        candidate_result.keepable_phrases = pipeline_result.keepable_phrases
+        candidate_result.must_avoid_phrases = pipeline_result.must_avoid_phrases
+        failure_reason = self._validate_teacher_referring_caption(candidate_result)
         reconstruct = self.reconstruct_mask(
             image=image,
             caption=candidate_result.detailed_caption,
@@ -952,6 +955,45 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
             - (0.75 if failure_reason else 0.0)
         )
         return candidate
+
+    def _validate_teacher_referring_caption(self, result):
+        caption = getattr(result, "detailed_caption", "") or ""
+        status = getattr(result, "detailed_status", "") or ""
+        if not self._teacher_field_is_effective(caption, invalid_markers=("",)):
+            return "teacher_referring_invalid:empty"
+        if status != "ok":
+            return f"teacher_referring_invalid:{status}"
+        if not self._referring_style_is_usable(caption):
+            return "teacher_referring_invalid:style"
+        if self._is_overly_generic_caption(caption):
+            return "teacher_referring_invalid:too_generic"
+        if self._teacher_template_prefix_hit_count(caption):
+            return "teacher_referring_invalid:template_prefix"
+        if not self._referring_candidate_type_constraint_passed(caption, result):
+            return "teacher_referring_invalid:type_cue_failed"
+        if self._teacher_text_overlap_ratio(caption, getattr(result, "distractor_summary", "")) >= 0.92:
+            return "teacher_referring_invalid:distractor_overlap"
+        return ""
+
+    def _validate_teacher_referring_verification_caption(self, result):
+        caption = getattr(result, "verification_caption", "") or ""
+        if not self._teacher_field_is_effective(caption, invalid_markers=("",)):
+            return "verification_invalid:empty"
+        verification_tokens = self._caption_token_count(caption)
+        detailed_tokens = self._caption_token_count(getattr(result, "detailed_caption", "") or "")
+        if detailed_tokens > 0 and verification_tokens >= detailed_tokens:
+            return "verification_invalid:not_shorter_than_referring"
+        if not self._referring_style_is_usable(caption):
+            return "verification_invalid:style"
+        if self._is_overly_generic_caption(caption):
+            return "verification_invalid:too_generic"
+        if self._teacher_template_prefix_hit_count(caption):
+            return "verification_invalid:template_prefix"
+        if not self._referring_candidate_type_constraint_passed(caption, result):
+            return "verification_invalid:type_cue_failed"
+        if self._teacher_text_overlap_ratio(caption, getattr(result, "distractor_summary", "")) >= 0.92:
+            return "verification_invalid:distractor_overlap"
+        return ""
 
     def _generate_referring_candidate_record(
         self,
@@ -1019,7 +1061,9 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         )
 
     def _teacher_candidate_is_usable(self, candidate):
-        if not super()._teacher_candidate_is_usable(candidate):
+        if candidate.get("status") != "ok":
+            return False
+        if str(candidate.get("failure_reason", "") or ""):
             return False
         if not self._referring_style_is_usable(candidate.get("caption", "")):
             return False
@@ -1474,13 +1518,13 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
             verification_status = "truncated_caption"
         pipeline_result.verification_caption = verification_caption
         pipeline_result.verification_status = verification_status
-        failure_reason = self._validate_teacher_verification_caption(pipeline_result)
+        failure_reason = self._validate_teacher_referring_verification_caption(pipeline_result)
         if failure_reason:
             fallback_caption = self._build_referring_verification_fallback(pipeline_result)
             if fallback_caption:
                 pipeline_result.verification_caption = fallback_caption
                 pipeline_result.verification_status = self._infer_description_status(fallback_caption)
-                retry_reason = self._validate_teacher_verification_caption(pipeline_result)
+                retry_reason = self._validate_teacher_referring_verification_caption(pipeline_result)
                 if not retry_reason:
                     pipeline_result.verification_failure_reason = ""
                     return pipeline_result
@@ -1880,7 +1924,7 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                 "structured_referring_candidate",
             )
         else:
-            pipeline_result.detailed_failure_reason = "teacher_dlc_invalid:no_candidate_selected"
+            pipeline_result.detailed_failure_reason = "teacher_referring_invalid:no_candidate_selected"
         pipeline_result.stop_stage = "referring_candidates"
 
         if selected_candidate is not None:
