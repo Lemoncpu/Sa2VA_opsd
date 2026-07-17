@@ -219,6 +219,39 @@
 - Updated `tools/traindlc.sh` so the remote training command now exports:
   - `SA2VA_REFCOCO_OPSD_CONFIG`
 
+## 2026-07-17 Referring Diagnosis Adds Support-Anchor Error Type
+
+### Problem
+- In the short-referring RefCOCO branch, some student expressions failed because they attached the target to a support or context object, for example `slice of yellow cake on a plate`.
+- The existing 4-type diagnosis taxonomy had no explicit place for this failure, so the teacher often mislabeled it as `wrong_attribute`.
+- `DROP_CUE` could also be backfilled from reconstructed-mask summaries instead of the student expression itself, which produced contradictory fake cues such as `black cake` even when the student never said that.
+
+### Root Cause Notes
+- `projects/sa2va/models/sa2va_opsd_referring_v3.py` only exposed `wrong_subject`, `missing_attribute`, `wrong_attribute`, and `missing_position`, so support-anchor drift was forced into the wrong bucket.
+- The short-referring backfill path sanitized `DROP_CUE`, but when it was missing it could still fall back to distractor-side evidence rather than a real span from the student's caption.
+- The diagnosis prompt told the teacher to output a short drop cue, but it did not explicitly require that cue to be copied from the student's actual expression.
+
+### Chosen Fix Direction
+- Add a new short-referring diagnosis type `wrong_anchor` for support/container/context-anchor drift.
+- Constrain `DROP_CUE` so the final stored cue must come from the student's actual caption text.
+- Update the teacher prompt so it compares the meaning of each short-referring error type before choosing one, while still emitting the same 4-field output schema.
+
+### Rejected Direction
+- Do not widen the short-referring taxonomy back into a larger DLC-like diagnosis set. The user requested the minimal referring-specific diagnosis path to stay compact.
+- Do not let `DROP_CUE` continue using `ref_only_summary` as a fallback, because that hides the key distinction between model-generated diagnosis and actual student wording.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_referring_v3.py`:
+  - Added `wrong_anchor` to the short-referring failure-type set.
+  - Added support-anchor phrase detection for patterns like `on a ...`, `in a ...`, `with a ...`, `holding ...`, and similar context-carrying spans.
+  - Added `_extract_student_drop_cue(...)` so `DROP_CUE` is only accepted when it literally appears in the student caption; otherwise it falls back to `none`.
+  - Updated minimal failure-type inference to choose `wrong_anchor` when the student expression shows support-anchor drift.
+  - Updated diagnosis validation, rewrite hints, and candidate type constraints so `wrong_anchor` behaves consistently with the rest of the referring pipeline.
+  - Updated the referring diagnosis prompt to define each error type explicitly and require `DROP_CUE` to be copied from the student's actual expression.
+
+### Validation
+- Ran `python3 -m py_compile projects/sa2va/models/sa2va_opsd_referring_v3.py`.
+
 ## 2026-07-13 Referring Teacher Pipeline Simplification For 4B
 
 ### Problem

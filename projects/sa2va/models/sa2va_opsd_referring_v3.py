@@ -25,6 +25,24 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         "behind", "beside", "near", "under", "over", "above", "below", "between", "with",
         "next", "holding", "wearing", "carrying", "by"
     }
+    _REFERRING_SUPPORT_ANCHOR_PATTERNS = (
+        r"\bon\s+(?:the\s+|a\s+|an\s+)?[a-z0-9' -]+",
+        r"\bin\s+(?:the\s+|a\s+|an\s+)?[a-z0-9' -]+",
+        r"\bat\s+(?:the\s+|a\s+|an\s+)?[a-z0-9' -]+",
+        r"\bwith\s+(?:the\s+|a\s+|an\s+)?[a-z0-9' -]+",
+        r"\bholding\s+(?:the\s+|a\s+|an\s+)?[a-z0-9' -]+",
+        r"\bcarrying\s+(?:the\s+|a\s+|an\s+)?[a-z0-9' -]+",
+        r"\bwearing\s+(?:the\s+|a\s+|an\s+)?[a-z0-9' -]+",
+        r"\bnext to\s+(?:the\s+|a\s+|an\s+)?[a-z0-9' -]+",
+        r"\bnear\s+(?:the\s+|a\s+|an\s+)?[a-z0-9' -]+",
+        r"\bbeside\s+(?:the\s+|a\s+|an\s+)?[a-z0-9' -]+",
+        r"\bbehind\s+(?:the\s+|a\s+|an\s+)?[a-z0-9' -]+",
+        r"\bunder\s+(?:the\s+|a\s+|an\s+)?[a-z0-9' -]+",
+        r"\bover\s+(?:the\s+|a\s+|an\s+)?[a-z0-9' -]+",
+        r"\babove\s+(?:the\s+|a\s+|an\s+)?[a-z0-9' -]+",
+        r"\bbelow\s+(?:the\s+|a\s+|an\s+)?[a-z0-9' -]+",
+        r"\bbetween\s+[a-z0-9' -]+",
+    )
     _REFERRING_BODYPART_WORDS = {
         "arm", "head", "hand", "leg", "hair", "face", "tail", "wing", "foot", "feet"
     }
@@ -96,6 +114,7 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
     def _referring_failure_type_set():
         return {
             "wrong_subject",
+            "wrong_anchor",
             "missing_attribute",
             "wrong_attribute",
             "missing_position",
@@ -308,6 +327,33 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
             return " ".join(spatial_tokens[:3]).strip()
         return " ".join(tokens[:4]).strip()
 
+    def _extract_student_drop_cue(self, student_caption, *, preferred_text="", failure_type=""):
+        caption = self._force_short_referring_expression(student_caption)
+        caption_lower = caption.lower()
+        preferred = self._sanitize_referring_cue(preferred_text)
+        if self._teacher_field_is_effective(preferred):
+            for item in self._split_teacher_field_list(preferred):
+                candidate = self._force_short_referring_expression(item).lower()
+                if candidate and candidate in caption_lower:
+                    return candidate
+        support_spans = []
+        for pattern in self._REFERRING_SUPPORT_ANCHOR_PATTERNS:
+            for match in re.finditer(pattern, caption_lower):
+                span = self._force_short_referring_expression(match.group(0))
+                if span:
+                    support_spans.append(span.lower())
+        if support_spans and failure_type == "wrong_anchor":
+            return max(support_spans, key=len)
+        if support_spans and failure_type in {"wrong_subject", "wrong_attribute"}:
+            return max(support_spans, key=len)
+        return "none"
+
+    def _caption_has_support_anchor_drift(self, student_caption):
+        caption = self._force_short_referring_expression(student_caption).lower()
+        if not caption:
+            return False
+        return any(re.search(pattern, caption) for pattern in self._REFERRING_SUPPORT_ANCHOR_PATTERNS)
+
     def _rewrite_caption_prompt_for_referring(self, prompt):
         replacements = (
             ("one natural and complete detailed localized caption", "one short, concrete, visually grounded referring expression"),
@@ -494,6 +540,8 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
             or any(token in distractor_text for token in self._tokenize_referring_expression(caption_lower))
         ):
             return "wrong_subject"
+        if self._caption_has_support_anchor_drift(student_caption):
+            return "wrong_anchor"
         if self._teacher_field_is_effective(getattr(result, "must_avoid_phrases", "")) and self._teacher_field_is_effective(getattr(result, "keepable_phrases", "")):
             return "wrong_attribute"
         if has_position:
@@ -526,9 +574,11 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                 result.keepable_phrases = fallback_keep
             else:
                 result.keepable_phrases = "none"
-        if not self._teacher_field_is_effective(getattr(result, "must_avoid_phrases", "")):
-            result.must_avoid_phrases = result.distractor_only_evidence if self._teacher_field_is_effective(result.distractor_only_evidence) else "none"
-        result.must_avoid_phrases = self._sanitize_referring_cue(result.must_avoid_phrases)
+        result.must_avoid_phrases = self._extract_student_drop_cue(
+            trimmed_caption,
+            preferred_text=result.must_avoid_phrases,
+            failure_type=result.primary_failure_type,
+        )
         result.missing_phrases_needed = result.keepable_phrases
         result.caption_problem = ""
         result.correction_direction = ""
@@ -585,6 +635,10 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         lower_text = " ".join(part.lower() for part in (keep_cue, drop_cue, detailed_caption, result.target_only_evidence) if part)
         if result.primary_failure_type == "missing_position" and not any(token in lower_text for token in (self._REFERRING_DIRECTION_WORDS | self._REFERRING_ORDINAL_WORDS)):
             return False, "referring_fault_report_invalid:missing_spatial_cue"
+        if result.primary_failure_type == "wrong_anchor" and not (
+            self._teacher_field_is_effective(drop_cue) or self._caption_has_support_anchor_drift(result.bad_phrases_in_student)
+        ):
+            return False, "referring_fault_report_invalid:missing_anchor_drop_cue"
         if result.primary_failure_type == "wrong_subject" and not (
             self._teacher_field_is_effective(drop_cue) or self._teacher_field_is_effective(detailed_caption, invalid_markers=("",))
         ):
@@ -608,6 +662,7 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         action = "Repair the expression" if repair_mode else "Rewrite the expression"
         mapping = {
             "wrong_subject": f"{action} around the true target subject only and remove the larger nearby subject.",
+            "wrong_anchor": f"{action} by keeping the true subject noun phrase and removing the support or context anchor phrase.",
             "missing_attribute": f"{action} by adding one short target-only attribute and nothing else.",
             "wrong_attribute": f"{action} by dropping the wrong attribute and keeping the correct subject cue.",
             "missing_position": f"{action} with one short left-right-middle or order cue and keep the noun phrase short.",
@@ -645,7 +700,7 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
         caption_lower = (caption or "").lower()
         if failure_type == "missing_position":
             return any(token in caption_lower for token in (self._REFERRING_DIRECTION_WORDS | self._REFERRING_ORDINAL_WORDS))
-        if failure_type in {"wrong_subject", "missing_attribute", "wrong_attribute"}:
+        if failure_type in {"wrong_subject", "wrong_anchor", "missing_attribute", "wrong_attribute"}:
             keep_cue = self._sanitize_referring_cue(getattr(pipeline_result, "keepable_phrases", ""))
             keep_ok = (not self._teacher_field_is_effective(keep_cue)) or any(
                 token.lower() in caption_lower
@@ -658,6 +713,10 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
             )
             if failure_type == "missing_attribute":
                 return bool(keep_ok)
+            if failure_type == "wrong_anchor":
+                if not self._teacher_field_is_effective(must_avoid):
+                    return bool(keep_ok)
+                return bool(keep_ok and drop_ok)
             if failure_type == "wrong_subject" and not self._teacher_field_is_effective(must_avoid):
                 return True
             if failure_type == "wrong_attribute" and not (
@@ -854,9 +913,15 @@ class Sa2VAOPSDReferringModelV3(Sa2VAOPSDModelV3):
                 "DROP_CUE:\n"
                 "REFERRING:\n"
                 "Rules:\n"
-                "- ERROR_TYPE must be exactly one of: wrong_subject, missing_attribute, wrong_attribute, missing_position.\n"
+                "- Compare all error types before choosing one. Meanings:\n"
+                "  wrong_subject = the main subject in the student expression points to the wrong nearby object/person.\n"
+                "  wrong_anchor = the core subject is roughly right, but an extra support/container/context phrase shifts the mask toward another object, such as 'on a plate' or 'in a bowl'.\n"
+                "  missing_attribute = the subject category is roughly right, but a short target-only attribute is missing.\n"
+                "  wrong_attribute = the subject category is roughly right, but the student expression includes a conflicting attribute.\n"
+                "  missing_position = the expression needs a short left/right/order cue to isolate the target.\n"
+                "- ERROR_TYPE must be exactly one of: wrong_subject, wrong_anchor, missing_attribute, wrong_attribute, missing_position.\n"
                 "- KEEP_CUE must be a very short target-side cue to keep or add. Use none only if necessary.\n"
-                "- DROP_CUE must be a very short wrong cue to drop. Use none if there is no wrong cue.\n"
+                "- DROP_CUE must be a very short wrong cue copied from the student's actual expression. Never invent a cue that does not literally appear in the student expression. Use none if there is no wrong cue.\n"
                 "- REFERRING must be one short target-specific referring expression for region1 only, ideally 2 to 5 words as a compact noun phrase.\n"
                 "- Focus only on the target subject, not the broader scene.\n"
                 "- REFERRING must end cleanly with a noun phrase and must not end with words like with, in, on, of, or and.\n"
