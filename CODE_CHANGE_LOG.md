@@ -2563,6 +2563,41 @@
 - Ran:
   - `python3 -m py_compile projects/sa2va/models/sa2va_opsd_referring_v3.py`
 
+## 2026-07-17 Referring V7 Training Crash On First On-Policy Sample
+
+### Problem
+- The new short-referring training run under `/data6/qianshan.wei/Sa2VA_opsd/work_dirs/sa2va_opsd_refcoco_referring_online_1gpu_train_v7` entered the new type-conditioned teacher path, processed the first regenerate sample, and then crashed on the first on-policy sample.
+- The stack trace ended in `projects/sa2va/models/sa2va_opsd_referring_v3.py` with:
+  - `AttributeError: 'TeacherRegeneratePipelineResult' object has no attribute 'primary_failure_type'`
+
+### Root Cause Notes
+- The recent short-referring refactor started using several new result fields directly on `TeacherRegeneratePipelineResult`, including:
+  - `primary_failure_type`
+  - `secondary_failure_type`
+  - `keepable_phrases`
+  - `must_avoid_phrases`
+  - `posterior_selected_type`
+  - related posterior-selection metadata
+- Those fields were already being written and read in the short-referring pipeline, but the shared dataclass definition in `projects/sa2va/models/sa2va_opsd_v2.py` had not been extended accordingly.
+- The regenerate sample happened to finish because the missing attribute was not accessed on that path before fallback, but the first on-policy sample touched the new field and crashed immediately.
+
+### Chosen Fix Direction
+- Extend the shared `TeacherRegeneratePipelineResult` dataclass with the full set of short-referring type-conditioned and posterior-selection fields already used by the new pipeline.
+- Keep the fix minimal and data-structure focused so the new route logic can proceed without changing the surrounding control flow again.
+
+### Rejected Direction
+- Do not patch around this with `getattr(..., default)` at every call site. The short-referring pipeline now genuinely owns these fields, so the canonical result object should define them explicitly.
+
+### Implemented Changes
+- Updated `projects/sa2va/models/sa2va_opsd_v2.py`:
+  - added short-referring type fields to `TeacherRegeneratePipelineResult`
+  - added short-referring posterior-selection fields to `TeacherRegeneratePipelineResult`
+  - added keep/drop phrase storage fields used by the new type-guided regenerate and on-policy logic
+
+### Validation
+- Ran:
+  - `python3 -m py_compile projects/sa2va/models/sa2va_opsd_v2.py projects/sa2va/models/sa2va_opsd_referring_v3.py`
+
 ## 2026-07-17 Frozen 4B Teacher Plus Type-Conditioned Referring Regenerate And On-Policy Guidance
 
 ### Problem

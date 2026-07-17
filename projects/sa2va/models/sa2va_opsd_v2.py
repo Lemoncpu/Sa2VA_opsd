@@ -99,8 +99,15 @@ class TeacherRegeneratePipelineResult:
     correction_direction: str = ""
     reason: str = ""
     confidence: str = ""
+    primary_failure_type: str = ""
+    secondary_failure_type: str = ""
+    secondary_failure_types: tuple = ()
     target_anchor: str = ""
     distractor_anchor: str = ""
+    bad_phrases_in_student: str = ""
+    missing_phrases_needed: str = ""
+    keepable_phrases: str = ""
+    must_avoid_phrases: str = ""
     detailed_caption: str = ""
     verification_caption: str = ""
     detailed_completion_ids: torch.Tensor = None
@@ -124,6 +131,11 @@ class TeacherRegeneratePipelineResult:
     teacher_fallback_reason: str = ""
     teacher_selected_caption_source: str = ""
     teacher_dlc_candidate_scores: tuple = ()
+    posterior_selected_type: str = ""
+    posterior_best_caption: str = ""
+    posterior_best_iou: float = 0.0
+    posterior_gain_vs_student: float = 0.0
+    posterior_selected_source: str = ""
     difference_context_failure_reason: str = ""
     diagnosis_failure_reason: str = ""
     problem_failure_reason: str = ""
